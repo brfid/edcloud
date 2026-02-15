@@ -2,6 +2,19 @@
 
 Personal cloud lab on AWS: one EC2 instance for x86_64 Linux workloads, managed through Portainer, accessed via Tailscale (no exposed ports).
 
+## Cold Start (Operator)
+
+Read in this order:
+
+1. `README.md`
+2. `SECURITY.md`
+3. `DESIGN.md`
+4. `SETUP.md`
+5. `AGENTS.md` (if using coding agents)
+
+Control plane expectation: this is intended to be operable from a small ARM Linux system
+(for example, Raspberry Pi Zero 2 W) as long as it has Python 3, AWS CLI credentials, and Tailscale.
+
 ## Setup
 
 ```bash
@@ -15,34 +28,41 @@ source .venv/bin/activate
 pip install -e '.[dev]'
 
 # Get Tailscale auth key from https://login.tailscale.com/admin/settings/keys
-export TAILSCALE_AUTH_KEY='tskey-auth-...'
+# Store in SSM Parameter Store (recommended)
+aws ssm put-parameter \
+  --name /edcloud/tailscale_auth_key \
+  --type SecureString \
+  --overwrite \
+  --value 'tskey-auth-...'
 
-# Provision (~3 min: creates t3a.medium + 80GB gp3 + Tailscale + Docker + Portainer)
-edcloud provision
+# Provision (~3 min: creates t3a.medium + 80GB root + 10GB state + Tailscale + Docker + Portainer)
+edc provision --tailscale-auth-key-ssm-parameter /edcloud/tailscale_auth_key
 ```
 
 ## Usage
 
 ```bash
-edcloud up             # Start instance
-edcloud status         # Check state, Tailscale IP, cost estimate
-edcloud ssh            # SSH via Tailscale
-edcloud down           # Stop (or auto-shuts down after 30min idle)
-edcloud snapshot       # Create EBS snapshot
-edcloud snapshot --list
-edcloud destroy        # Terminate instance (EBS preserved)
+edc up             # Start instance
+edc status         # Check state, Tailscale IP, cost estimate
+edc ssh            # SSH via Tailscale
+edc verify         # Fresh-reprovision verification checks
+edc down           # Stop (or auto-shuts down after 30min idle)
+edc snapshot       # Create EBS snapshot
+edc snapshot --list
+edc snapshot --prune --dry-run
+edc destroy        # Terminate instance (EBS preserved)
 ```
 
 Access Portainer: `https://edcloud:9443` (from any device on your tailnet)
 
 ## Cost
 
-~$11/mo at 4hrs/day: $4.51 compute + $6.40 storage + $0.40 snapshots. Auto-shutdown when idle (no SSH + low CPU for 30min).
+~$12/mo at 4hrs/day: $4.51 compute + $7.20 storage + snapshot usage (policy soft cap: $5/mo). Auto-shutdown when idle (no SSH + low CPU for 30min).
 
 ## Architecture
 
 - **1x t3a.medium** (4GB RAM) — Docker host
-- **80GB gp3 EBS** — persistent storage (survives stop/start)
+- **80GB gp3 root + 10GB gp3 state EBS** — host + durable assistant state
 - **Portainer CE** — container management UI
 - **Tailscale** — secure access, no public inbound ports
 - **Ubuntu 24.04 LTS** — 5yr security updates
@@ -54,20 +74,23 @@ Resources tracked by tag `edcloud:managed=true` (no local state file).
 Deploy the vintage computing lab (VAX + PDP-11 SIMH):
 
 ```bash
-edcloud ssh
-docker compose -f /opt/edcloud/compose/vintage-lab.yml up -d
+scp compose/vintage-lab.yml ubuntu@edcloud:/opt/edcloud/compose/
+edc ssh 'docker compose -f /opt/edcloud/compose/vintage-lab.yml up -d'
 telnet edcloud 2323  # VAX console
 ```
 
 Or use Portainer to deploy any Docker Compose stack.
+
+## Reproducible Baseline + Backup (Current Priority)
+
+Canonical task list: [`SETUP.md` → `Active Priorities`](SETUP.md#active-priorities).
 
 ## Documentation
 
 - **[SECURITY.md](SECURITY.md)** — Security policy, threat model, and vulnerability reporting
 - **[DESIGN.md](DESIGN.md)** — Architecture decisions and trade-offs
 - **[SETUP.md](SETUP.md)** — Detailed first-time setup guide
-- **[MIGRATION.md](MIGRATION.md)** — Migration from previous CDK-based stack
-- **[PUBLICATION-READINESS.md](PUBLICATION-READINESS.md)** — Security posture assessment
+- **[AGENTS.md](AGENTS.md)** — Agent workflow constraints for this repo
 
 ## Security
 

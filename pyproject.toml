@@ -26,6 +26,7 @@ dev = [
 ]
 
 [project.scripts]
+edc = "edcloud.cli:main"
 edcloud = "edcloud.cli:main"
 
 [tool.setuptools.packages.find]

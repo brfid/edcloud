@@ -61,8 +61,9 @@ If you discover a security issue, please report it privately:
 2. **Enable AWS MFA**: Protect your AWS account with multi-factor authentication.
 3. **Review Portainer access logs**: Check for unexpected container operations.
 4. **Keep Docker updated**: The cloud-init script installs Docker CE. Periodically recreate the instance to get latest packages.
-5. **Snapshot before experiments**: Use `edcloud snapshot` before running unfamiliar workloads.
-6. **Monitor costs**: Use `edcloud status` and AWS Cost Explorer to catch runaway resources.
+5. **Keep secrets out of git**: Store runtime secrets in AWS SSM Parameter Store, not plaintext repo files.
+6. **Snapshot before experiments**: Use `edc snapshot` before running unfamiliar workloads.
+7. **Monitor costs**: Use `edc status` and AWS Cost Explorer to catch runaway resources.
 
 ## Dependencies
 

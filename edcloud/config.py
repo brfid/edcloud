@@ -17,6 +17,9 @@ NAME_TAG = "edcloud"
 DEFAULT_INSTANCE_TYPE = "t3a.medium"
 DEFAULT_VOLUME_SIZE_GB = 80
 DEFAULT_VOLUME_TYPE = "gp3"
+DEFAULT_STATE_VOLUME_SIZE_GB = 10
+DEFAULT_STATE_VOLUME_TYPE = "gp3"
+DEFAULT_STATE_VOLUME_DEVICE_NAME = "/dev/sdf"
 
 # Ubuntu 24.04 LTS — resolve via SSM parameter at provision time
 AMI_SSM_PARAMETER = (
@@ -42,6 +45,9 @@ class InstanceConfig:
     instance_type: str = DEFAULT_INSTANCE_TYPE
     volume_size_gb: int = DEFAULT_VOLUME_SIZE_GB
     volume_type: str = DEFAULT_VOLUME_TYPE
+    state_volume_size_gb: int = DEFAULT_STATE_VOLUME_SIZE_GB
+    state_volume_type: str = DEFAULT_STATE_VOLUME_TYPE
+    state_volume_device_name: str = DEFAULT_STATE_VOLUME_DEVICE_NAME
     tailscale_hostname: str = DEFAULT_TAILSCALE_HOSTNAME
     ami_ssm_parameter: str = AMI_SSM_PARAMETER
     tags: dict[str, str] = field(

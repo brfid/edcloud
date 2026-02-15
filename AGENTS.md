@@ -4,19 +4,31 @@
 
 Build and maintain a single-instance AWS EC2 personal cloud lab (edcloud) accessed via Tailscale, with Portainer for container management. Focus: simple, cost-effective, secure infrastructure as a portfolio piece.
 
+Operational model: control and orchestration should work from low-power operator nodes (for example, Raspberry Pi Zero 2 W class ARM systems), not require a heavyweight workstation.
+
 ## Start-here order (for new agent sessions)
 
 1. `README.md`
 2. `SECURITY.md` (understand threat model: Tailscale-only, single-operator)
 3. `DESIGN.md` (why not Terraform, why Portainer, cost trade-offs)
-4. Code: `edcloud/` package (6 modules: cli, ec2, snapshot, tailscale, config, aws_check)
+4. `SETUP.md` (operator runbook + rebuild/backup policy)
+5. Code: `edcloud/` package (6 modules: cli, ec2, snapshot, tailscale, config, aws_check)
 
 ## Source-of-truth map
 
 - **AWS resources**: Tag-based discovery (`edcloud:managed=true`) — no local state file
-- **Configuration**: `edcloud/config.py` + environment variables (TAILSCALE_AUTH_KEY)
+- **Configuration**: `edcloud/config.py` + AWS SSM Parameter Store (runtime secrets) + optional environment variables
 - **User data**: `cloud-init/user-data.yaml` (instance bootstrap)
 - **Tests**: `tests/` (pytest with mocked boto3)
+- **Baseline tools/settings policy**: `SETUP.md` + `cloud-init/user-data.yaml`
+- **Backup/recovery policy**: `SETUP.md` (snapshot cadence + restore drills)
+- **Operator command surface**: `edc` (with `edcloud` compatibility alias)
+
+## Task list source
+
+- **Primary active TODOs**: `SETUP.md` section `Active Priorities`
+- **Code-level TODO scan** (if needed):
+  - `grep -RInE "TODO|FIXME|TBD|\\[ \\]" README.md SETUP.md DESIGN.md AGENTS.md edcloud tests cloud-init compose`
 
 ## Constraints
 
@@ -25,6 +37,7 @@ Build and maintain a single-instance AWS EC2 personal cloud lab (edcloud) access
 - Use the repo-local venv at `.venv/` for all Python commands
 - Do not install anything globally or modify system Python
 - Dependencies managed via `pyproject.toml`
+- Prefer Python over Bash when both are appropriate for the task.
 
 ### Testing and validation
 
@@ -60,6 +73,8 @@ pre-commit run --all-files   # Full suite
 - Do not remove AWS tags from resources (breaks tag-based discovery)
 - Do not hardcode credentials, API keys, or resource IDs in code
 - Preserve Tailscale-only access model (no security group inbound rules)
+- Keep host baseline reproducible: core tools/settings must be encoded in `cloud-init/user-data.yaml`, not manual-only.
+- Preserve backup posture: keep snapshot workflow and restore-drill guidance current.
 
 ## Expected output shape for implementation work
 
@@ -69,9 +84,9 @@ pre-commit run --all-files   # Full suite
 
 ## Architecture principles (from DESIGN.md)
 
-- **Simplicity over abstraction**: This is a 5-resource deployment, not Terraform scale
+- **Simplicity over abstraction**: This is a small single-instance deployment, not Terraform scale
 - **Tag-based discovery**: No state file = works from multiple devices
-- **Cost-awareness**: Auto-shutdown after 30min idle, ~$11/mo target
+- **Cost-awareness**: Auto-shutdown after 30min idle, root+state volume model, snapshot cap guardrail
 - **Security-first**: Tailscale-only, no public SSH, IMDSv2 enforced
 - **Portfolio-focused**: Self-documenting code with design decisions maintained cleanly and briefly in design.md
 
@@ -121,7 +136,7 @@ pre-commit run --all-files   # Full suite
 
 If your AGENTS.md needs extensive explanation, your repository structure is probably too complex. Good agent notes are short because the repo itself is well-organized.
 
-**This repository's structure**: 3 docs (README, SECURITY, DESIGN) + 1 package (edcloud/) + 1 test dir (tests/). Self-documenting. AGENTS.md adds workflow constraints, not architectural explanation.
+**This repository's structure**: core docs (README, SECURITY, DESIGN, SETUP, AGENTS) + 1 package (`edcloud/`) + 1 test dir (`tests/`). Self-documenting. AGENTS.md adds workflow constraints, not architectural explanation.
 
 ---
 

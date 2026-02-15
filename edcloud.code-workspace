@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "edcloud",
+			"path": "."
+		}
+	],
+	"settings": {
+		"chat.tools.terminal.autoApprove": {
+			"pip": true
+		}
+	}
+}

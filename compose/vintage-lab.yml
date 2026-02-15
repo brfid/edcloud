@@ -42,8 +42,7 @@ services:
     container_name: pdp11-host
     hostname: pdp11-host
     # Note: This uses the VAX image as a placeholder.
-    # For a proper PDP-11 setup, build from brfid.github.io/vintage/Dockerfile.pdp11
-    # or use a custom SIMH image with 2.11BSD disk images.
+    # For a proper PDP-11 setup, use a custom SIMH image with 2.11BSD disk images.
     image: jguillaumes/simh-vaxbsd:latest
     ports:
       - "2327:2327"   # PDP-11 console (telnet)
