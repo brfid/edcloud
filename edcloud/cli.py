@@ -95,7 +95,7 @@ def provision(
 @require_aws_creds
 def up() -> None:
     """Start the edcloud instance."""
-    iid = ec2.start()
+    ec2.start()
     ts_ip = tailscale.get_tailscale_ip(DEFAULT_TAILSCALE_HOSTNAME)
     if ts_ip:
         click.echo(f"Tailscale IP: {ts_ip}")
@@ -200,12 +200,66 @@ def snapshot_cmd(list_: bool, description: str | None) -> None:
 # ---------------------------------------------------------------------------
 # ssh
 # ---------------------------------------------------------------------------
-@main.command("ssh")
+@main.command("ssh", context_settings={"ignore_unknown_options": True})
 @click.option("--user", default="ubuntu", show_default=True, help="SSH user.")
-def ssh_cmd(user: str) -> None:
-    """SSH into the instance via Tailscale."""
-    cmd = tailscale.ssh_command(DEFAULT_TAILSCALE_HOSTNAME, user=user)
-    click.echo(f"Connecting: {' '.join(cmd)}")
+@click.option(
+    "--public-ip",
+    is_flag=True,
+    help="Use public IP instead of Tailscale (requires security group rule).",
+)
+@click.argument("ssh_args", nargs=-1, type=click.UNPROCESSED)
+@require_aws_creds
+def ssh_cmd(user: str, public_ip: bool, ssh_args: tuple[str, ...]) -> None:
+    """SSH into the instance.
+
+    Pass additional arguments to execute remote commands:
+      edcloud ssh 'docker ps'
+      edcloud ssh ls -la /opt
+
+    Default: Uses Tailscale network. No exposed ports required.
+
+    Note: If Tailscale SSH is enabled on your tailnet, it may require browser authentication.
+    Use --public-ip for direct SSH (requires security group rule: port 22 from your IP).
+    """
+    # Get instance info
+    info = ec2.status()
+    if not info.get("exists"):
+        click.echo("Error: No edcloud instance found.", err=True)
+        raise SystemExit(1)
+    if info["state"] != "running":
+        click.echo(f"Error: Instance is {info['state']}, not running.", err=True)
+        raise SystemExit(1)
+
+    # Choose target: Tailscale IP (default) or public IP
+    target = None
+    if public_ip:
+        target = info.get("public_ip")
+        if not target:
+            click.echo("Error: No public IP available.", err=True)
+            raise SystemExit(1)
+        click.echo(f"Connecting via public IP: {target}", err=True)
+        click.echo("Note: Security group must allow SSH (port 22) from your IP", err=True)
+        cmd = ["ssh", f"{user}@{target}"]
+    else:
+        ts_ip = tailscale.get_tailscale_ip(DEFAULT_TAILSCALE_HOSTNAME)
+        if ts_ip:
+            target = ts_ip
+            click.echo(f"Connecting via Tailscale: {ts_ip}", err=True)
+            click.echo(
+                "Note: May trigger Tailscale SSH browser auth if enabled on your tailnet", err=True
+            )
+            # Use ProxyCommand=none to attempt regular SSH over Tailscale network
+            # (Tailscale SSH may still intercept depending on tailnet settings)
+            cmd = ["ssh", "-o", "ProxyCommand=none", f"{user}@{target}"]
+        else:
+            click.echo("Error: Tailscale IP not found. Is tailscale running?", err=True)
+            click.echo("  Try: tailscale status", err=True)
+            click.echo("  Or use: edcloud ssh --public-ip", err=True)
+            raise SystemExit(1)
+
+    if ssh_args:
+        cmd.extend(ssh_args)
+
     os.execvp(cmd[0], cmd)
 
 

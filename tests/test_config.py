@@ -33,6 +33,6 @@ def test_config_is_frozen():
     cfg = InstanceConfig()
     try:
         cfg.instance_type = "t3a.large"  # type: ignore[misc]
-        assert False, "Should have raised"
+        raise AssertionError("Should have raised AttributeError")
     except AttributeError:
         pass
