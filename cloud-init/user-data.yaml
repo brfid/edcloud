@@ -1,0 +1,133 @@
+#cloud-config
+# edcloud instance bootstrap — Docker, Tailscale, Portainer, self-shutdown
+# Variables: ${TAILSCALE_AUTH_KEY}, ${TAILSCALE_HOSTNAME}
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+  - jq
+  - unattended-upgrades
+
+# --------------------------------------------------------------------------
+# Write files before runcmd
+# --------------------------------------------------------------------------
+write_files:
+  # Idle-shutdown: powers down if no Tailscale SSH + low CPU for 30 min
+  - path: /usr/local/bin/edcloud-idle-shutdown
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # edcloud idle-shutdown — stop instance if unused for IDLE_MINUTES
+      set -euo pipefail
+      IDLE_MINUTES=30
+      STATE_FILE="/tmp/edcloud-idle-since"
+
+      # Check for active Tailscale SSH sessions
+      TS_CONNECTIONS=$(tailscale status --json 2>/dev/null \
+        | jq '[.Peer // {} | to_entries[] | select(.value.Active == true)] | length' 2>/dev/null || echo "0")
+
+      # Check 5-minute CPU load average (< 0.15 = idle for a 2-vCPU box)
+      LOAD=$(awk '{print $2}' /proc/loadavg)
+      IDLE=$(awk "BEGIN {print ($LOAD < 0.15) ? 1 : 0}")
+
+      if [ "$TS_CONNECTIONS" -gt 0 ] || [ "$IDLE" -eq 0 ]; then
+          # Active — reset idle timer
+          rm -f "$STATE_FILE"
+          exit 0
+      fi
+
+      # Idle — track how long
+      if [ ! -f "$STATE_FILE" ]; then
+          date +%s > "$STATE_FILE"
+          exit 0
+      fi
+
+      IDLE_SINCE=$(cat "$STATE_FILE")
+      NOW=$(date +%s)
+      ELAPSED=$(( (NOW - IDLE_SINCE) / 60 ))
+
+      if [ "$ELAPSED" -ge "$IDLE_MINUTES" ]; then
+          logger -t edcloud "Idle for ${ELAPSED}m, shutting down."
+          /usr/bin/systemctl poweroff
+      fi
+
+  # Systemd timer for idle-shutdown (every 5 minutes)
+  - path: /etc/systemd/system/edcloud-idle-shutdown.service
+    content: |
+      [Unit]
+      Description=edcloud idle shutdown check
+      After=network-online.target tailscaled.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/edcloud-idle-shutdown
+
+  - path: /etc/systemd/system/edcloud-idle-shutdown.timer
+    content: |
+      [Unit]
+      Description=Check for idle edcloud instance every 5 minutes
+
+      [Timer]
+      OnBootSec=10min
+      OnUnitActiveSec=5min
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
+  # Docker compose directory marker
+  - path: /opt/edcloud/.env
+    content: |
+      EDCLOUD_MANAGED=true
+
+# --------------------------------------------------------------------------
+# Bootstrap commands
+# --------------------------------------------------------------------------
+runcmd:
+  # --- Docker (official repo) ---
+  - |
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+      https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+      > /etc/apt/sources.list.d/docker.list
+    apt-get update -qq
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    systemctl enable docker
+    usermod -aG docker ubuntu
+
+  # --- Tailscale ---
+  - |
+    curl -fsSL https://tailscale.com/install.sh | sh
+    tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${TAILSCALE_HOSTNAME}" --ssh
+
+  # --- Portainer CE ---
+  - |
+    docker volume create portainer_data
+    docker run -d \
+      --name portainer \
+      --restart=always \
+      -p 9443:9443 \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -v portainer_data:/data \
+      portainer/portainer-ce:lts
+
+  # --- Compose directory ---
+  - mkdir -p /opt/edcloud/compose
+
+  # --- Enable idle-shutdown timer ---
+  - systemctl daemon-reload
+  - systemctl enable --now edcloud-idle-shutdown.timer
+
+  # --- Signal completion ---
+  - echo "edcloud bootstrap complete $(date -Iseconds)" > /tmp/edcloud-ready
+
+final_message: "edcloud instance ready after $UPTIME seconds."
