@@ -101,7 +101,7 @@ def _resolve_ami(ssm_parameter: str) -> str:
             print(f"  SSM parameter {ssm_parameter} not found, falling back to AMI search...")
             ec2 = _ec2_client()
             resp = ec2.describe_images(
-                Owners=["099720109477"],  # Canonical
+                Owners=["099720109477"],  # Canonical's public AWS account (not a secret)
                 Filters=[
                     {
                         "Name": "name",
