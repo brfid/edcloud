@@ -60,3 +60,21 @@ telnet edcloud 2323  # VAX console
 ```
 
 Or use Portainer to deploy any Docker Compose stack.
+
+## Documentation
+
+- **[SECURITY.md](SECURITY.md)** — Security policy, threat model, and vulnerability reporting
+- **[DESIGN.md](DESIGN.md)** — Architecture decisions and trade-offs
+- **[SETUP.md](SETUP.md)** — Detailed first-time setup guide
+- **[MIGRATION.md](MIGRATION.md)** — Migration from previous CDK-based stack
+- **[PUBLICATION-READINESS.md](PUBLICATION-READINESS.md)** — Security posture assessment
+
+## Security
+
+This project follows secure development practices:
+- No credentials in code or git history
+- Automated secret scanning (pre-commit hooks)
+- Tailscale-only access (zero public inbound ports)
+- Comprehensive security documentation
+
+See [SECURITY.md](SECURITY.md) for the full security policy and threat model.
