@@ -1,6 +1,7 @@
 # Security Remediation Status
 
-**Commit**: `b999cb3` - security: prepare repo for potential public release
+**Last Updated**: 2026-02-15
+**Status**: Git history scrubbed, ready for force-push decision
 
 ## ✅ Changes Applied (Automated Fixes)
 
@@ -44,23 +45,37 @@ Created `.pre-commit-config.yaml` with:
 - Added clarifying comment for Canonical's AWS account ID (099720109477)
 - Cleaned up TODO comment in `vintage-lab.yml`
 
+## ✅ Git History Scrubbed (Completed)
+
+**Action taken**: Successfully ran `git-filter-repo --path 'ec2 describe-volumes*' --invert-paths --force`
+
+- Removed AWS output file from all 3 commits in history
+- Origin remote was automatically removed (standard git-filter-repo behavior)
+- Remote has been re-added: `https://github.com/brfid/edcloud.git`
+
+**Result**: The file with volume IDs no longer exists in any commit.
+
 ## ⚠️ Manual Steps Still Required
 
-### Critical (Before Publishing Publicly)
+### Critical Decision: Force-Push to GitHub
 
-**1. Scrub Git History**
-The accidentally committed file is still in git history. Options:
+Your local history is now clean, but GitHub still has the old commits with sensitive data. You have two options:
 
+**Option A: Force-push the cleaned history (recommended if repo is private/personal)**
 ```bash
-# Option A: git-filter-repo (recommended, requires clean working directory)
-pip install git-filter-repo
-git filter-repo --path 'ec2 describe-volumes*' --invert-paths
+gi1 push --force-with-lease origin main
+```
+⚠️ **WARNING**: This will rewrite public history. Anyone who has cloned must re-clone.
 
-# Option B: BFG Repo-Cleaner
-# https://rtyley.github.io/bfg-repo-cleaner/
+**Option B: Start fresh with a new repository**
+```bash
+# Delete the GitHub repo and create a new one
+# Then push the clean repo as a first commit
+git remote set-url origin https://github.com/brfid/edcloud-v2.git
+git push -u origin main
 ```
 
-**WARNING**: This rewrites history. Coordinate with any collaborators.
+### Other Critical Steps
 
 **2. Regenerate Exposed AWS Resources**
 These resource IDs are now public in git history and terminal context:
@@ -82,7 +97,7 @@ edcloud provision
 # (Manual EBS restore process)
 ```
 
-**3. Git Author Email Decision**
+**2. Git Author Email Decision**
 Current commits use `brfid@icloud.com`. Options:
 - Accept the linkage (simplest)
 - Rewrite history to use a throwaway email
@@ -90,45 +105,33 @@ Current commits use `brfid@icloud.com`. Options:
 
 ### Medium Priority
 
-**4. GitHub Repository Settings**
+**3. GitHub Repository Settings**
 If/when publishing:
 - Enable "Vulnerability alerts" (Dependabot)
 - Add repository topics: `aws`, `ec2`, `tailscale`, `docker`, `portainer`
 - Add link to SECURITY.md in repository description
 - Consider adding a `CONTRIBUTING.md` if accepting external contributions
 
-**5. Initialize Pre-commit Baseline**
-```bash
-cd /home/whf/edcloud
-pip install pre-commit detect-secrets
-pre-commit install
-detect-secrets scan > .secrets.baseline
-git add .secrets.baseline
-git commit -m "Initialize detect-secrets baseline"
-```
-
-**6. Review and Test Pre-commit Hooks**
-```bash
-pre-commit run --all-files
-```
-Fix any issues that come up.
+**4. Review and Test Pre-commit Hooks** ✅ DONE
+All 11 pre-commit hooks are passing.
 
 ## 📊 Risk Assessment (Post-Fixes)
 
 | Risk | Before | After | Notes |
 |------|--------|-------|-------|
 | Accidental secret commits | High | Low | Pre-commit hooks + .gitignore patterns |
-| Exposed AWS resource IDs | High | High* | *Still in git history, needs manual scrub |
+| Exposed AWS resource IDs (local) | High | **Low** ✅ | **Git history scrubbed locally** |
+| Exposed AWS resource IDs (GitHub) | High | **High*** | *Awaiting force-push decision |
 | Identity linkage | Medium | Medium | Email in commits, user decision needed |
 | Missing security docs | Medium | Low | SECURITY.md added |
 | Poor .gitignore coverage | Medium | Low | AWS CLI patterns added |
 
-## 🚀 Next Steps
+## 🚀 Next Steps (Priority Order)
 
-1. **If publishing soon**: Complete manual steps 1-3 above (critical)
-2. **If keeping private**: Manual steps are optional but recommended
-3. **Test the pre-commit setup**: Run `pip install pre-commit && pre-commit install && pre-commit run --all-files`
-4. **Review other modified files**: You have uncommitted changes in LICENSE, README.md, SETUP.md, cli.py, cloud-init/user-data.yaml
+1. **DECISION REQUIRED**: Force-push cleaned history or create new repo
+2. **After push decision**: Regenerate AWS resources (security group, instance, volumes)
+3. **Optional**: Commit remaining changes in LICENSE, README.md, SETUP.md, cloud-init/user-data.yaml
+4. **If publishing**: Configure GitHub security features
 
 ## 📚 References
 
@@ -138,4 +141,4 @@ Fix any issues that come up.
 
 ---
 
-**Status Summary**: Immediate code-level fixes complete. Git history cleanup and AWS resource regeneration are manual steps that require user decision and coordination.
+**Status Summary**: ✅ Git history successfully scrubbed locally. The AWS output file with volume IDs has been removed from all commits. Awaiting decision on force-pushing to GitHub, then AWS resource regeneration.
