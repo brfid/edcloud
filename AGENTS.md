@@ -73,7 +73,7 @@ pre-commit run --all-files   # Full suite
 - **Tag-based discovery**: No state file = works from multiple devices
 - **Cost-awareness**: Auto-shutdown after 30min idle, ~$11/mo target
 - **Security-first**: Tailscale-only, no public SSH, IMDSv2 enforced
-- **Portfolio-focused**: Decision rationale matters as much as code
+- **Portfolio-focused**: Self-documenting code with design decisions maintained cleanly and briefly in design.md
 
 ## Skill rubric vs. agent notes
 
