@@ -1,46 +1,39 @@
-# edcloud Setup Guide
+# edcloud setup guide
 
-Complete first-time setup from zero to running instance.
+Operator runbook for provisioning, operating, and recovering a single-instance edcloud deployment.
 
-## Active Priorities
+## Active priorities
 
-Canonical active TODO list for this repo:
+Open items only:
 
-- [x] Enforce "no local state file" as a hard invariant: commands must rely on AWS tag-based discovery (`edcloud:managed=true`) only.
-- [x] Add tests/validation that CLI flows do not read or write local state files.
-- [x] Add tag-drift guardrails: detect missing management tags, duplicate managed instances, and orphaned managed resources with clear remediation output.
-- [x] Define and enforce transient-instance policy: running host state may live for a while, but must be treated as disposable.
-- [x] Ensure active work on the instance is recoverable from upstream or reproducible sources (container images, compose configs, git repos, scripted bootstrap), not manual-only host state.
-- [x] Add and mount a dedicated 10GB EBS state volume at `/opt/edcloud/state` (separate from disposable host runtime).
-- [x] Keep runtime secrets in AWS SSM Parameter Store; no plaintext secrets in git.
-- [x] Standardize local operator command UX on ARM Linux around `edc` (`edc up`, `edc status`, `edc ssh`, `edc down`, `edc snapshot`, `edc destroy`).
-- [x] Document and template local ARM operator setup needed for orchestration (`edc` command install/wrapper, env vars, and shell/profile integration).
-- [x] Provide optional local orchestration templates where useful (for example systemd user units/timers for status checks, reminders, or snapshot cadence).
-- [ ] Encode core host tools/settings in `cloud-init/user-data.yaml` (no manual-only baseline drift).
-- [ ] Specify and version operator tool buildout + host config baseline (`packages`, services, files, and required settings) in `cloud-init/user-data.yaml`.
-- [x] Define and keep fresh-reprovision verification commands in this guide.
-- [ ] Set and follow snapshot cadence + retention policy for durable state (weekly + monthly, no daily baseline).
-- [x] Add explicit snapshot pruning procedure (keep 8 weekly + 3 monthly snapshots, plus pre-change snapshots).
-- [ ] Keep snapshot spend under a soft cap of `$5/month` and tune retention if exceeded.
-- [ ] Run restore drills from recent snapshots and verify: SSH, Docker, Tailscale, Portainer, and workload data under `/opt/edcloud/state`.
-- [ ] Record restore-drill date/result so backup posture is auditable over time.
-- [ ] Back up non-repo durable state under `/opt/edcloud/state`; reclone git repos from upstream on rebuild.
+- [x] Harden destructive lifecycle actions: require explicit instance-id confirmation for `edc destroy`, and add an option to require a fresh pre-change snapshot before deletion/rebuild.
+- [ ] Add a safe rebuild workflow (`snapshot -> reprovision -> verify`) as a single documented operator path.
+- [x] Persist user home on the state volume (`/opt/edcloud/state/home/ubuntu`) via cloud-init-managed bind mount and migration checks.
+- [x] Define default dev environment in cloud-init: `neovim` + LazyVim bootstrap, `byobu`, `gh`, and required runtime dependencies.
+- [x] Decide and codify package strategy for non-APT tooling (APT-first vs Linuxbrew) for repeatable, non-interactive provisioning.
+- [ ] Evaluate a secure operator login workflow that starts from one memorized string without weakening Tailscale/AWS MFA controls.
+- [ ] Centralize default SSH username in repo config (for example `edcloud/config.py`) and have `edc ssh`/`edc verify` read that value.
+- [ ] Run weekly + monthly snapshot cadence for durable state.
+- [ ] Keep snapshot spend under soft cap `$5/month`; adjust retention if exceeded.
+- [ ] Run restore drills from recent snapshots and verify SSH, Docker, Tailscale, Portainer, and data under `/opt/edcloud/state`.
+- [ ] Record restore drill date and result for auditability.
+- [ ] Back up non-repo durable state under `/opt/edcloud/state`; reclone repos from upstream on rebuild.
 
 ## Prerequisites
 
-- **AWS account** with credentials configured
-- **Tailscale account** (free tier works)
-- **Python 3.10+**
-- **Git**
-- **Operator device** running Linux/macOS/WSL. A small ARM host is valid
-  (for example, Raspberry Pi Zero 2 W) if it can run Python, AWS CLI, and Tailscale.
+- AWS account with CLI credentials configured
+- Tailscale account
+- Python 3.10+
+- Git
+- Linux/macOS/WSL operator environment
 
-## 1. AWS Setup
+A small ARM Linux operator node is supported if it can run Python, AWS CLI, and Tailscale.
 
-### Create IAM user (or use existing)
+## 1. AWS setup
 
-Minimum required permissions:
-```
+Required IAM actions:
+
+```text
 ec2:RunInstances
 ec2:DescribeInstances
 ec2:StartInstances
@@ -54,43 +47,26 @@ ec2:DescribeVolumes
 ec2:CreateSnapshot
 ec2:DescribeSnapshots
 ec2:DescribeImages
-ssm:GetParameter  # for AMI resolution
-ssm:PutParameter  # for storing Tailscale auth key in SSM
+ssm:GetParameter
+ssm:PutParameter
 ```
 
-If you want managed policies, use: `AmazonEC2FullAccess` + `AmazonSSMFullAccess`
-(or a least-privilege custom SSM policy with `ssm:GetParameter` and `ssm:PutParameter`).
-
-### Configure credentials
+Configure and verify credentials:
 
 ```bash
 aws configure
-# AWS Access Key ID: ...
-# AWS Secret Access Key: ...
-# Default region: us-east-1  (or your preferred region)
-# Default output format: json
-```
-
-Verify:
-```bash
 aws sts get-caller-identity
 ```
 
-## 2. Tailscale Setup
+## 2. Tailscale auth key
 
-### Generate an auth key
+Create a key in Tailscale admin:
 
-1. Go to https://login.tailscale.com/admin/settings/keys
-2. Click **Generate auth key**
-3. Settings:
-   - ✅ Reusable (so you can reprovision without generating new keys)
-   - ✅ Ephemeral (optional — instance removes itself from tailnet when terminated)
-   - Tag: `tag:edcloud` (optional — for ACL management)
-4. Copy the key (starts with `tskey-auth-...`)
+- URL: `https://login.tailscale.com/admin/settings/keys`
+- Recommended: reusable key
+- Optional: ephemeral key and `tag:edcloud`
 
-### Store auth key for provisioning
-
-Recommended: store the key in AWS SSM Parameter Store (SecureString):
+Store key in SSM Parameter Store:
 
 ```bash
 aws ssm put-parameter \
@@ -100,66 +76,57 @@ aws ssm put-parameter \
   --value 'tskey-auth-...'
 ```
 
-Then provision with:
+Use SSM-based provisioning (recommended):
+
 ```bash
 edc provision --tailscale-auth-key-ssm-parameter /edcloud/tailscale_auth_key
 ```
 
-Quick-start alternative: environment variable:
+Load key into current shell when needed:
 
 ```bash
-export TAILSCALE_AUTH_KEY='tskey-auth-...'
+eval "$(edc load-tailscale-env-key)"
 ```
 
-Or add to your `~/.bashrc` / `~/.zshrc`:
-```bash
-# edcloud
-export TAILSCALE_AUTH_KEY='tskey-auth-...'
-```
-
-**Security note**: Never commit this key to git. It's already in `.gitignore`.
-
-## 3. Install edcloud
+## 3. Install edcloud CLI
 
 ```bash
-git clone <your-fork-or-repo>
+git clone <your-repo>
 cd edcloud
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
-```
 
-Verify:
-```bash
 edc --version
 edc --help
 ```
 
-`edc` is the primary command surface for local operations. `edcloud` remains as a compatibility alias.
+`edc` is the primary command surface. `edcloud` remains a compatibility alias.
 
-### 3.1 Local ARM operator command setup (recommended)
+## 4. Optional: operator wrapper for ARM/Linux nodes
 
-Goal: run `edc up`, `edc status`, and related commands from a small ARM Linux operator node
-without manually activating the venv each time.
+This removes the need to manually activate the venv for every command.
 
-Install wrapper + env template:
 ```bash
 mkdir -p ~/.local/bin ~/.config/edcloud
 install -m 0755 templates/operator/edc-wrapper.sh ~/.local/bin/edc
 cp templates/operator/edc.env.example ~/.config/edcloud/edc.env
 ```
 
-Ensure `~/.local/bin` is on PATH (add to `~/.profile` if needed):
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
+If repo path differs from `~/edcloud`, set:
 
-If your repo checkout is not `~/edcloud`, set it in `~/.config/edcloud/edc.env`:
 ```bash
 EDCLOUD_REPO=/path/to/edcloud
 ```
 
-Optional automation templates (systemd user timers):
+To make `edc provision` work without repeated key flags, keep this in `~/.config/edcloud/edc.env`:
+
+```bash
+TAILSCALE_AUTH_KEY_SSM_PARAMETER=/edcloud/tailscale_auth_key
+```
+
+Optional automation templates:
+
 - `templates/operator/systemd-user/edc-weekly-snapshot.service`
 - `templates/operator/systemd-user/edc-weekly-snapshot.timer`
 - `templates/operator/systemd-user/edc-monthly-snapshot.service`
@@ -167,242 +134,193 @@ Optional automation templates (systemd user timers):
 - `templates/operator/run-reprovision-verify.sh`
 - `templates/operator/record-restore-drill.sh`
 
-## 4. Provision your instance
+## 5. Provision
 
 ```bash
 edc provision --tailscale-auth-key-ssm-parameter /edcloud/tailscale_auth_key
 ```
 
-This takes ~3-5 minutes:
-- Creates EC2 instance (t3a.medium by default)
-- Creates security group (no inbound rules)
-- Attaches 80GB gp3 root volume + 10GB gp3 state volume
-- Runs cloud-init (installs Docker, Tailscale, Portainer)
+If `TAILSCALE_AUTH_KEY_SSM_PARAMETER` is set in your operator env file:
 
-Output will show:
-```json
-{
-  "instance_id": "i-0abc123...",
-  "security_group_id": "sg-0def456...",
-  "public_ip": "54.x.y.z"
-}
+```bash
+edc provision
 ```
 
-## 5. Wait for cloud-init to complete
+Expected resources:
 
-Cloud-init installs Docker, Tailscale, and Portainer. Check progress:
+- 1x EC2 instance (`t3a.medium` default)
+- Security group with zero inbound rules
+- 40 GB gp3 root volume
+- 10 GB gp3 state volume mounted at `/opt/edcloud/state`
+
+## 6. Verify bootstrap
+
+Check status until reachable:
 
 ```bash
 edc status
 ```
 
-You'll see:
-```
-Instance:  i-0abc123...
-State:     running
-Type:      t3a.medium
-Public IP: 54.x.y.z
-Tailscale: 100.64.x.y (edcloud)
-Reachable: yes
+Run canonical verification:
+
+```bash
+edc verify
+edc verify --public-ip
+edc verify --json-output
 ```
 
-When `Reachable: yes`, it's ready.
-
-### Verify on the instance
+Manual check:
 
 ```bash
 edc ssh
-# Now on the instance:
 docker ps
 cat /tmp/edcloud-ready
 ```
 
-If you see the Portainer container running, you're good.
+## 7. Access Portainer
 
-### Fresh reprovision verification commands (canonical)
+From any tailnet device:
 
-Use the built-in verification helper:
-```bash
-edc verify
-```
-
-Public-IP fallback (if your local tailnet cannot resolve the peer yet):
-```bash
-edc verify --public-ip
-```
-
-Machine-readable output for logs/automation:
-```bash
-edc verify --json-output
-```
-
-Optional template script to save verification output with timestamp:
-```bash
-install -m 0755 templates/operator/run-reprovision-verify.sh ~/.local/bin/edc-verify-reprovision
-~/.local/bin/edc-verify-reprovision
-```
-
-## 6. Access Portainer
-
-From any device on your tailnet:
-```
+```text
 https://edcloud:9443
 ```
 
-First-time setup:
-1. Create admin password
-2. Choose "Get Started" → local Docker environment
-3. Done
+First login:
 
-## 7. Deploy a workload
+1. Set admin password.
+2. Select local Docker environment.
 
-### Example: Vintage computing lab
+## 8. Deploy workload example
 
 ```bash
 scp compose/vintage-lab.yml ubuntu@edcloud:/opt/edcloud/compose/
 edc ssh 'docker compose -f /opt/edcloud/compose/vintage-lab.yml up -d'
-```
-
-Or use Portainer:
-1. Stacks → Add stack
-2. Name: `vintage-lab`
-3. Upload `compose/vintage-lab.yml` or paste its contents
-4. Deploy
-
-Access VAX console:
-```bash
 telnet edcloud 2323
 ```
 
-## 8. Daily usage
+## 9. Daily operations
 
-**Start:**
 ```bash
 edc up
-```
-
-**Check status:**
-```bash
 edc status
-```
-
-**SSH in:**
-```bash
 edc ssh
-```
-
-**Stop (manual):**
-```bash
 edc down
 ```
 
-**Or let it auto-shutdown** after 30 minutes idle (no Tailscale SSH, low CPU).
+The instance also auto-shuts down after 30 minutes of idle activity.
 
-## 9. Backup
+Destroy safety guardrails:
 
-Operating model (agreed baseline):
-- Treat the EC2 host/runtime as transient and rebuildable.
-- Keep durable assistant/workflow state under `/opt/edcloud/state` (target mount path).
-- Reclone git repos from upstream on rebuild.
-- Keep secrets out of git; store runtime secrets in AWS SSM Parameter Store.
+```bash
+edc destroy --confirm-instance-id <instance-id>
+edc destroy --confirm-instance-id <instance-id> --require-fresh-snapshot
+```
 
-What gets backed up:
-- Durable state volume at `/opt/edcloud/state`
-  (assistant memory/state and non-repo configs/data).
-- Pre-change safety snapshots before risky infrastructure or workload changes.
-- Current CLI behavior note: `edc snapshot` captures all EBS volumes attached to the instance.
+## Default host toolset baseline
 
-Snapshot cadence (initial tempo):
-- Weekly snapshot of durable state.
-- Monthly snapshot of durable state.
-- No daily baseline by default.
+Core host tools are part of `cloud-init/user-data.yaml` and applied at provision time.
 
-Retention target:
-- Keep last 8 weekly snapshots.
-- Keep last 3 monthly snapshots.
-- Keep pre-change snapshots only as long as needed for rollback.
+Persistent home baseline:
 
-Create snapshots:
+- `~/` for `ubuntu` is bind-mounted to `/opt/edcloud/state/home/ubuntu`.
+- First boot migrates existing `/home/ubuntu` contents into the state volume.
+- This keeps shell/editor/tool settings across reprovision when reusing the state volume.
+
+Baseline packages:
+
+- `bash-completion`
+- `byobu`
+- `dnsutils`
+- `fd-find`
+- `fzf`
+- `gh`
+- `git`
+- `htop`
+- `jq`
+- `neovim`
+- `ripgrep`
+- `rsync`
+- `tmux`
+- `tree`
+- `unattended-upgrades`
+- `unzip`
+- `vim-tiny`
+- `xclip`
+- `zip`
+
+Package strategy:
+
+- Prefer Ubuntu APT packages for baseline reproducibility and low friction.
+- Install Homebrew by default for optional package gaps and operator preference.
+- Keep core runbook/tooling functional without requiring Homebrew formulas.
+
+Quick verification:
+
+```bash
+edc ssh 'git --version && tmux -V && rg --version && fdfind --version && htop --version | head -n 1'
+edc ssh 'nvim --version | head -n 1 && byobu -V && gh --version | head -n 1 && brew --version | head -n 1'
+edc ssh 'findmnt /home/ubuntu && df -h /home/ubuntu /opt/edcloud/state'
+```
+
+## 10. Backup and recovery standard
+
+Operating policy:
+
+- Treat host runtime as transient and rebuildable.
+- Persist durable state under `/opt/edcloud/state`.
+- Reclone git repositories from upstream on rebuild.
+- Store secrets in SSM, not in git.
+
+Snapshot operations:
+
 ```bash
 edc snapshot
-```
-
-List snapshots:
-```bash
 edc snapshot --list
+edc snapshot -d pre-change-<reason>
 ```
 
-Prune old periodic snapshots (safe preview first):
+Retention and pruning:
+
 ```bash
 edc snapshot --prune --keep-weekly 8 --keep-monthly 3 --dry-run
 edc snapshot --prune --keep-weekly 8 --keep-monthly 3 --apply
 ```
 
-Pre-change snapshots:
-```bash
-edc snapshot -d pre-change-<reason>
-```
+Policy targets:
 
-Notes:
-- Pruning targets snapshots with description prefixes `weekly-snapshot` and `monthly-snapshot`.
-- Pre-change snapshots are not pruned by default.
+- Weekly + monthly periodic snapshots
+- Keep 8 weekly and 3 monthly snapshots
+- Keep pre-change snapshots only while rollback value exists
+- Keep snapshot spend under `$5/month`
 
-Cost guardrail:
-- Soft cap snapshot spend at `$5/month`; reduce retention windows if exceeded.
+Restore drill baseline (monthly):
 
-## 10. Core Host Baseline (Rebuild-Safe)
+1. Restore from a recent snapshot.
+2. Verify Tailscale connectivity.
+3. Verify Docker and Portainer.
+4. Verify durable data under `/opt/edcloud/state`.
+5. Run `edc verify`.
 
-Current direction: define a core set of host tools/settings and make them reproducible.
+Optional drill record helper:
 
-Source of truth:
-- `cloud-init/user-data.yaml` for baseline packages/services/files
-- `compose/` for platform-managed workloads
-- this `SETUP.md` for operational procedure
-
-Rules:
-- If you manually install a tool that should persist across rebuilds, add it to `cloud-init/user-data.yaml`.
-- Keep dotfiles/system config that matter to operations in `write_files` or versioned scripts.
-- Avoid "snowflake host" drift.
-
-Suggested baseline workflow:
-1. Define core tools list in `cloud-init/user-data.yaml` (`packages` + `runcmd`).
-2. Reprovision a fresh instance and verify tooling from scratch.
-3. Record verification commands in this document.
-
-## 11. Backup + Recovery Standard
-
-Policy baseline:
-1. Weekly + monthly snapshots for durable state volume.
-2. Monthly restore drill:
-   - create/attach instance from recent snapshot,
-   - verify Tailscale connectivity,
-   - verify Docker and Portainer,
-   - verify workload data under `/opt/edcloud/state`,
-   - verify assistant state/memory expected to persist is present,
-   - run `edc verify`.
-3. Keep at least one known-good snapshot window before major changes.
-4. Before risky changes, take an on-demand pre-change snapshot.
-5. Prune snapshots beyond retention (`8 weekly + 3 monthly`) and track spend against the `$5/month` soft cap.
-
-Restore drill audit record (recommended):
 ```bash
 install -m 0755 templates/operator/record-restore-drill.sh ~/.local/bin/edc-record-restore-drill
 ~/.local/bin/edc-record-restore-drill pass snap-xxxxxxxx "monthly drill"
 cat ~/.config/edcloud/restore-drill.tsv
 ```
 
-## 12. Cost management
+## 11. Cost guardrail
 
-At 4 hours/day:
-- Compute: ~$4.51/mo
-- Storage: ~$7.20/mo
-- Snapshots: variable (target soft cap `$5/mo`; baseline often lower)
-- **Total: typically ~$12/mo + snapshot usage**
+Typical target at 4 hours/day:
 
-The instance auto-shuts-down when idle (no active SSH + low CPU for 30 minutes).
+- Compute: about `$4.51/month`
+- Storage: about `$4.00/month`
+- Snapshots: variable, target soft cap `$5/month`
+
+Use `edc status` and AWS Cost Explorer to track drift.
 
 ## Troubleshooting
 
-- Run `edc status` for instance/connection/cost visibility.
-- Validate AWS identity with `aws sts get-caller-identity`.
-- Validate local Tailscale with `tailscale status`.
+- Validate AWS identity: `aws sts get-caller-identity`
+- Validate local tailnet state: `tailscale status`
+- Validate instance and reachability: `edc status`

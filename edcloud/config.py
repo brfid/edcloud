@@ -15,7 +15,7 @@ NAME_TAG = "edcloud"
 # EC2 defaults
 # ---------------------------------------------------------------------------
 DEFAULT_INSTANCE_TYPE = "t3a.medium"
-DEFAULT_VOLUME_SIZE_GB = 80
+DEFAULT_VOLUME_SIZE_GB = 40
 DEFAULT_VOLUME_TYPE = "gp3"
 DEFAULT_STATE_VOLUME_SIZE_GB = 10
 DEFAULT_STATE_VOLUME_TYPE = "gp3"

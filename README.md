@@ -1,103 +1,92 @@
 # edcloud
 
-Personal cloud lab on AWS: one EC2 instance for x86_64 Linux workloads, managed through Portainer, accessed via Tailscale (no exposed ports).
+Single-instance AWS EC2 personal cloud lab for x86_64 Linux workloads.
 
-## Cold Start (Operator)
+- Access: Tailscale only (no public inbound rules)
+- Container management: Portainer CE
+- Operator interface: `edc` (`edcloud` remains a compatibility alias)
 
-Read in this order:
+## Read first
 
 1. `README.md`
 2. `SECURITY.md`
 3. `DESIGN.md`
 4. `SETUP.md`
-5. `AGENTS.md` (if using coding agents)
+5. `AGENTS.md` (only if you use coding agents)
 
-Control plane expectation: this is intended to be operable from a small ARM Linux system
-(for example, Raspberry Pi Zero 2 W) as long as it has Python 3, AWS CLI credentials, and Tailscale.
+## Quick start
 
-## Setup
+Prerequisites:
+
+- AWS account and configured CLI credentials
+- Tailscale account
+- Python 3.10+
+- Git
+
+Install and provision:
 
 ```bash
-# Prerequisites: AWS credentials configured, Tailscale account
-
-# Install
 git clone <repo>
 cd edcloud
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
 
-# Get Tailscale auth key from https://login.tailscale.com/admin/settings/keys
-# Store in SSM Parameter Store (recommended)
 aws ssm put-parameter \
   --name /edcloud/tailscale_auth_key \
   --type SecureString \
   --overwrite \
   --value 'tskey-auth-...'
 
-# Provision (~3 min: creates t3a.medium + 80GB root + 10GB state + Tailscale + Docker + Portainer)
 edc provision --tailscale-auth-key-ssm-parameter /edcloud/tailscale_auth_key
 ```
 
-## Usage
+Optional shell helper for reprovision workflows:
 
 ```bash
-edc up             # Start instance
-edc status         # Check state, Tailscale IP, cost estimate
-edc ssh            # SSH via Tailscale
-edc verify         # Fresh-reprovision verification checks
-edc down           # Stop (or auto-shuts down after 30min idle)
-edc snapshot       # Create EBS snapshot
+eval "$(edc load-tailscale-env-key)"
+```
+
+## Daily operations
+
+```bash
+edc up
+edc status
+edc ssh
+edc verify
+edc down
+edc snapshot
 edc snapshot --list
-edc snapshot --prune --dry-run
-edc destroy        # Terminate instance (EBS preserved)
+edc snapshot --prune --keep-weekly 8 --keep-monthly 3 --dry-run
+edc destroy --confirm-instance-id <instance-id>
 ```
 
-Access Portainer: `https://edcloud:9443` (from any device on your tailnet)
+Portainer URL (from a device on your tailnet): `https://edcloud:9443`
 
-## Cost
+## Architecture summary
 
-~$12/mo at 4hrs/day: $4.51 compute + $7.20 storage + snapshot usage (policy soft cap: $5/mo). Auto-shutdown when idle (no SSH + low CPU for 30min).
+- One `t3a.medium` instance (Ubuntu 24.04 LTS)
+- Two gp3 EBS volumes:
+  - 40 GB root
+  - 10 GB durable state at `/opt/edcloud/state`
+- `ubuntu` home persists on state volume via bind mount to `/opt/edcloud/state/home/ubuntu`
+- Resource discovery by tag: `edcloud:managed=true`
+- Runtime secrets from AWS SSM Parameter Store
+- Reprovision baseline includes core operator/dev tools (`neovim` + LazyVim starter, `byobu`, `gh`, `git`, `tmux`, `ripgrep`, `htop`) and Homebrew
 
-## Architecture
+## Cost model
 
-- **1x t3a.medium** (4GB RAM) — Docker host
-- **80GB gp3 root + 10GB gp3 state EBS** — host + durable assistant state
-- **Portainer CE** — container management UI
-- **Tailscale** — secure access, no public inbound ports
-- **Ubuntu 24.04 LTS** — 5yr security updates
+Typical target at 4 hours/day:
 
-Resources tracked by tag `edcloud:managed=true` (no local state file).
+- Compute: about `$4.51/month`
+- Storage: about `$4.00/month`
+- Snapshots: variable, soft cap `$5/month`
 
-## Example workload
-
-Deploy the vintage computing lab (VAX + PDP-11 SIMH):
-
-```bash
-scp compose/vintage-lab.yml ubuntu@edcloud:/opt/edcloud/compose/
-edc ssh 'docker compose -f /opt/edcloud/compose/vintage-lab.yml up -d'
-telnet edcloud 2323  # VAX console
-```
-
-Or use Portainer to deploy any Docker Compose stack.
-
-## Reproducible Baseline + Backup (Current Priority)
-
-Canonical task list: [`SETUP.md` → `Active Priorities`](SETUP.md#active-priorities).
+Auto-shutdown stops idle instances after 30 minutes.
 
 ## Documentation
 
-- **[SECURITY.md](SECURITY.md)** — Security policy, threat model, and vulnerability reporting
-- **[DESIGN.md](DESIGN.md)** — Architecture decisions and trade-offs
-- **[SETUP.md](SETUP.md)** — Detailed first-time setup guide
-- **[AGENTS.md](AGENTS.md)** — Agent workflow constraints for this repo
-
-## Security
-
-This project follows secure development practices:
-- No credentials in code or git history
-- Automated secret scanning (pre-commit hooks)
-- Tailscale-only access (zero public inbound ports)
-- Comprehensive security documentation
-
-See [SECURITY.md](SECURITY.md) for the full security policy and threat model.
+- `SECURITY.md`: threat model, assumptions, vulnerability reporting
+- `DESIGN.md`: design decisions and trade-offs
+- `SETUP.md`: full operator runbook and backup/recovery procedure
+- `AGENTS.md`: repo workflow constraints for coding agents

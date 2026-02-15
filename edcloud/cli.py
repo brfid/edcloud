@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import subprocess
+from datetime import datetime, timezone
 
 import boto3
 import click
@@ -15,6 +16,9 @@ from botocore.exceptions import ClientError
 from edcloud import ec2, snapshot, tailscale
 from edcloud.aws_check import check_aws_credentials, get_region
 from edcloud.config import DEFAULT_TAILSCALE_HOSTNAME, InstanceConfig
+
+DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER = "/edcloud/tailscale_auth_key"
+PRECHANGE_SNAPSHOT_PREFIX = "pre-change"
 
 
 def require_aws_creds(func):
@@ -36,6 +40,47 @@ def require_aws_creds(func):
             raise SystemExit(1) from exc
 
     return wrapper
+
+
+def _fetch_tailscale_auth_key_from_ssm(parameter_name: str) -> str:
+    ssm = boto3.client("ssm")
+    resp = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+    return str(resp["Parameter"]["Value"])
+
+
+def _snapshot_start_time(start_time: str) -> datetime | None:
+    if not start_time:
+        return None
+    ts = start_time.strip()
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _find_recent_prechange_snapshot(max_age_minutes: int) -> dict[str, object] | None:
+    now = datetime.now(timezone.utc)
+    freshest: tuple[datetime, dict[str, object]] | None = None
+    for snap_info in snapshot.list_snapshots():
+        description = str(snap_info.get("description", "")).strip().lower()
+        if not description.startswith(PRECHANGE_SNAPSHOT_PREFIX):
+            continue
+        if snap_info.get("state") != "completed":
+            continue
+        parsed = _snapshot_start_time(str(snap_info.get("start_time", "")))
+        if not parsed:
+            continue
+        age_minutes = (now - parsed).total_seconds() / 60
+        if age_minutes < 0 or age_minutes > max_age_minutes:
+            continue
+        if freshest is None or parsed > freshest[0]:
+            freshest = (parsed, snap_info)
+    return freshest[1] if freshest else None
 
 
 @click.group()
@@ -82,6 +127,7 @@ def main() -> None:
 @click.option(
     "--tailscale-auth-key-ssm-parameter",
     default=None,
+    envvar="TAILSCALE_AUTH_KEY_SSM_PARAMETER",
     help="SSM parameter name containing Tailscale auth key (SecureString supported).",
 )
 @require_aws_creds
@@ -96,9 +142,9 @@ def provision(
     """Create the edcloud EC2 instance from scratch."""
     if not tailscale_auth_key and tailscale_auth_key_ssm_parameter:
         try:
-            ssm = boto3.client("ssm")
-            resp = ssm.get_parameter(Name=tailscale_auth_key_ssm_parameter, WithDecryption=True)
-            tailscale_auth_key = resp["Parameter"]["Value"]
+            tailscale_auth_key = _fetch_tailscale_auth_key_from_ssm(
+                tailscale_auth_key_ssm_parameter
+            )
         except ClientError as exc:
             click.echo(
                 "Error: could not read Tailscale auth key from SSM parameter "
@@ -126,6 +172,47 @@ def provision(
     result = ec2.provision(cfg, tailscale_auth_key)
     click.echo()
     click.echo(json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# secrets helpers
+# ---------------------------------------------------------------------------
+@main.command("load-tailscale-env-key")
+@click.option(
+    "--tailscale-auth-key-ssm-parameter",
+    default=DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER,
+    envvar="TAILSCALE_AUTH_KEY_SSM_PARAMETER",
+    show_default=True,
+    help="SSM parameter to read (SecureString supported).",
+)
+@click.option(
+    "--shell-export/--no-shell-export",
+    default=True,
+    show_default=True,
+    help='Print export command for eval: eval "$(edc load-tailscale-env-key)"',
+)
+@require_aws_creds
+def load_tailscale_env_key(
+    tailscale_auth_key_ssm_parameter: str,
+    shell_export: bool,
+) -> None:
+    """Load TAILSCALE_AUTH_KEY from SSM for local operator usage."""
+    try:
+        key = _fetch_tailscale_auth_key_from_ssm(tailscale_auth_key_ssm_parameter)
+    except ClientError as exc:
+        click.echo(
+            "Error: could not read Tailscale auth key from SSM parameter "
+            f"'{tailscale_auth_key_ssm_parameter}': {exc}",
+            err=True,
+        )
+        raise SystemExit(1) from exc
+
+    if shell_export:
+        click.echo(f"export TAILSCALE_AUTH_KEY={shlex.quote(key)}")
+
+    if not shell_export:
+        click.echo("No output selected. Use --shell-export.", err=True)
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -219,9 +306,69 @@ def status() -> None:
 # ---------------------------------------------------------------------------
 @main.command()
 @click.option("--force", is_flag=True, help="Skip confirmation prompt.")
+@click.option(
+    "--confirm-instance-id",
+    default=None,
+    help="Required safety confirmation. Must match current managed instance ID.",
+)
+@click.option(
+    "--require-fresh-snapshot",
+    is_flag=True,
+    help="Require a recent pre-change snapshot before destroy.",
+)
+@click.option(
+    "--fresh-snapshot-max-age-minutes",
+    default=120,
+    type=int,
+    show_default=True,
+    help="Maximum snapshot age for --require-fresh-snapshot.",
+)
 @require_aws_creds
-def destroy(force: bool) -> None:
+def destroy(
+    force: bool,
+    confirm_instance_id: str | None,
+    require_fresh_snapshot: bool,
+    fresh_snapshot_max_age_minutes: int,
+) -> None:
     """Terminate the instance and clean up. EBS volume is preserved."""
+    if fresh_snapshot_max_age_minutes <= 0:
+        click.echo("Error: --fresh-snapshot-max-age-minutes must be > 0.", err=True)
+        raise SystemExit(1)
+
+    info = ec2.status()
+    if info.get("exists"):
+        instance_id = str(info.get("instance_id", ""))
+        if confirm_instance_id != instance_id:
+            click.echo(
+                "Error: destructive action requires explicit instance ID confirmation.",
+                err=True,
+            )
+            click.echo(
+                f"  Re-run with: edc destroy --confirm-instance-id {instance_id}",
+                err=True,
+            )
+            raise SystemExit(1)
+
+        if require_fresh_snapshot:
+            recent = _find_recent_prechange_snapshot(fresh_snapshot_max_age_minutes)
+            if not recent:
+                click.echo(
+                    "Error: no fresh pre-change snapshot found for this guardrail.",
+                    err=True,
+                )
+                click.echo(
+                    "  Create one: edc snapshot -d pre-change-<reason>",
+                    err=True,
+                )
+                click.echo(
+                    "  Then rerun destroy with --require-fresh-snapshot.",
+                    err=True,
+                )
+                raise SystemExit(1)
+            click.echo(
+                f"Using pre-change snapshot: {recent['snapshot_id']} ({recent['start_time']})"
+            )
+
     ec2.destroy(force=force)
 
 
@@ -330,6 +477,8 @@ def verify_cmd(user: str, public_ip: bool, json_output: bool) -> None:
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=12",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
     ]
     if public_ip:
         target = str(info.get("public_ip") or "")
@@ -355,6 +504,13 @@ def verify_cmd(user: str, public_ip: bool, json_output: bool) -> None:
         ("state directory exists", "test -d /opt/edcloud/state"),
         ("state directory is mounted", "mountpoint -q /opt/edcloud/state"),
         ("state directory writable", "test -w /opt/edcloud/state"),
+        ("home directory exists", "test -d /home/ubuntu"),
+        ("home directory is mounted", "mountpoint -q /home/ubuntu"),
+        ("home directory writable", "test -w /home/ubuntu"),
+        ("neovim installed", "command -v nvim >/dev/null"),
+        ("byobu installed", "command -v byobu >/dev/null"),
+        ("gh installed", "command -v gh >/dev/null"),
+        ("lazyvim starter present", "test -f /home/ubuntu/.config/nvim/init.lua"),
     ]
 
     results: list[dict[str, str | bool]] = []
@@ -445,7 +601,7 @@ def ssh_cmd(user: str, public_ip: bool, ssh_args: tuple[str, ...]) -> None:
             raise SystemExit(1)
         click.echo(f"Connecting via public IP: {target}", err=True)
         click.echo("Note: Security group must allow SSH (port 22) from your IP", err=True)
-        cmd = ["ssh", f"{user}@{target}"]
+        cmd = ["ssh", "-o", "StrictHostKeyChecking=accept-new", f"{user}@{target}"]
     else:
         ts_ip = tailscale.get_tailscale_ip(DEFAULT_TAILSCALE_HOSTNAME)
         if ts_ip:
@@ -456,7 +612,14 @@ def ssh_cmd(user: str, public_ip: bool, ssh_args: tuple[str, ...]) -> None:
             )
             # Use ProxyCommand=none to attempt regular SSH over Tailscale network
             # (Tailscale SSH may still intercept depending on tailnet settings)
-            cmd = ["ssh", "-o", "ProxyCommand=none", f"{user}@{target}"]
+            cmd = [
+                "ssh",
+                "-o",
+                "ProxyCommand=none",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                f"{user}@{target}",
+            ]
         else:
             click.echo("Error: Tailscale IP not found. Is tailscale running?", err=True)
             click.echo("  Try: tailscale status", err=True)

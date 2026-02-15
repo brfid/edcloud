@@ -6,7 +6,7 @@ from edcloud.config import MANAGER_TAG_KEY, MANAGER_TAG_VALUE, InstanceConfig
 def test_default_config():
     cfg = InstanceConfig()
     assert cfg.instance_type == "t3a.medium"
-    assert cfg.volume_size_gb == 80
+    assert cfg.volume_size_gb == 40
     assert cfg.volume_type == "gp3"
     assert cfg.state_volume_size_gb == 10
     assert cfg.state_volume_type == "gp3"

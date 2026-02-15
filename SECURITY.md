@@ -1,88 +1,59 @@
-# Security Policy
+# Security policy
 
-## Threat Model
+## Security model
 
-**edcloud** is designed for personal use: a single-user cloud lab accessible only via Tailscale. It is **not** designed for multi-tenant scenarios or public-facing services.
+edcloud is a single-operator personal lab, not a multi-tenant platform.
 
-### Security Assumptions
+Core assumptions:
 
-1. **Tailscale-only access**: The EC2 security group has zero inbound rules. All access (SSH, Portainer, container consoles) is via Tailscale's encrypted mesh network.
-2. **Single operator**: No IAM/RBAC within the instance — the ubuntu user has full Docker access.
-3. **Trusted workloads**: Containers run with default Docker privileges. Do not run untrusted code.
-4. **AWS credentials**: The CLI relies on your local AWS credentials. Use IAM roles with least-privilege policies.
+- Access is Tailscale-only.
+- The EC2 security group has no inbound rules.
+- The operator controls AWS and Tailscale identities.
+- Workloads are trusted by the operator.
 
-### What edcloud Protects Against
+## What this project is designed to prevent
 
-- Public SSH exposure (port 22 is never open to 0.0.0.0/0)
-- IMDS attacks (IMDSv2 required, hop limit = 1)
-- Idle cost (auto-shutdown after 30 minutes of inactivity)
-- Accidental public service exposure (no inbound security group rules)
+- Public SSH exposure
+- Public exposure of Portainer or workload ports
+- IMDSv1 usage (IMDSv2 is required)
+- Avoidable idle spend (automatic idle shutdown)
 
-### What edcloud Does NOT Protect Against
+## What this project does not try to prevent
 
-- Compromised Tailscale credentials (attacker gains full instance access)
-- Malicious containers (no AppArmor/SELinux hardening by default)
-- AWS account compromise (attacker can destroy/modify infrastructure)
-- Physical access to devices in your tailnet
+- Compromise of your AWS or Tailscale account
+- Malicious or vulnerable containers you choose to run
+- Physical compromise of devices in your tailnet
+- Multi-user isolation and tenant-level access control
 
-## Supported Versions
+## Required operator practices
 
-| Version | Supported          |
-| ------- | ------------------ |
-| main    | :white_check_mark: |
+- Keep runtime secrets in AWS SSM Parameter Store.
+- Do not commit credentials, keys, or tokens to git.
+- Use MFA on AWS and your identity provider.
+- Rotate Tailscale auth keys and remove unused devices.
+- Run restore drills and validate backup recovery.
 
-This is a personal project without formal versioning. Security fixes are applied to `main`.
+## Vulnerability reporting
 
-## Reporting a Vulnerability
+Do not open public issues for security vulnerabilities.
 
-**Please do not open public GitHub issues for security vulnerabilities.**
+Report privately to the repository owner and include:
 
-If you discover a security issue, please report it privately:
+- A clear description
+- Reproduction steps
+- Expected impact
+- Suggested remediation (optional)
 
-1. **Email**: Send details to the repository owner (check git commit history for contact info)
-2. **Scope**: Report vulnerabilities in the edcloud code, not in upstream dependencies (Docker, Tailscale, SIMH, etc.)
+Response targets:
 
-### What to Include
+- Initial acknowledgment: within 7 days
+- Fix priority: based on impact and exploitability
+- Public disclosure: after a fix is available
 
-- Description of the vulnerability
-- Steps to reproduce (if applicable)
-- Potential impact
-- Suggested fix (optional)
+## Supported code line
 
-### Response Timeline
+Security fixes are applied on `main`.
 
-- **Initial acknowledgment**: Within 7 days
-- **Fix timeline**: Depends on severity. Critical issues (credential exposure, remote code execution) will be prioritized.
-- **Disclosure**: Coordinated disclosure after fix is merged to `main`.
+## Dependency scope
 
-## Security Best Practices for Users
-
-1. **Rotate Tailscale auth keys**: Use ephemeral keys when possible.
-2. **Enable AWS MFA**: Protect your AWS account with multi-factor authentication.
-3. **Review Portainer access logs**: Check for unexpected container operations.
-4. **Keep Docker updated**: The cloud-init script installs Docker CE. Periodically recreate the instance to get latest packages.
-5. **Keep secrets out of git**: Store runtime secrets in AWS SSM Parameter Store, not plaintext repo files.
-6. **Snapshot before experiments**: Use `edc snapshot` before running unfamiliar workloads.
-7. **Monitor costs**: Use `edc status` and AWS Cost Explorer to catch runaway resources.
-
-## Dependencies
-
-edcloud relies on these third-party services:
-
-- **AWS EC2**: Compute platform (security updates via Ubuntu's unattended-upgrades)
-- **Tailscale**: Zero-trust network (audited by Cure53, SOC 2 Type II certified)
-- **Docker**: Container runtime (official Ubuntu packages)
-- **Portainer CE**: Container UI (community edition, self-hosted)
-
-Vulnerabilities in these dependencies should be reported to their respective maintainers.
-
-## Out of Scope
-
-- "Security issues" that require physical access to your devices
-- Social engineering attacks on your Tailscale/AWS accounts
-- Denial-of-service via AWS API rate limits (boto3 has no retry limits configured)
-- Issues with workloads you deploy (VAX/PDP-11 SIMH, etc.)
-
-## License
-
-This security policy follows the same license as the project (see [LICENSE](LICENSE)).
+Security issues in upstream dependencies (AWS, Ubuntu, Docker, Tailscale, Portainer) should also be reported to the relevant maintainers.
