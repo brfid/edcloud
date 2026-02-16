@@ -1,11 +1,12 @@
-"""EC2 lifecycle: provision, start, stop, status, destroy.
+"""EC2 lifecycle management: provision, start, stop, status, destroy.
 
-Resources are tracked by AWS tags (no local state file needed).
+Resources are tracked by AWS tags — no local state file needed.
 Tag ``edcloud:managed = true`` identifies all managed resources.
 """
 
 from __future__ import annotations
 
+import re
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -39,7 +40,11 @@ _ACTIVE_INSTANCE_STATES = ["pending", "running", "stopping", "stopped"]
 
 
 class TagDriftError(RuntimeError):
-    """Tag-based discovery invariants were violated."""
+    """Tag-based discovery invariants were violated.
+
+    Raised when managed-resource tags are missing, duplicated, or
+    inconsistent — situations that cannot be resolved automatically.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -48,31 +53,32 @@ class TagDriftError(RuntimeError):
 
 
 def _ec2_client() -> Any:
+    """Return a low-level EC2 client."""
     return boto3.client("ec2")
 
 
 def _ec2_resource() -> Any:
+    """Return a high-level EC2 resource."""
     return boto3.resource("ec2")
 
 
 def _ssm_client() -> Any:
+    """Return a low-level SSM client."""
     return boto3.client("ssm")
 
 
-# Backward-compat aliases for callers that import the underscore-prefixed names
-_managed_filter = managed_filter
-_has_managed_tag = has_managed_tag
-
-
 def _instance_state_filter() -> dict[str, Any]:
+    """Filter clause limiting results to non-terminated instance states."""
     return {"Name": "instance-state-name", "Values": _ACTIVE_INSTANCE_STATES}
 
 
 def _instance_summary(instances: list[dict[str, Any]]) -> str:
+    """Format a compact ``id (state)`` summary for one or more instances."""
     return ", ".join(f"{i['InstanceId']} ({i['State']['Name']})" for i in instances)
 
 
 def _list_instances(client: Any, filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Describe instances matching *filters*, excluding terminated ones."""
     resp = client.describe_instances(Filters=[*filters, _instance_state_filter()])
     instances: list[dict[str, Any]] = []
     for reservation in resp.get("Reservations", []):
@@ -81,7 +87,11 @@ def _list_instances(client: Any, filters: list[dict[str, Any]]) -> list[dict[str
 
 
 def _validate_instance_volume_tags(client: Any, instance: dict[str, Any]) -> None:
-    """Ensure attached volumes keep the managed tag."""
+    """Ensure every volume attached to *instance* carries the managed tag.
+
+    Raises:
+        TagDriftError: If any attached volume is missing the managed tag.
+    """
     volume_ids = get_volume_ids(instance)
     if not volume_ids:
         return
@@ -104,7 +114,11 @@ def _validate_instance_volume_tags(client: Any, instance: dict[str, Any]) -> Non
 
 
 def _managed_orphan_report(client: Any) -> dict[str, list[str]]:
-    """Return orphaned managed resources outside an active managed instance."""
+    """Scan for managed resources not attached to an active instance.
+
+    Returns:
+        Dict with ``security_groups`` and ``volumes`` lists of orphaned IDs.
+    """
     report: dict[str, list[str]] = {"security_groups": [], "volumes": []}
 
     sg_resp = client.describe_security_groups(Filters=managed_filter())
@@ -122,6 +136,7 @@ def _managed_orphan_report(client: Any) -> dict[str, list[str]]:
 
 
 def _orphaned_resources_text(report: dict[str, list[str]]) -> str:
+    """Render human-readable lines for orphaned-resource IDs."""
     lines: list[str] = []
     security_groups = report.get("security_groups", [])
     volumes = report.get("volumes", [])
@@ -139,7 +154,11 @@ def _apply_tags(client: Any, resource_ids: list[str], tags: dict[str, str]) -> N
 
 
 def _find_orphaned_state_volume_id(client: Any) -> str | None:
-    """Return a single available managed state volume ID, if present."""
+    """Return the single available managed state volume ID, if present.
+
+    Raises:
+        TagDriftError: If multiple available state volumes exist.
+    """
     resp = client.describe_volumes(
         Filters=[
             {"Name": f"tag:{MANAGER_TAG_KEY}", "Values": [MANAGER_TAG_VALUE]},
@@ -160,7 +179,11 @@ def _find_orphaned_state_volume_id(client: Any) -> str | None:
 
 
 def _state_volume_az(client: Any, volume_id: str) -> str:
-    """Return availability zone for an EBS volume."""
+    """Return the availability zone of an EBS volume.
+
+    Raises:
+        RuntimeError: If the volume is not found.
+    """
     resp = client.describe_volumes(VolumeIds=[volume_id])
     volumes = resp.get("Volumes", [])
     if not volumes:
@@ -169,7 +192,11 @@ def _state_volume_az(client: Any, volume_id: str) -> str:
 
 
 def _default_subnet_for_az(client: Any, az: str) -> str:
-    """Get default subnet ID in a given AZ for deterministic instance placement."""
+    """Return the default subnet ID in a given availability zone.
+
+    Raises:
+        RuntimeError: If no default subnet exists in the AZ.
+    """
     resp = client.describe_subnets(
         Filters=[
             {"Name": "availability-zone", "Values": [az]},
@@ -186,8 +213,15 @@ def _default_subnet_for_az(client: Any, az: str) -> str:
 
 
 def _find_instance(client: Any) -> dict[str, Any] | None:
-    """Find the single edcloud-managed instance (any state except terminated)."""
-    managed_instances = _list_instances(client, _managed_filter())
+    """Locate the single edcloud-managed instance (any non-terminated state).
+
+    Returns:
+        Instance dict from ``describe_instances``, or ``None``.
+
+    Raises:
+        TagDriftError: On duplicate managed instances or missing tags.
+    """
+    managed_instances = _list_instances(client, managed_filter())
     if len(managed_instances) > 1:
         raise TagDriftError(
             "Tag drift detected: multiple managed instances found: "
@@ -198,7 +232,7 @@ def _find_instance(client: Any) -> dict[str, Any] | None:
 
     if not managed_instances:
         named_instances = _list_instances(client, [{"Name": "tag:Name", "Values": [NAME_TAG]}])
-        untagged_named = [i for i in named_instances if not _has_managed_tag(i.get("Tags", []))]
+        untagged_named = [i for i in named_instances if not has_managed_tag(i.get("Tags", []))]
         if untagged_named:
             instance_ids = " ".join(i["InstanceId"] for i in untagged_named)
             instance_list = ", ".join(i["InstanceId"] for i in untagged_named)
@@ -218,7 +252,11 @@ def _find_instance(client: Any) -> dict[str, Any] | None:
 
 
 def _find_security_group(client: Any) -> str | None:
-    """Return the edcloud security group ID, or None."""
+    """Return the edcloud security-group ID, or ``None`` if it doesn't exist.
+
+    Raises:
+        TagDriftError: On duplicate or untagged security groups.
+    """
     try:
         resp = client.describe_security_groups(
             Filters=[{"Name": "group-name", "Values": [SECURITY_GROUP_NAME]}]
@@ -227,8 +265,8 @@ def _find_security_group(client: Any) -> str | None:
         return None
 
     groups = resp.get("SecurityGroups", [])
-    managed_groups = [g for g in groups if _has_managed_tag(g.get("Tags", []))]
-    unmanaged_groups = [g for g in groups if not _has_managed_tag(g.get("Tags", []))]
+    managed_groups = [g for g in groups if has_managed_tag(g.get("Tags", []))]
+    unmanaged_groups = [g for g in groups if not has_managed_tag(g.get("Tags", []))]
 
     if len(managed_groups) > 1:
         raise TagDriftError(
@@ -262,7 +300,11 @@ def _find_security_group(client: Any) -> str | None:
 
 
 def _resolve_ami(ssm_parameter: str) -> str:
-    """Resolve an AMI ID from an SSM public parameter."""
+    """Resolve an AMI ID from an SSM public parameter.
+
+    Falls back to a ``describe_images`` search if the SSM parameter is
+    missing.
+    """
     ssm = _ssm_client()
     try:
         resp = ssm.get_parameter(Name=ssm_parameter)
@@ -290,7 +332,11 @@ def _resolve_ami(ssm_parameter: str) -> str:
 
 
 def _get_default_vpc_id(client: Any) -> str:
-    """Get the default VPC ID."""
+    """Return the default VPC ID.
+
+    Raises:
+        RuntimeError: If no default VPC exists.
+    """
     resp = client.describe_vpcs(Filters=[{"Name": "is-default", "Values": ["true"]}])
     vpcs = resp.get("Vpcs", [])
     if not vpcs:
@@ -299,7 +345,11 @@ def _get_default_vpc_id(client: Any) -> str:
 
 
 def _get_aws_region() -> str:
-    """Get the current AWS region from the session."""
+    """Return the current AWS region from the boto3 session.
+
+    Raises:
+        RuntimeError: If no region is configured.
+    """
     region = get_region()
     if not region:
         raise RuntimeError(
@@ -316,10 +366,15 @@ def _validate_user_data_inputs(
 ) -> None:
     """Validate user-data template inputs to prevent injection attacks.
 
-    Raises ValueError if any input contains dangerous characters or invalid format.
-    """
-    import re
+    Args:
+        tailscale_hostname: DNS-safe hostname (1-63 chars, alphanumeric/hyphen).
+        tailscale_auth_key: Raw auth key value (checked for shell-dangerous chars).
+        tailscale_auth_key_ssm_parameter: SSM parameter path (path-safe chars only).
+        aws_region: AWS region string (e.g. ``us-east-1``).
 
+    Raises:
+        ValueError: If any input contains invalid or dangerous characters.
+    """
     # Validate hostname: DNS-safe, 1-63 chars
     if not re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$", tailscale_hostname):
         raise ValueError(
@@ -357,7 +412,16 @@ def _render_user_data(
     tailscale_hostname: str,
     aws_region: str,
 ) -> str:
-    """Read cloud-init template and interpolate variables."""
+    """Read the cloud-init template and interpolate runtime variables.
+
+    Args:
+        tailscale_auth_key_ssm_parameter: SSM parameter the instance reads at boot.
+        tailscale_hostname: MagicDNS hostname to register.
+        aws_region: Region for SSM API calls from the instance.
+
+    Returns:
+        Rendered user-data string ready for RunInstances.
+    """
     _validate_user_data_inputs(
         tailscale_hostname=tailscale_hostname,
         tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
@@ -382,9 +446,19 @@ def provision(
 ) -> dict[str, str]:
     """Create the edcloud instance from scratch.
 
-    The Tailscale auth key is fetched from SSM at boot time by the instance.
+    The Tailscale auth key is fetched from SSM at boot time by the instance
+    itself.
 
-    Returns dict with instance_id, security_group_id, public_ip (if any).
+    Args:
+        cfg: Resolved instance configuration.
+        require_existing_state_volume: If ``True``, abort when no reusable
+            managed state volume is available.
+
+    Returns:
+        Dict with keys ``instance_id``, ``security_group_id``, ``public_ip``.
+
+    Raises:
+        RuntimeError: If an instance already exists, or provisioning fails.
     """
     ec2 = _ec2_client()
 
@@ -611,7 +685,15 @@ def provision(
 
 
 def start() -> str:
-    """Start a stopped edcloud instance. Returns instance ID."""
+    """Start a stopped edcloud instance.
+
+    Returns:
+        The instance ID.
+
+    Raises:
+        RuntimeError: If no instance exists or it isn't in ``stopped`` state.
+        TagDriftError: If orphaned managed resources are found instead.
+    """
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
     if not inst:
@@ -649,7 +731,15 @@ def start() -> str:
 
 
 def stop() -> str:
-    """Stop a running edcloud instance. Returns instance ID."""
+    """Stop a running edcloud instance.
+
+    Returns:
+        The instance ID.
+
+    Raises:
+        RuntimeError: If no instance exists or it isn't in ``running`` state.
+        TagDriftError: If orphaned managed resources are found instead.
+    """
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
     if not inst:
@@ -682,7 +772,14 @@ def stop() -> str:
 
 
 def status() -> dict[str, Any]:
-    """Return current instance status as a dict."""
+    """Return current instance status.
+
+    Returns:
+        Dict with at least ``exists: bool``.  When the instance exists the
+        dict also contains ``instance_id``, ``state``, ``instance_type``,
+        ``public_ip``, ``launch_time``, ``volumes``, and ``cost_estimate``.
+        When it does not exist, an ``orphaned_resources`` summary is included.
+    """
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
 
@@ -740,9 +837,13 @@ def status() -> dict[str, Any]:
 
 
 def destroy(force: bool = False) -> None:
-    """Terminate the edcloud instance and clean up the security group.
+    """Terminate the edcloud instance and clean up its security group and IAM.
 
-    The EBS volume survives (DeleteOnTermination=false).
+    EBS volumes survive (``DeleteOnTermination=False``).  Orphaned volumes
+    are listed at the end for manual cleanup.
+
+    Args:
+        force: Skip the interactive confirmation prompt.
     """
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
@@ -795,7 +896,7 @@ def destroy(force: bool = False) -> None:
     delete_instance_profile()
 
     # List orphaned volumes
-    vol_resp = ec2.describe_volumes(Filters=_managed_filter())
+    vol_resp = ec2.describe_volumes(Filters=managed_filter())
     orphaned = vol_resp.get("Volumes", [])
     if orphaned:
         print()

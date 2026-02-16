@@ -1,4 +1,4 @@
-"""EBS snapshot management."""
+"""EBS snapshot management: create, list, and prune edcloud snapshots."""
 
 from __future__ import annotations
 
@@ -19,9 +19,10 @@ MONTHLY_PREFIX = "monthly-snapshot"
 
 
 def auto_snapshot_before_destroy() -> list[str]:
-    """Create automatic snapshot before destructive operation.
+    """Snapshot all volumes of the current instance before a destructive op.
 
-    Returns list of snapshot IDs, or empty list if no instance exists.
+    Returns:
+        List of snapshot IDs created, or empty list if no instance exists.
     """
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
@@ -35,9 +36,16 @@ def auto_snapshot_before_destroy() -> list[str]:
 
 
 def create_snapshot(description: str | None = None) -> list[str]:
-    """Snapshot all EBS volumes attached to the edcloud instance.
+    """Snapshot every EBS volume attached to the edcloud instance.
 
-    Returns list of snapshot IDs.
+    Args:
+        description: Optional description; auto-generated if omitted.
+
+    Returns:
+        List of created snapshot IDs.
+
+    Raises:
+        RuntimeError: If no instance or no volumes are found.
     """
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
@@ -80,7 +88,12 @@ def create_snapshot(description: str | None = None) -> list[str]:
 
 
 def list_snapshots() -> list[dict[str, Any]]:
-    """List all edcloud-managed snapshots."""
+    """List all edcloud-managed snapshots, most recent first.
+
+    Returns:
+        Dicts with keys: ``snapshot_id``, ``volume_id``, ``size_gb``,
+        ``state``, ``progress``, ``start_time``, ``description``, ``name``.
+    """
     ec2 = _ec2_client()
     resp = ec2.describe_snapshots(
         Filters=managed_filter(),
@@ -111,13 +124,23 @@ def prune_snapshots(
     keep_monthly: int = 3,
     dry_run: bool = True,
 ) -> dict[str, Any]:
-    """Prune old periodic snapshots.
+    """Prune old periodic snapshots per a retention policy.
 
-    Retention policy:
-    - Keep newest ``keep_weekly`` snapshots whose description starts with ``weekly-snapshot``.
-    - Keep newest ``keep_monthly`` snapshots whose description starts with ``monthly-snapshot``.
+    Retention:
+        * Keep newest *keep_weekly* snapshots prefixed ``weekly-snapshot``.
+        * Keep newest *keep_monthly* snapshots prefixed ``monthly-snapshot``.
+        * Snapshots with other descriptions (e.g. ``pre-change``) are never pruned.
 
-    Snapshots with other descriptions (for example pre-change snapshots) are not pruned.
+    Args:
+        keep_weekly: Number of weekly snapshots to retain.
+        keep_monthly: Number of monthly snapshots to retain.
+        dry_run: Preview deletions without applying when ``True``.
+
+    Returns:
+        Summary dict with counts and the list of snapshots to delete.
+
+    Raises:
+        ValueError: If retention counts are negative.
     """
     if keep_weekly < 0 or keep_monthly < 0:
         raise ValueError("Retention counts must be >= 0.")

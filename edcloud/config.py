@@ -1,7 +1,12 @@
-"""Centralized configuration for edcloud resources."""
+"""Centralized configuration and tag-based discovery primitives.
+
+All AWS resource names, tag conventions, and default tuning knobs live here
+so that the rest of the package can import a single source of truth.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -65,21 +70,46 @@ DEFAULT_HOURS_PER_DAY = 4
 
 
 def managed_filter() -> list[dict[str, Any]]:
-    """Tag filter that matches edcloud-managed resources."""
+    """Return an EC2 ``Filters`` list matching edcloud-managed resources.
+
+    Returns:
+        Single-element filter list suitable for ``describe_*`` API calls.
+    """
     return [{"Name": f"tag:{MANAGER_TAG_KEY}", "Values": [MANAGER_TAG_VALUE]}]
 
 
-def has_managed_tag(tags: list[dict[str, str]] | None) -> bool:
-    """Check whether a resource's tag list includes the managed tag."""
+def tag_value(tags: Sequence[Mapping[str, Any]] | None, key: str) -> str | None:
+    """Look up a single tag value from an AWS-format tag list.
+
+    Args:
+        tags: AWS tag list (``[{"Key": …, "Value": …}, …]``), or ``None``.
+        key: Tag key to search for.
+
+    Returns:
+        The tag's value as a string, or ``None`` if not found.
+    """
     if not tags:
-        return False
-    return any(
-        t.get("Key") == MANAGER_TAG_KEY and t.get("Value") == MANAGER_TAG_VALUE for t in tags
-    )
+        return None
+    for t in tags:
+        if t.get("Key") == key:
+            return str(t.get("Value", ""))
+    return None
+
+
+def has_managed_tag(tags: list[dict[str, str]] | None) -> bool:
+    """Check whether a resource's tag list includes the managed marker."""
+    return tag_value(tags, MANAGER_TAG_KEY) == MANAGER_TAG_VALUE
 
 
 def get_volume_ids(instance: dict[str, Any]) -> list[str]:
-    """Extract EBS volume IDs from an instance description."""
+    """Extract EBS volume IDs from an EC2 instance description.
+
+    Args:
+        instance: A single item from ``describe_instances`` Reservations.
+
+    Returns:
+        Volume IDs in block-device-mapping order (may be empty).
+    """
     return [
         vid
         for bdm in instance.get("BlockDeviceMappings", [])
@@ -89,7 +119,12 @@ def get_volume_ids(instance: dict[str, Any]) -> list[str]:
 
 @dataclass(frozen=True)
 class InstanceConfig:
-    """Runtime-resolved configuration for an edcloud instance."""
+    """Runtime-resolved configuration for provisioning an edcloud instance.
+
+    All fields carry sensible defaults so callers can override only what
+    they need.  The ``tags`` dict is always pre-populated with the
+    managed-resource marker and a human-friendly Name tag.
+    """
 
     instance_type: str = DEFAULT_INSTANCE_TYPE
     volume_size_gb: int = DEFAULT_VOLUME_SIZE_GB
@@ -109,4 +144,5 @@ class InstanceConfig:
 
     @property
     def name_tag(self) -> str:
+        """Shortcut for the ``Name`` tag value."""
         return self.tags.get("Name", NAME_TAG)

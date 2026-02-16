@@ -1,4 +1,8 @@
-"""Tailscale integration — hostname resolution and connectivity checks."""
+"""Tailscale integration — hostname resolution, connectivity, and cleanup.
+
+All interaction with Tailscale goes through the local ``tailscale`` CLI;
+no API key is required on the operator node.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +14,11 @@ from typing import Any
 
 
 def _tailscale_status() -> dict[str, Any] | None:
-    """Return `tailscale status --json` payload, or None on failure."""
+    """Run ``tailscale status --json`` and return the parsed payload.
+
+    Returns:
+        Parsed JSON dict, or ``None`` on any failure.
+    """
     if not tailscale_available():
         return None
     try:
@@ -31,15 +39,18 @@ def _tailscale_status() -> dict[str, Any] | None:
 
 
 def tailscale_available() -> bool:
-    """Check if the tailscale CLI is on PATH."""
+    """Return ``True`` if the ``tailscale`` CLI is on ``$PATH``."""
     return shutil.which("tailscale") is not None
 
 
 def find_active_edcloud_device() -> tuple[str, str] | None:
-    """Find the active edcloud device in Tailscale, regardless of suffix.
+    """Find the active edcloud device in Tailscale.
 
-    Returns (hostname, ip) tuple or None if not found.
-    Prefers online devices, handles edcloud, edcloud-1, edcloud-2, etc.
+    Handles hostname suffixes (``edcloud``, ``edcloud-1``, …) and prefers
+    online devices.  Does *not* fall back to offline records.
+
+    Returns:
+        ``(hostname, ip)`` tuple, or ``None`` if no online device is found.
     """
     edcloud_devices = list_all_edcloud_devices()
 
@@ -61,10 +72,14 @@ def find_active_edcloud_device() -> tuple[str, str] | None:
 def get_tailscale_ip(hostname: str) -> str | None:
     """Resolve a Tailscale MagicDNS hostname to its IP.
 
-    Returns the Tailscale IP (100.x.y.z) or None if not found.
+    When *hostname* is ``"edcloud"``, auto-detects the active device
+    even if Tailscale appended a numeric suffix.
 
-    Special case: if hostname is "edcloud", will find any active edcloud device
-    (edcloud, edcloud-1, edcloud-2, etc.) and return its IP.
+    Args:
+        hostname: Tailscale hostname or MagicDNS prefix.
+
+    Returns:
+        Tailscale IP (``100.x.y.z``) or ``None`` if not found.
     """
     status = _tailscale_status()
     if not status:
@@ -88,7 +103,12 @@ def get_tailscale_ip(hostname: str) -> str | None:
 
 
 def is_reachable(hostname: str, timeout: int = 5) -> bool:
-    """Ping the Tailscale hostname to check if it's reachable."""
+    """Ping the Tailscale peer to check reachability.
+
+    Args:
+        hostname: Tailscale hostname to resolve and ping.
+        timeout: Ping timeout in seconds.
+    """
     ip = get_tailscale_ip(hostname)
     if not ip:
         return False
@@ -104,7 +124,7 @@ def is_reachable(hostname: str, timeout: int = 5) -> bool:
 
 
 def get_active_edcloud_hostname() -> str:
-    """Get the active edcloud hostname (handles edcloud-1, edcloud-2, etc.)."""
+    """Return the active edcloud hostname, falling back to ``"edcloud"``."""
     result = find_active_edcloud_device()
     if result:
         return result[0]  # Return the hostname
@@ -112,9 +132,10 @@ def get_active_edcloud_hostname() -> str:
 
 
 def list_all_edcloud_devices() -> list[dict[str, str | bool]]:
-    """List all edcloud devices (active and offline) in Tailscale.
+    """List all edcloud devices (online and offline) visible on the tailnet.
 
-    Returns list of dicts with keys: hostname, ip, online.
+    Returns:
+        List of dicts with keys ``hostname``, ``ip``, ``dns_name``, ``online``.
     """
     status = _tailscale_status()
     if not status:
@@ -162,10 +183,13 @@ def list_all_edcloud_devices() -> list[dict[str, str | bool]]:
 
 
 def edcloud_name_conflicts(base_hostname: str = "edcloud") -> list[dict[str, str | bool]]:
-    """Return edcloud devices that indicate naming drift/conflict.
+    """Detect Tailscale naming drift for edcloud devices.
 
-    A conflict exists when a device DNS label is incremented (for example
-    ``edcloud-4.tail...``) or when multiple edcloud records are present.
+    A conflict exists when a device's DNS label has a numeric suffix
+    (e.g. ``edcloud-4``) or when multiple edcloud records coexist.
+
+    Returns:
+        Conflicting device dicts, or empty list if clean.
     """
     devices = list_all_edcloud_devices()
     if not devices:
@@ -187,7 +211,7 @@ def edcloud_name_conflicts(base_hostname: str = "edcloud") -> list[dict[str, str
 
 
 def format_conflict_message(conflicts: list[dict[str, str | bool]]) -> str:
-    """Render a stable remediation message for Tailscale naming conflicts."""
+    """Render a user-facing remediation message for Tailscale naming conflicts."""
     lines = [
         "Tailscale naming conflict detected for edcloud devices.",
         "Conflicting/duplicate entries:",
@@ -214,12 +238,14 @@ def format_conflict_message(conflicts: list[dict[str, str | bool]]) -> str:
 
 
 def cleanup_offline_edcloud_devices() -> tuple[int, str]:
-    """Remove offline edcloud devices from Tailscale.
+    """Detect offline edcloud devices and produce cleanup guidance.
 
-    Returns (count_removed, message).
+    The Tailscale CLI cannot remove devices without an API key, so this
+    returns instructions for manual cleanup via the admin console.
 
-    Note: This requires manual cleanup via Tailscale admin console.
-    We detect offline devices but cannot remove them via CLI without API key.
+    Returns:
+        ``(count, message)`` — count of offline devices and a human-readable
+        remediation message.
     """
     devices = list_all_edcloud_devices()
     offline = [d for d in devices if not d["online"]]
@@ -242,9 +268,16 @@ def cleanup_offline_edcloud_devices() -> tuple[int, str]:
 
 
 def ssh_command(hostname: str, user: str = "ubuntu") -> list[str]:
-    """Build an SSH command targeting the Tailscale hostname.
+    """Build an SSH command targeting a Tailscale hostname.
 
-    If hostname is "edcloud", will auto-detect the active edcloud device.
+    Auto-detects the active edcloud device when *hostname* is ``"edcloud"``.
+
+    Args:
+        hostname: Tailscale hostname to connect to.
+        user: Remote username.
+
+    Returns:
+        Command list suitable for ``subprocess.run``.
     """
     ip = get_tailscale_ip(hostname)
     target = ip if ip else hostname

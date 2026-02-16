@@ -1,4 +1,8 @@
-"""IAM role and instance profile management for edcloud."""
+"""IAM role and instance-profile management for edcloud.
+
+The instance role grants the EC2 instance read access to ``/edcloud/*``
+SSM parameters (used to retrieve the Tailscale auth key at boot).
+"""
 
 from __future__ import annotations
 
@@ -20,14 +24,14 @@ def _iam_client() -> Any:
 
 
 def _ssm_resource_arn() -> str:
-    """Build SSM parameter ARN pattern for /edcloud/* parameters."""
+    """Build the SSM parameter ARN pattern for ``/edcloud/*``."""
     sts = boto3.client("sts")
     account_id = sts.get_caller_identity()["Account"]
     return f"arn:aws:ssm:*:{account_id}:parameter/edcloud/*"
 
 
 def _trust_policy() -> dict[str, Any]:
-    """EC2 service trust policy for the instance role."""
+    """Return the EC2 service trust policy for ``sts:AssumeRole``."""
     return {
         "Version": "2012-10-17",
         "Statement": [
@@ -41,7 +45,7 @@ def _trust_policy() -> dict[str, Any]:
 
 
 def _ssm_read_policy() -> dict[str, Any]:
-    """Inline policy allowing SSM parameter reads under /edcloud/*."""
+    """Return the inline policy allowing ``ssm:GetParameter`` under ``/edcloud/*``."""
     return {
         "Version": "2012-10-17",
         "Statement": [
@@ -55,7 +59,7 @@ def _ssm_read_policy() -> dict[str, Any]:
 
 
 def find_instance_profile() -> str | None:
-    """Return the edcloud instance profile ARN if it exists, else None."""
+    """Return the edcloud instance-profile ARN, or ``None`` if it doesn't exist."""
     iam = _iam_client()
     try:
         resp = iam.get_instance_profile(InstanceProfileName=INSTANCE_PROFILE_NAME)
@@ -67,9 +71,16 @@ def find_instance_profile() -> str | None:
 
 
 def ensure_instance_profile(tags: dict[str, str]) -> str:
-    """Idempotently create IAM role + instance profile for edcloud.
+    """Idempotently create the IAM role and instance profile for edcloud.
 
-    Returns the instance profile ARN.
+    Steps: create role → attach inline SSM policy → create instance profile
+    → bind role to profile.  Each step is a no-op if the resource exists.
+
+    Args:
+        tags: AWS tags to apply to newly created IAM resources.
+
+    Returns:
+        The instance-profile ARN.
     """
     iam = _iam_client()
 
@@ -129,7 +140,11 @@ def ensure_instance_profile(tags: dict[str, str]) -> str:
 
 
 def delete_instance_profile() -> None:
-    """Clean up edcloud IAM role and instance profile."""
+    """Remove the edcloud IAM role and instance profile.
+
+    Each step tolerates ``NoSuchEntity`` so the function is safe to call
+    even when resources have already been partially cleaned up.
+    """
     iam = _iam_client()
 
     # 1. Remove role from instance profile

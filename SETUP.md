@@ -19,6 +19,14 @@ Open items only:
 - [ ] Record restore drill date and result for auditability.
 - [ ] Back up non-repo durable state under `/opt/edcloud/state`; reclone repos from upstream on rebuild.
 
+### Architectural improvements (deferred)
+
+_Lower-priority refactors identified 2026-02-16 during docstring/config review:_
+
+- [ ] **Output separation**: Library modules (`ec2.py`, `iam.py`, `snapshot.py`) use `print()` while CLI uses `click.echo()`. Cleanest fix: return structured data from library functions, move all output rendering to CLI layer, or introduce `logging` module. Current split works but complicates testing.
+- [ ] **Centralize boto3 client factories**: `cli.py` and `cleanup.py` call `boto3.client()` directly instead of reusing `_ec2_client()`/`_ssm_client()` factories from `ec2.py`. Better: shared session or factory module. Simplifies mock patching in tests.
+- [ ] **Declarative verification checks**: The 24-item `checks` list in `verify_cmd` (cli.py ~700-725) is maintenance-heavy inline data. Extract to typed dataclass list or YAML for easier additions and self-documenting check catalog.
+
 ## Prerequisites
 
 - AWS account with CLI credentials configured

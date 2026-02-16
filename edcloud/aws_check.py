@@ -1,4 +1,4 @@
-"""AWS credentials validation."""
+"""AWS credentials validation and region discovery."""
 
 from __future__ import annotations
 
@@ -7,9 +7,10 @@ from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
 
 def check_aws_credentials() -> tuple[bool, str]:
-    """Verify AWS credentials are configured and valid.
+    """Verify that AWS credentials are configured and valid.
 
-    Returns (is_valid, message).
+    Returns:
+        ``(is_valid, human_message)`` tuple.
     """
     try:
         sts = boto3.client("sts")
@@ -29,7 +30,7 @@ def check_aws_credentials() -> tuple[bool, str]:
 
 
 def get_region() -> str | None:
-    """Get the configured AWS region."""
+    """Return the configured AWS region, or ``None`` if unavailable."""
     try:
         session = boto3.session.Session()
         return session.region_name

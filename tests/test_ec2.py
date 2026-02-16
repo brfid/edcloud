@@ -4,19 +4,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from edcloud.config import MANAGER_TAG_KEY, MANAGER_TAG_VALUE, InstanceConfig
+from edcloud.config import MANAGER_TAG_KEY, MANAGER_TAG_VALUE, InstanceConfig, managed_filter
 from edcloud.ec2 import (
     TagDriftError,
     _find_instance,
     _find_security_group,
-    _managed_filter,
     provision,
 )
 
 
 class TestManagedFilter:
     def test_filter_shape(self):
-        f = _managed_filter()
+        f = managed_filter()
         assert len(f) == 1
         assert f[0]["Name"] == f"tag:{MANAGER_TAG_KEY}"
         assert f[0]["Values"] == [MANAGER_TAG_VALUE]

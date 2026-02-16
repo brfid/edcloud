@@ -9,6 +9,7 @@ from edcloud.config import (
     get_volume_ids,
     has_managed_tag,
     managed_filter,
+    tag_value,
 )
 
 
@@ -101,3 +102,19 @@ def test_get_volume_ids_no_mappings() -> None:
     instance: dict[str, Any] = {}
     result = get_volume_ids(instance)
     assert result == []
+
+
+class TestTagValue:
+    def test_found(self) -> None:
+        tags = [{"Key": "Name", "Value": "edcloud"}, {"Key": "env", "Value": "lab"}]
+        assert tag_value(tags, "env") == "lab"
+
+    def test_not_found(self) -> None:
+        tags = [{"Key": "Name", "Value": "edcloud"}]
+        assert tag_value(tags, "missing") is None
+
+    def test_none_tags(self) -> None:
+        assert tag_value(None, "any") is None
+
+    def test_empty_tags(self) -> None:
+        assert tag_value([], "any") is None

@@ -1,4 +1,4 @@
-"""edcloud CLI — manage your personal cloud lab."""
+"""edcloud CLI — user-facing commands for the personal cloud lab."""
 
 from __future__ import annotations
 
@@ -34,9 +34,19 @@ def _resolve_ssh_target(
     user: str,
     hostname: str,
 ) -> tuple[str, list[str]]:
-    """Resolve SSH target and build base command for Tailscale or public IP.
+    """Build an SSH target address and base command.
 
-    Returns (target_ip, ssh_base_command).
+    Args:
+        info: Instance status dict (from ``ec2.status()``).
+        public_ip: If ``True`` use the public IP; otherwise resolve via Tailscale.
+        user: Remote username.
+        hostname: Tailscale MagicDNS hostname to resolve.
+
+    Returns:
+        ``(target_ip, ssh_base_command)`` tuple.
+
+    Raises:
+        RuntimeError: If the chosen network path has no reachable address.
     """
     if public_ip:
         target = str(info.get("public_ip") or "")
@@ -63,7 +73,11 @@ def _resolve_ssh_target(
 
 
 def require_aws_creds(func: Callable[P, R]) -> Callable[P, R]:
-    """Decorator: verify AWS credentials before running command."""
+    """Decorator that verifies AWS credentials before running a command.
+
+    Catches ``RuntimeError`` from the wrapped command and converts it to a
+    clean ``SystemExit(1)`` with the error message on stderr.
+    """
 
     @functools.wraps(func)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
@@ -84,19 +98,25 @@ def require_aws_creds(func: Callable[P, R]) -> Callable[P, R]:
 
 
 def _fetch_tailscale_auth_key_from_ssm(parameter_name: str) -> str:
+    """Read a Tailscale auth key from SSM Parameter Store."""
     ssm = boto3.client("ssm")
     resp = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
     return str(resp["Parameter"]["Value"])
 
 
 def _snapshot_start_time(start_time: str) -> datetime | None:
-    if not start_time:
+    """Parse an ISO-format snapshot timestamp into a UTC-aware datetime.
+
+    Tolerates trailing ``Z`` and naive timestamps (assumed UTC).
+    Returns ``None`` on any parse failure.
+    """
+    raw = start_time.strip()
+    if not raw:
         return None
-    ts = start_time.strip()
-    if ts.endswith("Z"):
-        ts = ts[:-1] + "+00:00"
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
     try:
-        parsed = datetime.fromisoformat(ts)
+        parsed = datetime.fromisoformat(raw)
     except ValueError:
         return None
     if parsed.tzinfo is None:
@@ -105,6 +125,11 @@ def _snapshot_start_time(start_time: str) -> datetime | None:
 
 
 def _find_recent_prechange_snapshot(max_age_minutes: int) -> dict[str, object] | None:
+    """Return the freshest completed pre-change snapshot within *max_age_minutes*.
+
+    Returns:
+        Snapshot info dict, or ``None`` if nothing qualifies.
+    """
     now = datetime.now(timezone.utc)
     freshest: tuple[datetime, dict[str, object]] | None = None
     for snap_info in snapshot.list_snapshots():
@@ -125,7 +150,11 @@ def _find_recent_prechange_snapshot(max_age_minutes: int) -> dict[str, object] |
 
 
 def _ensure_no_tailscale_name_conflicts(base_hostname: str = DEFAULT_TAILSCALE_HOSTNAME) -> None:
-    """Fail fast when Tailscale naming drift is detected for edcloud."""
+    """Fail fast when Tailscale naming drift is detected.
+
+    Raises:
+        RuntimeError: If conflicting/suffixed edcloud records are found.
+    """
     if not tailscale.tailscale_available():
         return
     conflicts = tailscale.edcloud_name_conflicts(base_hostname=base_hostname)
@@ -346,10 +375,10 @@ def load_tailscale_env_key(
 
     if shell_export:
         click.echo(f"export TAILSCALE_AUTH_KEY={shlex.quote(key)}")
+        return
 
-    if not shell_export:
-        click.echo("No output selected. Use --shell-export.", err=True)
-        raise SystemExit(1)
+    click.echo("No output selected. Use --shell-export.", err=True)
+    raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
