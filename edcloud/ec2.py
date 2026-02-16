@@ -7,6 +7,7 @@ Tag ``edcloud:managed = true`` identifies all managed resources.
 from __future__ import annotations
 
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -156,6 +157,32 @@ def _find_orphaned_state_volume_id(client: Any) -> str | None:
             "Remediation: keep a single state volume for this environment."
         )
     return str(vols[0])
+
+
+def _state_volume_az(client: Any, volume_id: str) -> str:
+    """Return availability zone for an EBS volume."""
+    resp = client.describe_volumes(VolumeIds=[volume_id])
+    volumes = resp.get("Volumes", [])
+    if not volumes:
+        raise RuntimeError(f"State volume not found: {volume_id}")
+    return str(volumes[0]["AvailabilityZone"])
+
+
+def _default_subnet_for_az(client: Any, az: str) -> str:
+    """Get default subnet ID in a given AZ for deterministic instance placement."""
+    resp = client.describe_subnets(
+        Filters=[
+            {"Name": "availability-zone", "Values": [az]},
+            {"Name": "default-for-az", "Values": ["true"]},
+        ]
+    )
+    subnets = resp.get("Subnets", [])
+    if not subnets:
+        raise RuntimeError(
+            f"No default subnet found in AZ {az}. "
+            "Create/enable a default subnet in this AZ or choose a state volume in a supported AZ."
+        )
+    return str(subnets[0]["SubnetId"])
 
 
 def _find_instance(client: Any) -> dict[str, Any] | None:
@@ -421,6 +448,9 @@ def provision(
     if reused_state_volume_id:
         state_mapping: dict[str, Any] | None = None
         print(f"  Reusing managed state volume: {reused_state_volume_id}")
+        state_volume_az = _state_volume_az(ec2, reused_state_volume_id)
+        subnet_id = _default_subnet_for_az(ec2, state_volume_az)
+        print(f"  Launching instance in {state_volume_az} to match reused state volume")
     else:
         state_mapping = {
             "DeviceName": cfg.state_volume_device_name,
@@ -432,17 +462,20 @@ def provision(
             },
         }
         print("  No reusable managed state volume found; creating new state volume.")
+        subnet_id = None
 
     # 4. Launch instance -------------------------------------------------------
-    run_resp = ec2.run_instances(
-        ImageId=ami_id,
-        InstanceType=cfg.instance_type,
-        MinCount=1,
-        MaxCount=1,
-        SecurityGroupIds=[sg_id],
-        IamInstanceProfile={"Arn": profile_arn},
-        UserData=user_data,
-        BlockDeviceMappings=[
+    # IAM instance profile creation can be eventually consistent. Retry launch
+    # briefly when AWS returns transient invalid-profile errors.
+    run_kwargs: dict[str, Any] = {
+        "ImageId": ami_id,
+        "InstanceType": cfg.instance_type,
+        "MinCount": 1,
+        "MaxCount": 1,
+        "SecurityGroupIds": [sg_id],
+        "IamInstanceProfile": {"Arn": profile_arn},
+        "UserData": user_data,
+        "BlockDeviceMappings": [
             {
                 "DeviceName": "/dev/sda1",
                 "Ebs": {
@@ -454,7 +487,7 @@ def provision(
             },
             *([state_mapping] if state_mapping else []),
         ],
-        TagSpecifications=[
+        "TagSpecifications": [
             {
                 "ResourceType": "instance",
                 "Tags": [{"Key": k, "Value": v} for k, v in cfg.tags.items()],
@@ -465,12 +498,33 @@ def provision(
             },
         ],
         # No key pair — SSH access is via Tailscale + instance connect or SSM
-        MetadataOptions={
+        "MetadataOptions": {
             "HttpTokens": "required",  # IMDSv2 only
             "HttpEndpoint": "enabled",
             "HttpPutResponseHopLimit": 1,  # Prevent containers from reaching IMDS
         },
-    )
+    }
+    if subnet_id is not None:
+        run_kwargs["SubnetId"] = subnet_id
+
+    run_resp = None
+    for attempt in range(1, 13):
+        try:
+            run_resp = ec2.run_instances(**run_kwargs)
+            break
+        except ClientError as exc:
+            msg = str(exc)
+            if (
+                "Invalid IAM Instance Profile" in msg
+                or ("InvalidParameterValue" in msg and "iamInstanceProfile" in msg)
+            ) and attempt < 12:
+                print("  IAM instance profile not yet propagated; retrying launch...")
+                time.sleep(5)
+                continue
+            raise
+
+    if run_resp is None:
+        raise RuntimeError("Failed to launch instance after IAM profile propagation retries.")
 
     instance_id = run_resp["Instances"][0]["InstanceId"]
     print(f"  Instance launched: {instance_id}")
@@ -492,6 +546,21 @@ def provision(
                 if "IncorrectState" in msg or "is not 'available'" in msg:
                     time.sleep(2)
                     continue
+                if "VolumeInUse" in msg or "already attached" in msg:
+                    # Another concurrent provision likely attached the shared
+                    # state volume first. Clean up this duplicate instance to
+                    # avoid managed-instance tag drift.
+                    print(
+                        "  State volume is already attached elsewhere; "
+                        f"terminating duplicate instance {instance_id}."
+                    )
+                    with suppress(ClientError):
+                        ec2.terminate_instances(InstanceIds=[instance_id])
+                    raise RuntimeError(
+                        "Provision aborted: reusable state volume is already attached to "
+                        "another instance (likely concurrent provision). "
+                        "Retry once only after confirming a single managed instance exists."
+                    ) from exc
                 raise
         else:
             raise RuntimeError(

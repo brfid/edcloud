@@ -82,7 +82,7 @@ def ensure_instance_profile(tags: dict[str, str]) -> str:
             iam.create_role(
                 RoleName=INSTANCE_ROLE_NAME,
                 AssumeRolePolicyDocument=json.dumps(_trust_policy()),
-                Description="edcloud instance role — SSM parameter access",
+                Description="edcloud instance role - SSM parameter access",
                 Tags=[{"Key": k, "Value": v} for k, v in tags.items()],
             )
             print(f"  Created IAM role: {INSTANCE_ROLE_NAME}")

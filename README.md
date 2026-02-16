@@ -26,6 +26,11 @@ aws ssm put-parameter --name /edcloud/tailscale_auth_key \
 edc provision --tailscale-auth-key-ssm-parameter /edcloud/tailscale_auth_key
 ```
 
+ARM/Linux operator note:
+
+- If you run commands from a small ARM/Linux operator node and want to skip manual venv activation, use the optional wrapper flow in `SETUP.md` section **"4. Optional: operator wrapper for ARM/Linux nodes"**.
+- Command surface stays the same (`edc provision`, `edc up`, `edc down`, `edc status`).
+
 ## Commands
 
 ```bash

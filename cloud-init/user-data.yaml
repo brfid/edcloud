@@ -1,5 +1,5 @@
 #cloud-config
-# edcloud instance bootstrap — Docker, Tailscale, Portainer, self-shutdown, state volume
+# edcloud instance bootstrap
 # Variables: ${TAILSCALE_AUTH_KEY_SSM_PARAMETER}, ${TAILSCALE_HOSTNAME}, ${AWS_REGION}
 
 package_update: true
@@ -8,7 +8,6 @@ package_upgrade: true
 packages:
   # Core utilities
   - apt-transport-https
-  - awscli
   - bash-completion
   - build-essential
   - ca-certificates
@@ -157,7 +156,6 @@ write_files:
       [Install]
       WantedBy=timers.target
 
-  # Docker compose directory marker
   - path: /opt/edcloud/.env
     content: |
       EDCLOUD_MANAGED=true
@@ -166,31 +164,9 @@ write_files:
 # Bootstrap commands
 # --------------------------------------------------------------------------
 runcmd:
-  # --- Docker (official repo) ---
-  - |
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-      https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
-      > /etc/apt/sources.list.d/docker.list
-    apt-get update -qq
-    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
-    systemctl enable docker
-    usermod -aG docker ubuntu
-
-  # --- Tailscale ---
-  - |
-    curl -fsSL https://tailscale.com/install.sh | sh
-    TS_AUTH_KEY=$(aws ssm get-parameter \
-      --name "${TAILSCALE_AUTH_KEY_SSM_PARAMETER}" \
-      --with-decryption --query 'Parameter.Value' \
-      --output text --region "${AWS_REGION}")
-    tailscale up --auth-key="$TS_AUTH_KEY" --hostname="${TAILSCALE_HOSTNAME}" --ssh
-    unset TS_AUTH_KEY
-
-  # --- Durable state volume (/opt/edcloud/state) ---
+  # --- State volume: early mount (home bind before other runcmd steps) ---
+  # This must run first so that ~/  points at the durable copy before Docker,
+  # Tailscale, or any later step that might write to /home/ubuntu.
   - |
     ROOT_SOURCE=$(findmnt -n -o SOURCE /)
     ROOT_PARENT=$(lsblk -no PKNAME "$ROOT_SOURCE" 2>/dev/null || true)
@@ -207,107 +183,199 @@ runcmd:
     fi
 
     if [ -z "${STATE_DEV:-}" ] || [ ! -b "$STATE_DEV" ]; then
-      logger -t edcloud "State volume not found; skipping /opt/edcloud/state mount."
-    else
-      if ! blkid "$STATE_DEV" >/dev/null 2>&1; then
-        mkfs.ext4 -F "$STATE_DEV"
-      fi
-      mkdir -p /opt/edcloud/state
-      UUID=$(blkid -s UUID -o value "$STATE_DEV")
-      if ! grep -q "$UUID" /etc/fstab; then
-        echo "UUID=$UUID /opt/edcloud/state ext4 defaults,nofail 0 2" >> /etc/fstab
-      fi
-      mount -a
-
-      # Keep ubuntu home on the durable state volume.
-      mkdir -p /opt/edcloud/state/home/ubuntu
-      if [ -z "$(ls -A /opt/edcloud/state/home/ubuntu 2>/dev/null)" ]; then
-        rsync -a /home/ubuntu/ /opt/edcloud/state/home/ubuntu/
-      fi
-
-      if ! grep -qE '^/opt/edcloud/state/home/ubuntu[[:space:]]+/home/ubuntu[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
-        echo "/opt/edcloud/state/home/ubuntu /home/ubuntu none bind 0 0" >> /etc/fstab
-      fi
-      if ! mountpoint -q /home/ubuntu; then
-        mount /home/ubuntu || mount -a
-      fi
-
-      chown -R ubuntu:ubuntu /opt/edcloud/state
-      chmod 700 /home/ubuntu
-      if [ -d /home/ubuntu/.ssh ]; then
-        chmod 700 /home/ubuntu/.ssh
-      fi
-
-      # Keep tailscaled state durable to preserve node identity across rebuilds.
-      mkdir -p /opt/edcloud/state/tailscale
-      if [ -z "$(ls -A /opt/edcloud/state/tailscale 2>/dev/null)" ] && [ -d /var/lib/tailscale ]; then
-        rsync -a /var/lib/tailscale/ /opt/edcloud/state/tailscale/
-      fi
-
-      if ! grep -qE '^/opt/edcloud/state/tailscale[[:space:]]+/var/lib/tailscale[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
-        echo "/opt/edcloud/state/tailscale /var/lib/tailscale none bind 0 0" >> /etc/fstab
-      fi
-      mkdir -p /var/lib/tailscale
-      if ! mountpoint -q /var/lib/tailscale; then
-        mount /var/lib/tailscale || mount -a
-      fi
-
-      # Keep compose files durable across reprovision.
-      mkdir -p /opt/edcloud/state/compose
-      mkdir -p /opt/edcloud/compose
-      if [ -z "$(ls -A /opt/edcloud/state/compose 2>/dev/null)" ] && [ -n "$(ls -A /opt/edcloud/compose 2>/dev/null)" ]; then
-        rsync -a /opt/edcloud/compose/ /opt/edcloud/state/compose/
-      fi
-
-      if ! grep -qE '^/opt/edcloud/state/compose[[:space:]]+/opt/edcloud/compose[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
-        echo "/opt/edcloud/state/compose /opt/edcloud/compose none bind 0 0" >> /etc/fstab
-      fi
-      if ! mountpoint -q /opt/edcloud/compose; then
-        mount /opt/edcloud/compose || mount -a
-      fi
-
-      # Keep Portainer data durable across reprovision.
-      mkdir -p /opt/edcloud/state/portainer-data
-      mkdir -p /opt/edcloud/portainer-data
-      if [ -z "$(ls -A /opt/edcloud/state/portainer-data 2>/dev/null)" ] && [ -n "$(ls -A /opt/edcloud/portainer-data 2>/dev/null)" ]; then
-        rsync -a /opt/edcloud/portainer-data/ /opt/edcloud/state/portainer-data/
-      fi
-
-      if ! grep -qE '^/opt/edcloud/state/portainer-data[[:space:]]+/opt/edcloud/portainer-data[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
-        echo "/opt/edcloud/state/portainer-data /opt/edcloud/portainer-data none bind 0 0" >> /etc/fstab
-      fi
-      if ! mountpoint -q /opt/edcloud/portainer-data; then
-        mount /opt/edcloud/portainer-data || mount -a
-      fi
-
-      # Keep Docker engine data durable across reprovision.
-      mkdir -p /opt/edcloud/state/docker
-      if [ -z "$(ls -A /opt/edcloud/state/docker 2>/dev/null)" ] && [ -n "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
-        rsync -a /var/lib/docker/ /opt/edcloud/state/docker/
-      fi
-
-      printf '%s\n' \
-        '{' \
-        '  "data-root": "/opt/edcloud/state/docker"' \
-        '}' > /etc/docker/daemon.json
-
-      systemctl daemon-reload
-      systemctl restart docker
+      logger -t edcloud "State volume not found; skipping early mount."
+      exit 0
     fi
+
+    if ! blkid "$STATE_DEV" >/dev/null 2>&1; then
+      mkfs.ext4 -F "$STATE_DEV"
+    fi
+    mkdir -p /opt/edcloud/state
+    UUID=$(blkid -s UUID -o value "$STATE_DEV")
+    if ! grep -q "$UUID" /etc/fstab; then
+      echo "UUID=$UUID /opt/edcloud/state ext4 defaults,nofail 0 2" >> /etc/fstab
+    fi
+    mount -a
+
+    # Keep ubuntu home on the durable state volume.
+    mkdir -p /opt/edcloud/state/home/ubuntu
+    if [ -z "$(ls -A /opt/edcloud/state/home/ubuntu 2>/dev/null)" ]; then
+      rsync -a /home/ubuntu/ /opt/edcloud/state/home/ubuntu/
+    fi
+
+    if ! grep -qE '^/opt/edcloud/state/home/ubuntu[[:space:]]+/home/ubuntu[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
+      echo "/opt/edcloud/state/home/ubuntu /home/ubuntu none bind 0 0" >> /etc/fstab
+    fi
+    if ! mountpoint -q /home/ubuntu; then
+      mount /home/ubuntu || mount -a
+    fi
+
+    chown -R ubuntu:ubuntu /opt/edcloud/state
+    chmod 700 /home/ubuntu
+    if [ -d /home/ubuntu/.ssh ]; then
+      chmod 700 /home/ubuntu/.ssh
+    fi
+
+  # --- Docker (official repo) ---
+  - |
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+      https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+      > /etc/apt/sources.list.d/docker.list
+    apt-get update -qq
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    systemctl enable docker
+    usermod -aG docker ubuntu
+
+  # --- Tailscale ---
+  - |
+    set -eu
+    TS_AUTH_KEY_FILE="/run/edcloud-tailscale-auth.key"
+    curl -fsSL https://tailscale.com/install.sh | sh
+    if ! command -v aws >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq
+      if ! apt-get install -y -qq awscli; then
+        apt-get install -y -qq python3-pip
+        python3 -m pip install --break-system-packages --upgrade awscli
+      fi
+    fi
+    AWS_BIN=$(command -v aws)
+    export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE
+
+    TS_AUTH_KEY=""
+    for attempt in $(seq 1 72); do
+      if TS_AUTH_KEY=$("$AWS_BIN" ssm get-parameter \
+        --name "${TAILSCALE_AUTH_KEY_SSM_PARAMETER}" \
+        --with-decryption --query 'Parameter.Value' \
+        --output text --region "${AWS_REGION}" 2>/tmp/edcloud-ssm.err); then
+        break
+      fi
+      sleep 5
+    done
+
+    "$AWS_BIN" sts get-caller-identity --output json >/tmp/edcloud-sts.json 2>/tmp/edcloud-sts.err || true
+    if [ -n "$TS_AUTH_KEY" ]; then
+      umask 077
+      printf '%s' "$TS_AUTH_KEY" > "$TS_AUTH_KEY_FILE"
+      timeout 45s tailscale up --auth-key="$TS_AUTH_KEY" --hostname="${TAILSCALE_HOSTNAME}" --ssh \
+        >/tmp/edcloud-tailscale-up.out 2>/tmp/edcloud-tailscale-up.err || true
+      cat /tmp/edcloud-tailscale-up.err >&2 || true
+    else
+      cat /tmp/edcloud-ssm.err >&2 || true
+      logger -t edcloud "No Tailscale auth key retrieved from SSM; continuing bootstrap."
+    fi
+    unset TS_AUTH_KEY
+
+  # --- State volume: service-level bind mounts (Tailscale, Docker, Portainer) ---
+  - |
+    if ! mountpoint -q /opt/edcloud/state 2>/dev/null; then
+      logger -t edcloud "State volume not mounted; skipping service bind mounts."
+      exit 0
+    fi
+
+    mkdir -p /opt/edcloud/state/tailscale
+    if [ -z "$(ls -A /opt/edcloud/state/tailscale 2>/dev/null)" ] && [ -d /var/lib/tailscale ]; then
+      rsync -a /var/lib/tailscale/ /opt/edcloud/state/tailscale/
+    fi
+
+    if ! grep -qE '^/opt/edcloud/state/tailscale[[:space:]]+/var/lib/tailscale[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
+      echo "/opt/edcloud/state/tailscale /var/lib/tailscale none bind 0 0" >> /etc/fstab
+    fi
+    mkdir -p /var/lib/tailscale
+    if ! mountpoint -q /var/lib/tailscale; then
+      mount /var/lib/tailscale || mount -a
+    fi
+    systemctl restart tailscaled || true
+    TS_REUP_OK=0
+    if [ -s /run/edcloud-tailscale-auth.key ]; then
+      if timeout 45s tailscale up \
+        --auth-key="$(cat /run/edcloud-tailscale-auth.key)" --hostname="${TAILSCALE_HOSTNAME}" --ssh \
+        >/tmp/edcloud-tailscale-reup.out 2>/tmp/edcloud-tailscale-reup.err; then
+        TS_REUP_OK=1
+      fi
+      rm -f /run/edcloud-tailscale-auth.key || true
+    fi
+    if [ "$TS_REUP_OK" -ne 1 ]; then
+      timeout 45s tailscale up --hostname="${TAILSCALE_HOSTNAME}" --ssh \
+        >/tmp/edcloud-tailscale-reup.out 2>/tmp/edcloud-tailscale-reup.err || true
+    fi
+    cat /tmp/edcloud-tailscale-reup.err >&2 || true
+    tailscale status --json >/tmp/edcloud-tailscale-status.json 2>/tmp/edcloud-tailscale-status.err || true
+    cat /tmp/edcloud-tailscale-status.err >&2 || true
+
+    mkdir -p /opt/edcloud/state/compose
+    mkdir -p /opt/edcloud/compose
+    if [ -z "$(ls -A /opt/edcloud/state/compose 2>/dev/null)" ] && [ -n "$(ls -A /opt/edcloud/compose 2>/dev/null)" ]; then
+      rsync -a /opt/edcloud/compose/ /opt/edcloud/state/compose/
+    fi
+
+    if ! grep -qE '^/opt/edcloud/state/compose[[:space:]]+/opt/edcloud/compose[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
+      echo "/opt/edcloud/state/compose /opt/edcloud/compose none bind 0 0" >> /etc/fstab
+    fi
+    if ! mountpoint -q /opt/edcloud/compose; then
+      mount /opt/edcloud/compose || mount -a
+    fi
+
+    mkdir -p /opt/edcloud/state/portainer-data
+    mkdir -p /opt/edcloud/portainer-data
+    if [ -z "$(ls -A /opt/edcloud/state/portainer-data 2>/dev/null)" ] && [ -n "$(ls -A /opt/edcloud/portainer-data 2>/dev/null)" ]; then
+      rsync -a /opt/edcloud/portainer-data/ /opt/edcloud/state/portainer-data/
+    fi
+
+    if ! grep -qE '^/opt/edcloud/state/portainer-data[[:space:]]+/opt/edcloud/portainer-data[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
+      echo "/opt/edcloud/state/portainer-data /opt/edcloud/portainer-data none bind 0 0" >> /etc/fstab
+    fi
+    if ! mountpoint -q /opt/edcloud/portainer-data; then
+      mount /opt/edcloud/portainer-data || mount -a
+    fi
+
+    mkdir -p /opt/edcloud/state/docker
+    if [ -z "$(ls -A /opt/edcloud/state/docker 2>/dev/null)" ] && [ -n "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
+      rsync -a /var/lib/docker/ /opt/edcloud/state/docker/
+    fi
+
+    printf '%s\n' \
+      '{' \
+      '  "data-root": "/opt/edcloud/state/docker"' \
+      '}' > /etc/docker/daemon.json
+
+    systemctl daemon-reload
+    systemctl restart docker
 
   # --- Portainer CE ---
   - |
-    TS_IP=$(tailscale ip -4)
+    TS_IP=""
+    if ! TS_IP=$(tailscale ip -4 2>/tmp/edcloud-tailscale-ip.err); then
+      cat /tmp/edcloud-tailscale-ip.err >&2 || true
+      logger -t edcloud "Tailscale IP unavailable during bootstrap; skipping Portainer startup for now."
+      exit 0
+    fi
+    if [ -z "$TS_IP" ]; then
+      logger -t edcloud "Empty Tailscale IP during bootstrap; skipping Portainer startup for now."
+      exit 0
+    fi
+
+    if docker ps -a --format '{{.Names}}' | grep -qx portainer; then
+      docker rm -f portainer || true
+    fi
+
     docker run -d \
       --name portainer \
       --restart=always \
       -p "${TS_IP}:9443:9443" \
       -v /var/run/docker.sock:/var/run/docker.sock \
       -v /opt/edcloud/portainer-data:/data \
-      portainer/portainer-ce:lts
+      portainer/portainer-ce:lts || true
 
   # --- Homebrew + LazyVim baseline ---
   - |
+    export HOME="${HOME:-/root}"
     NVIM_VERSION="v0.11.3"
     NVIM_TARBALL_URL="https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz"
     curl -fsSL "$NVIM_TARBALL_URL" -o /tmp/nvim-linux-x86_64.tar.gz
@@ -317,7 +385,9 @@ runcmd:
 
     export NONINTERACTIVE=1
     if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
-      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+      if ! /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+        logger -t edcloud "Homebrew install failed; continuing bootstrap without brew."
+      fi
     fi
 
     cat >/etc/profile.d/edcloud-brew.sh <<'BREWENV'
@@ -329,6 +399,7 @@ runcmd:
 
     runuser -u ubuntu -- bash -lc '
       set -euo pipefail
+      export HOME="${HOME:-/home/ubuntu}"
       mkdir -p "$HOME/.config"
       if [ ! -d "$HOME/.config/nvim" ]; then
         git clone --depth=1 https://github.com/LazyVim/starter "$HOME/.config/nvim"
@@ -340,7 +411,7 @@ runcmd:
   - |
     curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
     apt-get install -y nodejs
-    npm install -g npm@11.9.0 @openai/codex@0.98.0 cline@2.2.2 @google/gemini-cli
+    npm install -g npm@11.9.0 @openai/codex@0.98.0 cline@2.2.2 @google/gemini-cli @anthropic-ai/claude-code
 
   # --- Python developer tooling (pipx-managed, persistent on state volume) ---
   - |
@@ -418,10 +489,6 @@ runcmd:
         find "$HOME/src/bin" -maxdepth 1 -type f -perm -u+x -exec ln -sfn {} "$HOME/.local/bin/" \;
       fi
     '
-
-  # --- AI CLI profile note ---
-  # Baseline installs Codex + Cline + Gemini CLI via npm above.
-  # Keep this path game-free for default rebuilds.
 
   # --- Enable idle-shutdown timer ---
   - systemctl daemon-reload

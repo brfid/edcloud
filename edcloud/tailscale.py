@@ -53,9 +53,9 @@ def find_active_edcloud_device() -> tuple[str, str] | None:
         device = online_devices[0]
         return (str(device["hostname"]), str(device["ip"]))
 
-    # Fall back to any device if none online
-    device = edcloud_devices[0]
-    return (str(device["hostname"]), str(device["ip"]))
+    # Do not fall back to offline devices; stale records can point status/
+    # verify at dead nodes and mask the active replacement instance.
+    return None
 
 
 def get_tailscale_ip(hostname: str) -> str | None:
@@ -136,7 +136,9 @@ def list_all_edcloud_devices() -> list[dict[str, str | bool]]:
                 "hostname": hostname,
                 "ip": str(addrs[0]),
                 "dns_name": dns_name,
-                "online": bool(device_info.get("Online", False)),
+                # Prefer explicit Online when present; otherwise fall back to
+                # Active for compatibility with older/mock tailscale status.
+                "online": bool(device_info.get("Online", device_info.get("Active", False))),
             }
         )
 

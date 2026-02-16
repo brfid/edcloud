@@ -125,6 +125,7 @@ edc --help
 ## 4. Optional: operator wrapper for ARM/Linux nodes
 
 This removes the need to manually activate the venv for every command.
+The command surface is unchanged: use the same lifecycle commands (`edc provision`, `edc up`, `edc down`, `edc status`, `edc ssh`).
 
 ```bash
 mkdir -p ~/.local/bin ~/.config/edcloud
@@ -143,6 +144,40 @@ To make `edc provision` work without repeated key flags, keep this in `~/.config
 ```bash
 TAILSCALE_AUTH_KEY_SSM_PARAMETER=/edcloud/tailscale_auth_key
 ```
+
+Sanity checks after wrapper install:
+
+```bash
+which edc
+edc --version
+edc status
+```
+
+Cline account auth transfer (operator -> edcloud):
+
+Use this when `cline` on the instance prompts for login even though your local operator machine is already authenticated.
+
+```bash
+# Copy authenticated Cline runtime files from local operator host to edcloud instance
+cat ~/.cline/data/secrets.json | edc ssh "mkdir -p ~/.cline/data && chmod 700 ~/.cline ~/.cline/data && cat > ~/.cline/data/secrets.json"
+cat ~/.cline/data/globalState.json | edc ssh "cat > ~/.cline/data/globalState.json && chmod 600 ~/.cline/data/secrets.json ~/.cline/data/globalState.json"
+```
+
+Verify transfer:
+
+```bash
+edc ssh "jq -r 'keys[]' ~/.cline/data/secrets.json"
+edc ssh "cline 'auth smoke test'"
+```
+
+Expected key list should include:
+
+- `openai-codex-oauth-credentials`
+
+Security note:
+
+- `~/.cline/data/secrets.json` contains sensitive credentials.
+- Do not commit it, share it in tickets, or store it in git-tracked files.
 
 Optional automation templates:
 
@@ -342,6 +377,8 @@ AI + Python dev baseline:
   - `@openai/codex@0.98.0`
   - `cline@2.2.2`
   - `@google/gemini-cli`
+- Node.js LTS with latest-at-build global AI CLI:
+  - `@anthropic-ai/claude-code` (intentionally unpinned)
 - Python developer tools (user-local):
   - `ruff`
   - `mypy`
@@ -364,7 +401,7 @@ Quick verification:
 ```bash
 edc ssh 'git --version && tmux -V && rg --version && fdfind --version && htop --version | head -n 1'
 edc ssh 'nvim --version | head -n 1 && byobu -V && gh --version | head -n 1 && brew --version | head -n 1'
-edc ssh 'node --version && npm --version && codex --version && cline --version && gemini --version'
+edc ssh 'node --version && npm --version && codex --version && cline --version && gemini --version && claude --version'
 edc ssh 'python3 --version && ruff --version && mypy --version && pytest --version'
 edc ssh 'findmnt /home/ubuntu /var/lib/tailscale /opt/edcloud/compose /opt/edcloud/portainer-data && df -h /home/ubuntu /opt/edcloud/state'
 edc ssh "docker info --format '{{.DockerRootDir}}'"
@@ -451,3 +488,19 @@ Use `edc status` and AWS Cost Explorer to track drift.
 - Validate AWS identity: `aws sts get-caller-identity`
 - Validate local tailnet state: `tailscale status`
 - Validate instance and reachability: `edc status`
+
+If Cline still asks for browser login on the instance:
+
+1. Start auth on edcloud and note the localhost port it prints:
+
+   ```bash
+   edc ssh "cline auth"
+   ```
+
+2. From your laptop, open an SSH tunnel to that same port (example `3000`):
+
+   ```bash
+   ssh -N -L 3000:127.0.0.1:3000 ubuntu@edcloud
+   ```
+
+3. Open your local browser to `http://127.0.0.1:3000` and complete the OAuth flow.
