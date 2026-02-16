@@ -49,6 +49,19 @@ ec2:DescribeSnapshots
 ec2:DescribeImages
 ssm:GetParameter
 ssm:PutParameter
+iam:CreateRole
+iam:GetRole
+iam:PutRolePolicy
+iam:DeleteRolePolicy
+iam:ListRolePolicies
+iam:DeleteRole
+iam:CreateInstanceProfile
+iam:GetInstanceProfile
+iam:AddRoleToInstanceProfile
+iam:RemoveRoleFromInstanceProfile
+iam:DeleteInstanceProfile
+iam:PassRole
+sts:GetCallerIdentity
 ```
 
 Configure and verify credentials:

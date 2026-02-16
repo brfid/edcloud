@@ -34,12 +34,14 @@ def test_provision_reads_tailscale_key_from_ssm(
     )
 
     assert result.exit_code == 0
-    _, passed_key = mock_provision.call_args.args
-    assert passed_key == "tailscale-test-key"
-    ssm.get_parameter.assert_called_once_with(
-        Name="/edcloud/tailscale_auth_key",
-        WithDecryption=True,
-    )
+    # Provision now only receives config, SSM parameter is verified but not fetched
+    cfg = mock_provision.call_args.args[0]
+    assert cfg.tailscale_auth_key_ssm_parameter == "/edcloud/tailscale_auth_key"
+    # Verify SSM parameter existence is checked (not fetched with decryption)
+    assert ssm.get_parameter.called
+    call_kwargs = ssm.get_parameter.call_args.kwargs
+    assert call_kwargs["Name"] == "/edcloud/tailscale_auth_key"
+    assert call_kwargs["WithDecryption"] is False
 
 
 @patch("edcloud.cli.boto3.client")
@@ -53,7 +55,7 @@ def test_provision_reads_tailscale_key_from_ssm_envvar(
     mock_boto3_client,
 ):
     ssm = MagicMock()
-    ssm.get_parameter.return_value = {"Parameter": {"Value": "tailscale-test-key"}}
+    ssm.get_parameter.return_value = {"Parameter": {"Value": "exists"}}
     mock_boto3_client.return_value = ssm
     mock_provision.return_value = {
         "instance_id": "i-abc123",
@@ -69,22 +71,28 @@ def test_provision_reads_tailscale_key_from_ssm_envvar(
     )
 
     assert result.exit_code == 0
-    _, passed_key = mock_provision.call_args.args
-    assert passed_key == "tailscale-test-key"
-    ssm.get_parameter.assert_called_once_with(
-        Name="/edcloud/tailscale_auth_key",
-        WithDecryption=True,
-    )
+    cfg = mock_provision.call_args.args[0]
+    assert cfg.tailscale_auth_key_ssm_parameter == "/edcloud/tailscale_auth_key"
 
 
+@patch("edcloud.cli.boto3.client")
 @patch("edcloud.cli.get_region", return_value="us-east-1")
 @patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
-def test_provision_requires_tailscale_key(_mock_creds, _mock_region):
+def test_provision_requires_tailscale_key(_mock_creds, _mock_region, mock_boto3_client):
+    from botocore.exceptions import ClientError
+
+    ssm = MagicMock()
+    ssm.get_parameter.side_effect = ClientError(
+        {"Error": {"Code": "ParameterNotFound"}},
+        "GetParameter",
+    )
+    mock_boto3_client.return_value = ssm
+
     runner = CliRunner()
     result = runner.invoke(main, ["provision"])
 
     assert result.exit_code == 1
-    assert "Tailscale auth key required." in result.output
+    assert "Tailscale auth key not found in SSM" in result.output
 
 
 @patch("edcloud.cli.get_region", return_value="us-east-1")
@@ -289,3 +297,76 @@ def test_destroy_require_fresh_snapshot_passes_with_recent_snapshot(
     assert result.exit_code == 0
     assert "Using pre-change snapshot: snap-abc123" in result.output
     mock_destroy.assert_called_once_with(force=True)
+
+
+@patch("edcloud.cli.tailscale.get_tailscale_ip", return_value="100.64.1.1")
+@patch("edcloud.cli.ec2.start")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_up_calls_start(_mock_creds, _mock_region, mock_start, _mock_tailscale):
+    runner = CliRunner()
+    result = runner.invoke(main, ["up"])
+
+    assert result.exit_code == 0
+    mock_start.assert_called_once()
+    assert "100.64.1.1" in result.output
+
+
+@patch("edcloud.cli.ec2.stop")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_down_calls_stop(_mock_creds, _mock_region, mock_stop):
+    runner = CliRunner()
+    result = runner.invoke(main, ["down"])
+
+    assert result.exit_code == 0
+    mock_stop.assert_called_once()
+
+
+@patch("edcloud.cli.tailscale.get_tailscale_ip", return_value="100.64.1.1")
+@patch("edcloud.cli.tailscale.is_reachable", return_value=True)
+@patch("edcloud.cli.ec2.status")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_status_displays_instance_info(
+    _mock_creds, _mock_region, mock_status, _mock_reachable, _mock_tailscale
+):
+    mock_status.return_value = {
+        "exists": True,
+        "instance_id": "i-abc123",
+        "state": "running",
+        "instance_type": "t3a.medium",
+        "public_ip": "3.3.3.3",
+        "launch_time": "2026-02-15T10:00:00Z",
+        "volumes": [{"volume_id": "vol-123", "size_gb": 40, "type": "gp3", "state": "in-use"}],
+        "cost_estimate": {
+            "compute_monthly": 13.54,
+            "storage_monthly": 3.20,
+            "total_monthly": 16.74,
+            "note": "Assumes 4hrs/day runtime",
+        },
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+
+    assert result.exit_code == 0
+    assert "i-abc123" in result.output
+    assert "running" in result.output
+    assert "t3a.medium" in result.output
+    assert "100.64.1.1" in result.output
+    assert "yes" in result.output  # reachable
+    assert "$16.74" in result.output
+
+
+@patch("edcloud.cli.ec2.status")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_status_shows_no_instance(_mock_creds, _mock_region, mock_status):
+    mock_status.return_value = {"exists": False, "orphaned_resources": {}}
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+
+    assert result.exit_code == 0
+    assert "No edcloud instance found" in result.output

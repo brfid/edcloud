@@ -5,27 +5,17 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-import boto3
-
-from edcloud.config import MANAGER_TAG_KEY, MANAGER_TAG_VALUE, NAME_TAG
-from edcloud.ec2 import _find_instance, _managed_filter
+from edcloud.config import (
+    MANAGER_TAG_KEY,
+    MANAGER_TAG_VALUE,
+    NAME_TAG,
+    get_volume_ids,
+    managed_filter,
+)
+from edcloud.ec2 import _ec2_client, _find_instance
 
 WEEKLY_PREFIX = "weekly-snapshot"
 MONTHLY_PREFIX = "monthly-snapshot"
-
-
-def _ec2_client() -> Any:
-    return boto3.client("ec2")
-
-
-def _get_volume_ids(instance: dict[str, Any]) -> list[str]:
-    """Extract EBS volume IDs from an instance description."""
-    vol_ids = []
-    for bdm in instance.get("BlockDeviceMappings", []):
-        vid = bdm.get("Ebs", {}).get("VolumeId")
-        if vid:
-            vol_ids.append(vid)
-    return vol_ids
 
 
 def create_snapshot(description: str | None = None) -> list[str]:
@@ -39,7 +29,7 @@ def create_snapshot(description: str | None = None) -> list[str]:
         raise RuntimeError("No edcloud instance found. Nothing to snapshot.")
 
     iid = inst["InstanceId"]
-    vol_ids = _get_volume_ids(inst)
+    vol_ids = get_volume_ids(inst)
     if not vol_ids:
         raise RuntimeError(f"No EBS volumes found on instance {iid}.")
 
@@ -77,7 +67,7 @@ def list_snapshots() -> list[dict[str, Any]]:
     """List all edcloud-managed snapshots."""
     ec2 = _ec2_client()
     resp = ec2.describe_snapshots(
-        Filters=_managed_filter(),
+        Filters=managed_filter(),
         OwnerIds=["self"],
     )
     snapshots = []

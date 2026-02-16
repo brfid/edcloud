@@ -13,14 +13,22 @@ from typing import Any
 import boto3
 from botocore.exceptions import ClientError
 
+from edcloud.aws_check import get_region
 from edcloud.config import (
+    DEFAULT_HOURS_PER_DAY,
+    EBS_MONTHLY_RATE_PER_GB,
+    HOURLY_RATES,
     MANAGER_TAG_KEY,
     MANAGER_TAG_VALUE,
     NAME_TAG,
     SECURITY_GROUP_DESC,
     SECURITY_GROUP_NAME,
     InstanceConfig,
+    get_volume_ids,
+    has_managed_tag,
+    managed_filter,
 )
+from edcloud.iam import delete_instance_profile, ensure_instance_profile
 
 _USER_DATA_PATH = Path(__file__).resolve().parent.parent / "cloud-init" / "user-data.yaml"
 _ACTIVE_INSTANCE_STATES = ["pending", "running", "stopping", "stopped"]
@@ -47,22 +55,13 @@ def _ssm_client() -> Any:
     return boto3.client("ssm")
 
 
-def _managed_filter() -> list[dict[str, Any]]:
-    """Tag filter that matches edcloud-managed resources."""
-    return [{"Name": f"tag:{MANAGER_TAG_KEY}", "Values": [MANAGER_TAG_VALUE]}]
+# Backward-compat aliases for callers that import the underscore-prefixed names
+_managed_filter = managed_filter
+_has_managed_tag = has_managed_tag
 
 
 def _instance_state_filter() -> dict[str, Any]:
     return {"Name": "instance-state-name", "Values": _ACTIVE_INSTANCE_STATES}
-
-
-def _has_managed_tag(tags: list[dict[str, str]] | None) -> bool:
-    if not tags:
-        return False
-    for tag in tags:
-        if tag.get("Key") == MANAGER_TAG_KEY and tag.get("Value") == MANAGER_TAG_VALUE:
-            return True
-    return False
 
 
 def _instance_summary(instances: list[dict[str, Any]]) -> str:
@@ -79,17 +78,13 @@ def _list_instances(client: Any, filters: list[dict[str, Any]]) -> list[dict[str
 
 def _validate_instance_volume_tags(client: Any, instance: dict[str, Any]) -> None:
     """Ensure attached volumes keep the managed tag."""
-    volume_ids = [
-        bdm.get("Ebs", {}).get("VolumeId")
-        for bdm in instance.get("BlockDeviceMappings", [])
-        if bdm.get("Ebs", {}).get("VolumeId")
-    ]
+    volume_ids = get_volume_ids(instance)
     if not volume_ids:
         return
 
     resp = client.describe_volumes(VolumeIds=volume_ids)
     untagged = [
-        v["VolumeId"] for v in resp.get("Volumes", []) if not _has_managed_tag(v.get("Tags", []))
+        v["VolumeId"] for v in resp.get("Volumes", []) if not has_managed_tag(v.get("Tags", []))
     ]
     if not untagged:
         return
@@ -108,13 +103,13 @@ def _managed_orphan_report(client: Any) -> dict[str, list[str]]:
     """Return orphaned managed resources outside an active managed instance."""
     report: dict[str, list[str]] = {"security_groups": [], "volumes": []}
 
-    sg_resp = client.describe_security_groups(Filters=_managed_filter())
+    sg_resp = client.describe_security_groups(Filters=managed_filter())
     for sg in sg_resp.get("SecurityGroups", []):
         group_name = sg.get("GroupName")
         if group_name == SECURITY_GROUP_NAME:
             report["security_groups"].append(sg["GroupId"])
 
-    vol_resp = client.describe_volumes(Filters=_managed_filter())
+    vol_resp = client.describe_volumes(Filters=managed_filter())
     for volume in vol_resp.get("Volumes", []):
         if volume.get("State") == "available":
             report["volumes"].append(volume["VolumeId"])
@@ -252,11 +247,76 @@ def _get_default_vpc_id(client: Any) -> str:
     return vpcs[0]["VpcId"]  # type: ignore[no-any-return]
 
 
-def _render_user_data(tailscale_auth_key: str, tailscale_hostname: str) -> str:
+def _get_aws_region() -> str:
+    """Get the current AWS region from the session."""
+    region = get_region()
+    if not region:
+        raise RuntimeError(
+            "No AWS region configured. Set AWS_DEFAULT_REGION or run 'aws configure'."
+        )
+    return region
+
+
+def _validate_user_data_inputs(
+    tailscale_hostname: str,
+    tailscale_auth_key: str | None = None,
+    tailscale_auth_key_ssm_parameter: str | None = None,
+    aws_region: str | None = None,
+) -> None:
+    """Validate user-data template inputs to prevent injection attacks.
+
+    Raises ValueError if any input contains dangerous characters or invalid format.
+    """
+    import re
+
+    # Validate hostname: DNS-safe, 1-63 chars
+    if not re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$", tailscale_hostname):
+        raise ValueError(
+            f"Invalid tailscale_hostname: {tailscale_hostname!r}. "
+            "Must be 1-63 alphanumeric/hyphen characters, cannot start/end with hyphen."
+        )
+
+    # Validate auth key if provided (transitional, for old flow)
+    if tailscale_auth_key is not None:
+        dangerous_chars = ["\n", "\r", "`", "$(", "${", ";", "'", '"', "|", "&"]
+        for char in dangerous_chars:
+            if char in tailscale_auth_key:
+                raise ValueError(
+                    f"Invalid tailscale_auth_key: contains dangerous character {char!r}"
+                )
+
+    # Validate SSM parameter path if provided
+    if tailscale_auth_key_ssm_parameter is not None and not re.match(
+        r"^[a-zA-Z0-9/_.-]+$", tailscale_auth_key_ssm_parameter
+    ):
+        raise ValueError(
+            f"Invalid tailscale_auth_key_ssm_parameter: {tailscale_auth_key_ssm_parameter!r}. "
+            "Must contain only alphanumeric, /, _, ., - characters."
+        )
+
+    # Validate AWS region if provided
+    if aws_region is not None and not re.match(r"^[a-z]{2}(-[a-z]+-[0-9]+)?$", aws_region):
+        raise ValueError(
+            f"Invalid aws_region: {aws_region!r}. Must match AWS region format (e.g., us-east-1)."
+        )
+
+
+def _render_user_data(
+    tailscale_auth_key_ssm_parameter: str,
+    tailscale_hostname: str,
+    aws_region: str,
+) -> str:
     """Read cloud-init template and interpolate variables."""
+    _validate_user_data_inputs(
+        tailscale_hostname=tailscale_hostname,
+        tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
+        aws_region=aws_region,
+    )
     template = _USER_DATA_PATH.read_text()
-    return template.replace("${TAILSCALE_AUTH_KEY}", tailscale_auth_key).replace(
-        "${TAILSCALE_HOSTNAME}", tailscale_hostname
+    return (
+        template.replace("${TAILSCALE_AUTH_KEY_SSM_PARAMETER}", tailscale_auth_key_ssm_parameter)
+        .replace("${TAILSCALE_HOSTNAME}", tailscale_hostname)
+        .replace("${AWS_REGION}", aws_region)
     )
 
 
@@ -265,8 +325,10 @@ def _render_user_data(tailscale_auth_key: str, tailscale_hostname: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def provision(cfg: InstanceConfig, tailscale_auth_key: str) -> dict[str, str]:
+def provision(cfg: InstanceConfig) -> dict[str, str]:
     """Create the edcloud instance from scratch.
+
+    The Tailscale auth key is fetched from SSM at boot time by the instance.
 
     Returns dict with instance_id, security_group_id, public_ip (if any).
     """
@@ -303,20 +365,31 @@ def provision(cfg: InstanceConfig, tailscale_auth_key: str) -> dict[str, str]:
         # No inbound rules: all access comes via Tailscale tunnel.
         print(f"  Created security group: {sg_id} (no inbound rules)")
 
-    # 2. Resolve AMI -----------------------------------------------------------
+    # 2. IAM instance profile -------------------------------------------------
+    profile_arn = ensure_instance_profile(cfg.tags)
+    print(f"  Instance profile: {profile_arn}")
+
+    # 3. Resolve AMI -----------------------------------------------------------
     ami_id = _resolve_ami(cfg.ami_ssm_parameter)
     print(f"  AMI: {ami_id}")
 
-    # 3. User-data script ------------------------------------------------------
-    user_data = _render_user_data(tailscale_auth_key, cfg.tailscale_hostname)
+    # 4. User-data script ------------------------------------------------------
+    aws_region = _get_aws_region()
+    user_data = _render_user_data(
+        tailscale_auth_key_ssm_parameter=cfg.tailscale_auth_key_ssm_parameter,
+        tailscale_hostname=cfg.tailscale_hostname,
+        aws_region=aws_region,
+    )
+    print(f"  Tailscale auth key will be fetched from SSM: {cfg.tailscale_auth_key_ssm_parameter}")
 
-    # 4. Launch instance -------------------------------------------------------
+    # 5. Launch instance -------------------------------------------------------
     run_resp = ec2.run_instances(
         ImageId=ami_id,
         InstanceType=cfg.instance_type,
         MinCount=1,
         MaxCount=1,
         SecurityGroupIds=[sg_id],
+        IamInstanceProfile={"Arn": profile_arn},
         UserData=user_data,
         BlockDeviceMappings=[
             {
@@ -352,13 +425,14 @@ def provision(cfg: InstanceConfig, tailscale_auth_key: str) -> dict[str, str]:
         MetadataOptions={
             "HttpTokens": "required",  # IMDSv2 only
             "HttpEndpoint": "enabled",
+            "HttpPutResponseHopLimit": 1,  # Prevent containers from reaching IMDS
         },
     )
 
     instance_id = run_resp["Instances"][0]["InstanceId"]
     print(f"  Instance launched: {instance_id}")
 
-    # 5. Wait for running ------------------------------------------------------
+    # 6. Wait for running ------------------------------------------------------
     print("  Waiting for instance to reach 'running' state...")
     waiter = ec2.get_waiter("instance_running")
     waiter.wait(InstanceIds=[instance_id])
@@ -486,10 +560,9 @@ def status() -> dict[str, Any]:
                 )
 
     # Cost estimate
-    hours_per_day = 4
-    hourly_rate = {"t3a.medium": 0.0376, "t3a.small": 0.0188}.get(instance_type, 0.0)
-    compute_monthly = hourly_rate * hours_per_day * 30
-    storage_monthly = sum(v["size_gb"] for v in volumes) * 0.08
+    hourly_rate = HOURLY_RATES.get(instance_type, 0.0)
+    compute_monthly = hourly_rate * DEFAULT_HOURS_PER_DAY * 30
+    storage_monthly = sum(v["size_gb"] for v in volumes) * EBS_MONTHLY_RATE_PER_GB
     total_monthly = compute_monthly + storage_monthly
 
     result: dict[str, Any] = {
@@ -504,7 +577,7 @@ def status() -> dict[str, Any]:
             "compute_monthly": round(compute_monthly, 2),
             "storage_monthly": round(storage_monthly, 2),
             "total_monthly": round(total_monthly, 2),
-            "note": f"Assumes {hours_per_day}hrs/day runtime",
+            "note": f"Assumes {DEFAULT_HOURS_PER_DAY}hrs/day runtime",
         },
     }
     return result
@@ -560,6 +633,10 @@ def destroy(force: bool = False) -> None:
         except ClientError as exc:
             print(f"Could not delete security group {sg_id}: {exc}")
             print("You may need to delete it manually after ENIs are released.")
+
+    # Clean up IAM instance profile
+    print()
+    delete_instance_profile()
 
     # List orphaned volumes
     vol_resp = ec2.describe_volumes(Filters=_managed_filter())

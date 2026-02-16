@@ -15,10 +15,47 @@ from botocore.exceptions import ClientError
 
 from edcloud import ec2, snapshot, tailscale
 from edcloud.aws_check import check_aws_credentials, get_region
-from edcloud.config import DEFAULT_TAILSCALE_HOSTNAME, InstanceConfig
+from edcloud.config import (
+    DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER,
+    DEFAULT_TAILSCALE_HOSTNAME,
+    InstanceConfig,
+)
 
-DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER = "/edcloud/tailscale_auth_key"
 PRECHANGE_SNAPSHOT_PREFIX = "pre-change"
+
+
+def _resolve_ssh_target(
+    info: dict[str, object],
+    public_ip: bool,
+    user: str,
+    hostname: str,
+) -> tuple[str, list[str]]:
+    """Resolve SSH target and build base command for Tailscale or public IP.
+
+    Returns (target_ip, ssh_base_command).
+    """
+    if public_ip:
+        target = str(info.get("public_ip") or "")
+        if not target:
+            raise RuntimeError("No public IP available. Remove --public-ip or assign a public IP.")
+        ssh_base = ["ssh", "-o", "StrictHostKeyChecking=accept-new", f"{user}@{target}"]
+        return target, ssh_base
+    else:
+        ts_ip = tailscale.get_tailscale_ip(hostname)
+        if not ts_ip:
+            raise RuntimeError(
+                f"Tailscale IP not found for '{hostname}'. "
+                "Check tailnet connectivity or use --public-ip."
+            )
+        ssh_base = [
+            "ssh",
+            "-o",
+            "ProxyCommand=none",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            f"{user}@{ts_ip}",
+        ]
+        return ts_ip, ssh_base
 
 
 def require_aws_creds(func):
@@ -122,13 +159,14 @@ def main() -> None:
 @click.option(
     "--tailscale-auth-key",
     envvar="TAILSCALE_AUTH_KEY",
-    help="Tailscale auth key (or set TAILSCALE_AUTH_KEY env var).",
+    help="Tailscale auth key (will be stored in SSM if provided).",
 )
 @click.option(
     "--tailscale-auth-key-ssm-parameter",
-    default=None,
+    default=DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER,
     envvar="TAILSCALE_AUTH_KEY_SSM_PARAMETER",
-    help="SSM parameter name containing Tailscale auth key (SecureString supported).",
+    show_default=True,
+    help="SSM parameter name containing Tailscale auth key.",
 )
 @require_aws_creds
 def provision(
@@ -137,39 +175,60 @@ def provision(
     state_volume_size: int,
     tailscale_hostname: str,
     tailscale_auth_key: str | None,
-    tailscale_auth_key_ssm_parameter: str | None,
+    tailscale_auth_key_ssm_parameter: str,
 ) -> None:
-    """Create the edcloud EC2 instance from scratch."""
-    if not tailscale_auth_key and tailscale_auth_key_ssm_parameter:
+    """Create the edcloud EC2 instance from scratch.
+
+    The Tailscale auth key is fetched from SSM by the instance at boot.
+    """
+    ssm = boto3.client("ssm")
+
+    # If raw key is provided, store it in SSM
+    if tailscale_auth_key:
+        click.echo(f"Storing Tailscale auth key in SSM: {tailscale_auth_key_ssm_parameter}")
         try:
-            tailscale_auth_key = _fetch_tailscale_auth_key_from_ssm(
-                tailscale_auth_key_ssm_parameter
+            ssm.put_parameter(
+                Name=tailscale_auth_key_ssm_parameter,
+                Value=tailscale_auth_key,
+                Type="SecureString",
+                Overwrite=True,
             )
+            click.echo("  Key stored successfully.")
         except ClientError as exc:
+            click.echo(f"Error storing key in SSM: {exc}", err=True)
+            raise SystemExit(1) from exc
+
+    # Verify SSM parameter exists
+    try:
+        ssm.get_parameter(Name=tailscale_auth_key_ssm_parameter, WithDecryption=False)
+    except ClientError as exc:
+        if "ParameterNotFound" in str(exc):
             click.echo(
-                "Error: could not read Tailscale auth key from SSM parameter "
-                f"'{tailscale_auth_key_ssm_parameter}': {exc}",
+                f"Error: Tailscale auth key not found in SSM: {tailscale_auth_key_ssm_parameter}",
+                err=True,
+            )
+            click.echo("  Set TAILSCALE_AUTH_KEY or pass --tailscale-auth-key.", err=True)
+            click.echo(
+                "  Or manually create the parameter with: "
+                "aws ssm put-parameter --name /edcloud/tailscale_auth_key "
+                "--type SecureString --value 'tskey-auth-...'",
+                err=True,
+            )
+            click.echo(
+                "  Generate a key at: https://login.tailscale.com/admin/settings/keys",
                 err=True,
             )
             raise SystemExit(1) from exc
-
-    if not tailscale_auth_key:
-        click.echo("Error: Tailscale auth key required.", err=True)
-        click.echo("  Set TAILSCALE_AUTH_KEY or pass --tailscale-auth-key.", err=True)
-        click.echo(
-            "  Or pass --tailscale-auth-key-ssm-parameter /path/to/parameter.",
-            err=True,
-        )
-        click.echo("  Generate one at: https://login.tailscale.com/admin/settings/keys", err=True)
-        raise SystemExit(1)
+        raise
 
     cfg = InstanceConfig(
         instance_type=instance_type,
         volume_size_gb=volume_size,
         state_volume_size_gb=state_volume_size,
         tailscale_hostname=tailscale_hostname,
+        tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
     )
-    result = ec2.provision(cfg, tailscale_auth_key)
+    result = ec2.provision(cfg)
     click.echo()
     click.echo(json.dumps(result, indent=2))
 
@@ -470,31 +529,9 @@ def verify_cmd(user: str, public_ip: bool, json_output: bool) -> None:
     if info.get("state") != "running":
         raise RuntimeError(f"Instance is {info.get('state')}, must be running for verification.")
 
-    target = ""
-    ssh_base: list[str] = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=12",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-    ]
-    if public_ip:
-        target = str(info.get("public_ip") or "")
-        if not target:
-            raise RuntimeError(
-                "No public IP available. Start without --public-ip or assign a public IP."
-            )
-        ssh_base.append(f"{user}@{target}")
-    else:
-        ts_ip = tailscale.get_tailscale_ip(DEFAULT_TAILSCALE_HOSTNAME)
-        if not ts_ip:
-            raise RuntimeError(
-                "Tailscale IP not found. Verify local tailnet connectivity or use --public-ip."
-            )
-        target = ts_ip
-        ssh_base.extend(["-o", "ProxyCommand=none", f"{user}@{target}"])
+    target, ssh_base = _resolve_ssh_target(info, public_ip, user, DEFAULT_TAILSCALE_HOSTNAME)
+    # Add verify-specific options
+    ssh_base.extend(["-o", "BatchMode=yes", "-o", "ConnectTimeout=12"])
 
     checks: list[tuple[str, str]] = [
         ("cloud-init completion marker", "test -f /tmp/edcloud-ready"),
@@ -592,39 +629,25 @@ def ssh_cmd(user: str, public_ip: bool, ssh_args: tuple[str, ...]) -> None:
         click.echo(f"Error: Instance is {info['state']}, not running.", err=True)
         raise SystemExit(1)
 
-    # Choose target: Tailscale IP (default) or public IP
-    target = None
-    if public_ip:
-        target = info.get("public_ip")
-        if not target:
-            click.echo("Error: No public IP available.", err=True)
-            raise SystemExit(1)
-        click.echo(f"Connecting via public IP: {target}", err=True)
-        click.echo("Note: Security group must allow SSH (port 22) from your IP", err=True)
-        cmd = ["ssh", "-o", "StrictHostKeyChecking=accept-new", f"{user}@{target}"]
-    else:
-        ts_ip = tailscale.get_tailscale_ip(DEFAULT_TAILSCALE_HOSTNAME)
-        if ts_ip:
-            target = ts_ip
-            click.echo(f"Connecting via Tailscale: {ts_ip}", err=True)
-            click.echo(
-                "Note: May trigger Tailscale SSH browser auth if enabled on your tailnet", err=True
-            )
-            # Use ProxyCommand=none to attempt regular SSH over Tailscale network
-            # (Tailscale SSH may still intercept depending on tailnet settings)
-            cmd = [
-                "ssh",
-                "-o",
-                "ProxyCommand=none",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                f"{user}@{target}",
-            ]
-        else:
-            click.echo("Error: Tailscale IP not found. Is tailscale running?", err=True)
+    # Resolve SSH target
+    try:
+        target, cmd = _resolve_ssh_target(info, public_ip, user, DEFAULT_TAILSCALE_HOSTNAME)
+    except RuntimeError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        if not public_ip:
             click.echo("  Try: tailscale status", err=True)
             click.echo("  Or use: edc ssh --public-ip", err=True)
-            raise SystemExit(1)
+        raise SystemExit(1) from exc
+
+    # Log connection details
+    if public_ip:
+        click.echo(f"Connecting via public IP: {target}", err=True)
+        click.echo("Note: Security group must allow SSH (port 22) from your IP", err=True)
+    else:
+        click.echo(f"Connecting via Tailscale: {target}", err=True)
+        click.echo(
+            "Note: May trigger Tailscale SSH browser auth if enabled on your tailnet", err=True
+        )
 
     if ssh_args:
         cmd.extend(ssh_args)

@@ -1,12 +1,13 @@
 #cloud-config
 # edcloud instance bootstrap — Docker, Tailscale, Portainer, self-shutdown, state volume
-# Variables: ${TAILSCALE_AUTH_KEY}, ${TAILSCALE_HOSTNAME}
+# Variables: ${TAILSCALE_AUTH_KEY_SSM_PARAMETER}, ${TAILSCALE_HOSTNAME}, ${AWS_REGION}
 
 package_update: true
 package_upgrade: true
 
 packages:
   - apt-transport-https
+  - awscli
   - bash-completion
   - byobu
   - ca-certificates
@@ -124,15 +125,21 @@ runcmd:
   # --- Tailscale ---
   - |
     curl -fsSL https://tailscale.com/install.sh | sh
-    tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${TAILSCALE_HOSTNAME}" --ssh
+    TS_AUTH_KEY=$(aws ssm get-parameter \
+      --name "${TAILSCALE_AUTH_KEY_SSM_PARAMETER}" \
+      --with-decryption --query 'Parameter.Value' \
+      --output text --region "${AWS_REGION}")
+    tailscale up --auth-key="$TS_AUTH_KEY" --hostname="${TAILSCALE_HOSTNAME}" --ssh
+    unset TS_AUTH_KEY
 
-  # --- Portainer CE ---
+  # --- Portainer CE (Tailscale-only binding) ---
   - |
+    TS_IP=$(tailscale ip -4)
     docker volume create portainer_data
     docker run -d \
       --name portainer \
       --restart=always \
-      -p 9443:9443 \
+      -p "${TS_IP}:9443:9443" \
       -v /var/run/docker.sock:/var/run/docker.sock \
       -v portainer_data:/data \
       portainer/portainer-ce:lts
