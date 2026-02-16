@@ -7,6 +7,7 @@ from typing import Any
 
 import boto3
 import click
+from botocore.exceptions import BotoCoreError, ClientError
 
 from edcloud import tailscale
 from edcloud.config import (
@@ -159,7 +160,7 @@ def _delete_volumes(
         try:
             ec2_client.delete_volume(VolumeId=vol_id)
             click.echo(f"✅ Deleted {vol_id}")
-        except Exception as e:
+        except (ClientError, BotoCoreError) as e:
             click.echo(f"❌ Failed to delete {vol_id}: {e}")
     return True
 

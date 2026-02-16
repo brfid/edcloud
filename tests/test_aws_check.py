@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
-from botocore.exceptions import ClientError, NoCredentialsError
+from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
 from edcloud.aws_check import check_aws_credentials, get_region
 
@@ -71,7 +71,7 @@ class TestGetRegion:
 
     @patch("edcloud.aws_check.boto3.session.Session")
     def test_returns_none_on_exception(self, mock_session_class: MagicMock) -> None:
-        mock_session_class.side_effect = RuntimeError("Session error")
+        mock_session_class.side_effect = BotoCoreError()
 
         result = get_region()
 

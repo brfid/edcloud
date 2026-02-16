@@ -13,7 +13,7 @@ from typing import ParamSpec, TypeVar
 
 import boto3
 import click
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from edcloud import ec2, snapshot, tailscale
 from edcloud.aws_check import check_aws_credentials, get_region
@@ -238,12 +238,11 @@ def provision(
         # Auto-snapshot if existing instance (unless --skip-snapshot)
         if not skip_snapshot:
             click.echo("Checking for existing instance to snapshot...")
-            try:
-                snap_ids = snapshot.auto_snapshot_before_destroy()
-                if snap_ids:
-                    click.echo(f"✅ Created pre-provision snapshot(s): {', '.join(snap_ids)}")
-                    click.echo()
-            except Exception:
+            snap_ids = snapshot.auto_snapshot_before_destroy()
+            if snap_ids:
+                click.echo(f"✅ Created pre-provision snapshot(s): {', '.join(snap_ids)}")
+                click.echo()
+            else:
                 click.echo(
                     "Info: no existing instance to snapshot (this is fine for first provision)"
                 )
@@ -541,7 +540,7 @@ def destroy(
                 click.echo(f"✅ Created snapshot(s): {', '.join(snap_ids)}")
             else:
                 click.echo("Info: no instance found to snapshot")
-        except Exception as e:
+        except (RuntimeError, ClientError, BotoCoreError) as e:
             click.echo(f"⚠️  Snapshot failed: {e}", err=True)
             if not click.confirm("Continue with destroy anyway?"):
                 click.echo("Aborted.")

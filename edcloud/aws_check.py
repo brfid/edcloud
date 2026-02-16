@@ -24,7 +24,7 @@ def check_aws_credentials() -> tuple[bool, str]:
         )
     except ClientError as exc:
         return False, f"AWS credentials invalid: {exc}"
-    except (BotoCoreError, Exception) as exc:
+    except BotoCoreError as exc:
         return False, f"AWS connection error: {exc}"
 
 
@@ -33,5 +33,5 @@ def get_region() -> str | None:
     try:
         session = boto3.session.Session()
         return session.region_name
-    except Exception:
+    except BotoCoreError:
         return None
