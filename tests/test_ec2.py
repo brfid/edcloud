@@ -260,7 +260,7 @@ class TestProvision:
         assert len(block_mappings) == 2
         assert block_mappings[0]["DeviceName"] == "/dev/sda1"
         assert block_mappings[1]["DeviceName"] == "/dev/sdf"
-        assert block_mappings[1]["Ebs"]["VolumeSize"] == 10
+        assert block_mappings[1]["Ebs"]["VolumeSize"] == 30
         assert block_mappings[1]["Ebs"]["DeleteOnTermination"] is False
         # Verify IMDS settings
         metadata_opts = kwargs["MetadataOptions"]
@@ -269,6 +269,92 @@ class TestProvision:
         # Verify IAM instance profile is attached
         assert "IamInstanceProfile" in kwargs
         assert kwargs["IamInstanceProfile"]["Arn"] == "arn:aws:iam::123:instance-profile/edcloud"
+
+    @patch("edcloud.ec2._ec2_client")
+    @patch("edcloud.ec2._find_orphaned_state_volume_id", return_value="vol-state-existing")
+    @patch("edcloud.ec2._find_instance")
+    @patch("edcloud.ec2._find_security_group", return_value="sg-abc123")
+    @patch("edcloud.ec2._render_user_data", return_value="#cloud-config")
+    @patch("edcloud.ec2._resolve_ami", return_value="ami-abc123")
+    @patch("edcloud.ec2._get_aws_region", return_value="us-east-1")
+    @patch(
+        "edcloud.ec2.ensure_instance_profile",
+        return_value="arn:aws:iam::123:instance-profile/edcloud",
+    )
+    @patch("edcloud.ec2._apply_tags")
+    def test_reuses_existing_managed_state_volume(
+        self,
+        mock_apply_tags,
+        _mock_ensure_profile,
+        _mock_get_region,
+        _mock_resolve_ami,
+        _mock_render_user_data,
+        _mock_find_security_group,
+        mock_find_instance,
+        _mock_find_orphaned_state_volume_id,
+        mock_ec2_client,
+    ):
+        mock_client = MagicMock()
+        mock_client.run_instances.return_value = {"Instances": [{"InstanceId": "i-abc123"}]}
+        mock_client.get_waiter.return_value = MagicMock()
+        mock_ec2_client.return_value = mock_client
+
+        instance_after_launch = {
+            "InstanceId": "i-abc123",
+            "PublicIpAddress": "none",
+            "BlockDeviceMappings": [
+                {"DeviceName": "/dev/sda1", "Ebs": {"VolumeId": "vol-root"}},
+                {"DeviceName": "/dev/sdf", "Ebs": {"VolumeId": "vol-state-existing"}},
+            ],
+        }
+        mock_find_instance.side_effect = [None, instance_after_launch, instance_after_launch]
+
+        cfg = InstanceConfig()
+        provision(cfg)
+
+        kwargs = mock_client.run_instances.call_args.kwargs
+        block_mappings = kwargs["BlockDeviceMappings"]
+        assert len(block_mappings) == 1
+        assert block_mappings[0]["DeviceName"] == "/dev/sda1"
+
+        mock_client.attach_volume.assert_called_once_with(
+            VolumeId="vol-state-existing",
+            InstanceId="i-abc123",
+            Device="/dev/sdf",
+        )
+
+        assert mock_apply_tags.call_count == 2
+
+    @patch("edcloud.ec2._ec2_client")
+    @patch("edcloud.ec2._find_orphaned_state_volume_id", return_value=None)
+    @patch("edcloud.ec2._find_instance", return_value=None)
+    @patch("edcloud.ec2._find_security_group", return_value="sg-abc123")
+    @patch("edcloud.ec2._render_user_data", return_value="#cloud-config")
+    @patch("edcloud.ec2._resolve_ami", return_value="ami-abc123")
+    @patch("edcloud.ec2._get_aws_region", return_value="us-east-1")
+    @patch(
+        "edcloud.ec2.ensure_instance_profile",
+        return_value="arn:aws:iam::123:instance-profile/edcloud",
+    )
+    def test_require_existing_state_volume_fails_when_missing(
+        self,
+        _mock_ensure_profile,
+        _mock_get_region,
+        _mock_resolve_ami,
+        _mock_render_user_data,
+        _mock_find_security_group,
+        _mock_find_instance,
+        _mock_find_orphaned_state_volume_id,
+        mock_ec2_client,
+    ):
+        mock_client = MagicMock()
+        mock_ec2_client.return_value = mock_client
+
+        cfg = InstanceConfig()
+        with pytest.raises(RuntimeError, match="No reusable managed state volume found"):
+            provision(cfg, require_existing_state_volume=True)
+
+        mock_client.run_instances.assert_not_called()
 
 
 class TestStart:

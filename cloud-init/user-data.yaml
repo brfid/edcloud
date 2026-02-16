@@ -6,31 +6,89 @@ package_update: true
 package_upgrade: true
 
 packages:
+  # Core utilities
   - apt-transport-https
   - awscli
   - bash-completion
-  - byobu
+  - build-essential
   - ca-certificates
   - curl
-  - dnsutils
+  - gnupg
+  - lsb-release
+  - software-properties-common
+  - unattended-upgrades
+  - wget
+
+  # Developer tools
+  - git
+  - gh
+  - make
+  - cmake
+  - pkg-config
+
+  # Terminal tools
+  - byobu
+  - tmux
+  - screen
+  - neomutt
+  - vim-tiny
+  - neovim
+  - tree
+  - htop
+  - btop
+  - ncdu
+
+  # Search and file tools
   - fd-find
   - fzf
-  - gh
-  - gnupg
-  - git
-  - htop
-  - lsb-release
-  - jq
-  - neovim
   - ripgrep
-  - rsync
-  - tmux
-  - tree
-  - unattended-upgrades
+  - silversearcher-ag
+  - jq
+  - yq
+
+  # Network tools
+  - dnsutils
+  - net-tools
+  - iputils-ping
+  - traceroute
+  - nmap
+  - tcpdump
+  - netcat-openbsd
+
+  # Archive tools
   - unzip
-  - vim-tiny
-  - xclip
   - zip
+  - p7zip-full
+  - tar
+  - gzip
+  - bzip2
+  - xz-utils
+
+  # System tools
+  - rsync
+  - rclone
+  - strace
+  - lsof
+  - sysstat
+  - xclip
+
+  # Python environment
+  - python3
+  - python3-pip
+  - python3-venv
+  - python3-dev
+  - python3-setuptools
+  - python3-wheel
+  - python3-pytest
+  - python3-ipython
+  - pipx
+  - python-is-python3
+
+  # Additional useful tools
+  - sqlite3
+  - postgresql-client
+  - redis-tools
+  - certbot
 
 # --------------------------------------------------------------------------
 # Write files before runcmd
@@ -132,18 +190,6 @@ runcmd:
     tailscale up --auth-key="$TS_AUTH_KEY" --hostname="${TAILSCALE_HOSTNAME}" --ssh
     unset TS_AUTH_KEY
 
-  # --- Portainer CE (Tailscale-only binding) ---
-  - |
-    TS_IP=$(tailscale ip -4)
-    docker volume create portainer_data
-    docker run -d \
-      --name portainer \
-      --restart=always \
-      -p "${TS_IP}:9443:9443" \
-      -v /var/run/docker.sock:/var/run/docker.sock \
-      -v portainer_data:/data \
-      portainer/portainer-ce:lts
-
   # --- Durable state volume (/opt/edcloud/state) ---
   - |
     ROOT_SOURCE=$(findmnt -n -o SOURCE /)
@@ -191,10 +237,84 @@ runcmd:
       if [ -d /home/ubuntu/.ssh ]; then
         chmod 700 /home/ubuntu/.ssh
       fi
+
+      # Keep tailscaled state durable to preserve node identity across rebuilds.
+      mkdir -p /opt/edcloud/state/tailscale
+      if [ -z "$(ls -A /opt/edcloud/state/tailscale 2>/dev/null)" ] && [ -d /var/lib/tailscale ]; then
+        rsync -a /var/lib/tailscale/ /opt/edcloud/state/tailscale/
+      fi
+
+      if ! grep -qE '^/opt/edcloud/state/tailscale[[:space:]]+/var/lib/tailscale[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
+        echo "/opt/edcloud/state/tailscale /var/lib/tailscale none bind 0 0" >> /etc/fstab
+      fi
+      mkdir -p /var/lib/tailscale
+      if ! mountpoint -q /var/lib/tailscale; then
+        mount /var/lib/tailscale || mount -a
+      fi
+
+      # Keep compose files durable across reprovision.
+      mkdir -p /opt/edcloud/state/compose
+      mkdir -p /opt/edcloud/compose
+      if [ -z "$(ls -A /opt/edcloud/state/compose 2>/dev/null)" ] && [ -n "$(ls -A /opt/edcloud/compose 2>/dev/null)" ]; then
+        rsync -a /opt/edcloud/compose/ /opt/edcloud/state/compose/
+      fi
+
+      if ! grep -qE '^/opt/edcloud/state/compose[[:space:]]+/opt/edcloud/compose[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
+        echo "/opt/edcloud/state/compose /opt/edcloud/compose none bind 0 0" >> /etc/fstab
+      fi
+      if ! mountpoint -q /opt/edcloud/compose; then
+        mount /opt/edcloud/compose || mount -a
+      fi
+
+      # Keep Portainer data durable across reprovision.
+      mkdir -p /opt/edcloud/state/portainer-data
+      mkdir -p /opt/edcloud/portainer-data
+      if [ -z "$(ls -A /opt/edcloud/state/portainer-data 2>/dev/null)" ] && [ -n "$(ls -A /opt/edcloud/portainer-data 2>/dev/null)" ]; then
+        rsync -a /opt/edcloud/portainer-data/ /opt/edcloud/state/portainer-data/
+      fi
+
+      if ! grep -qE '^/opt/edcloud/state/portainer-data[[:space:]]+/opt/edcloud/portainer-data[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
+        echo "/opt/edcloud/state/portainer-data /opt/edcloud/portainer-data none bind 0 0" >> /etc/fstab
+      fi
+      if ! mountpoint -q /opt/edcloud/portainer-data; then
+        mount /opt/edcloud/portainer-data || mount -a
+      fi
+
+      # Keep Docker engine data durable across reprovision.
+      mkdir -p /opt/edcloud/state/docker
+      if [ -z "$(ls -A /opt/edcloud/state/docker 2>/dev/null)" ] && [ -n "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
+        rsync -a /var/lib/docker/ /opt/edcloud/state/docker/
+      fi
+
+      printf '%s\n' \
+        '{' \
+        '  "data-root": "/opt/edcloud/state/docker"' \
+        '}' > /etc/docker/daemon.json
+
+      systemctl daemon-reload
+      systemctl restart docker
     fi
+
+  # --- Portainer CE ---
+  - |
+    TS_IP=$(tailscale ip -4)
+    docker run -d \
+      --name portainer \
+      --restart=always \
+      -p "${TS_IP}:9443:9443" \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -v /opt/edcloud/portainer-data:/data \
+      portainer/portainer-ce:lts
 
   # --- Homebrew + LazyVim baseline ---
   - |
+    NVIM_VERSION="v0.11.3"
+    NVIM_TARBALL_URL="https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz"
+    curl -fsSL "$NVIM_TARBALL_URL" -o /tmp/nvim-linux-x86_64.tar.gz
+    rm -rf /opt/nvim-linux-x86_64
+    tar -C /opt -xzf /tmp/nvim-linux-x86_64.tar.gz
+    ln -sfn /opt/nvim-linux-x86_64/bin/nvim /usr/local/bin/nvim
+
     export NONINTERACTIVE=1
     if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
       /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
@@ -216,8 +336,92 @@ runcmd:
       fi
     '
 
-  # --- Compose directory ---
-  - mkdir -p /opt/edcloud/compose
+  # --- Node.js LTS (via NodeSource) ---
+  - |
+    curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+    apt-get install -y nodejs
+    npm install -g npm@11.9.0 @openai/codex@0.98.0 cline@2.2.2 @google/gemini-cli
+
+  # --- Python developer tooling (pipx-managed, persistent on state volume) ---
+  - |
+    runuser -u ubuntu -- bash -lc '
+      set -euo pipefail
+      pipx ensurepath
+      pipx install --force ruff
+      pipx install --force mypy
+    '
+
+  # --- GitHub CLI authentication (from SSM if available) ---
+  - |
+    runuser -u ubuntu -- bash -lc '
+      set -euo pipefail
+      if command -v aws &>/dev/null && command -v gh &>/dev/null; then
+        # Try to get GitHub token from SSM (requires IAM role with SSM read permission)
+        GITHUB_TOKEN=$(aws ssm get-parameter \
+          --name /edcloud/github_token \
+          --with-decryption \
+          --query "Parameter.Value" \
+          --output text 2>/dev/null || echo "")
+
+        if [ -n "$GITHUB_TOKEN" ]; then
+          # Configure gh CLI with token
+          echo "$GITHUB_TOKEN" | gh auth login --with-token
+          gh auth setup-git
+          echo "✅ GitHub CLI authenticated from SSM"
+        fi
+      fi
+    '
+
+  # --- Pull non-secret personal repos (dotfiles/bin/llm-config) ---
+  - |
+    runuser -u ubuntu -- bash -lc '
+      set -euo pipefail
+
+      if ! command -v gh &>/dev/null; then
+        exit 0
+      fi
+
+      if ! gh auth status &>/dev/null; then
+        echo "ℹ️ gh not authenticated; skipping dotfiles/bin/llm-config sync"
+        exit 0
+      fi
+
+      GH_USER=$(gh api user --jq .login 2>/dev/null || true)
+      if [ -z "$GH_USER" ]; then
+        echo "ℹ️ could not resolve GitHub username; skipping repo sync"
+        exit 0
+      fi
+
+      mkdir -p "$HOME/src" "$HOME/.local/bin"
+
+      sync_repo() {
+        local name="$1"
+        local repo_url="https://github.com/${GH_USER}/${name}.git"
+        local target="$HOME/src/${name}"
+
+        if [ -d "$target/.git" ]; then
+          git -C "$target" pull --ff-only || true
+        else
+          git clone "$repo_url" "$target" || true
+        fi
+      }
+
+      sync_repo dotfiles
+      sync_repo bin
+      sync_repo llm-config
+
+      if [ -x "$HOME/src/dotfiles/install.sh" ]; then
+        "$HOME/src/dotfiles/install.sh" || true
+      fi
+
+      if [ -d "$HOME/src/bin" ]; then
+        find "$HOME/src/bin" -maxdepth 1 -type f -perm -u+x -exec ln -sfn {} "$HOME/.local/bin/" \;
+      fi
+    '
+
+  # --- AI CLI profile note ---
+  # Baseline installs Codex + Cline + Gemini CLI via npm above.
+  # Keep this path game-free for default rebuilds.
 
   # --- Enable idle-shutdown timer ---
   - systemctl daemon-reload

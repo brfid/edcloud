@@ -21,8 +21,11 @@ from edcloud.config import (
     MANAGER_TAG_KEY,
     MANAGER_TAG_VALUE,
     NAME_TAG,
+    ROOT_VOLUME_ROLE,
     SECURITY_GROUP_DESC,
     SECURITY_GROUP_NAME,
+    STATE_VOLUME_ROLE,
+    VOLUME_ROLE_TAG_KEY,
     InstanceConfig,
     get_volume_ids,
     has_managed_tag,
@@ -134,6 +137,27 @@ def _apply_tags(client: Any, resource_ids: list[str], tags: dict[str, str]) -> N
     client.create_tags(Resources=resource_ids, Tags=tag_list)
 
 
+def _find_orphaned_state_volume_id(client: Any) -> str | None:
+    """Return a single available managed state volume ID, if present."""
+    resp = client.describe_volumes(
+        Filters=[
+            {"Name": f"tag:{MANAGER_TAG_KEY}", "Values": [MANAGER_TAG_VALUE]},
+            {"Name": f"tag:{VOLUME_ROLE_TAG_KEY}", "Values": [STATE_VOLUME_ROLE]},
+            {"Name": "status", "Values": ["available"]},
+        ]
+    )
+    vols = [v["VolumeId"] for v in resp.get("Volumes", [])]
+    if not vols:
+        return None
+    if len(vols) > 1:
+        raise TagDriftError(
+            "Tag drift detected: multiple available managed state volumes found: "
+            f"{', '.join(vols)}\n"
+            "Remediation: keep a single state volume for this environment."
+        )
+    return str(vols[0])
+
+
 def _find_instance(client: Any) -> dict[str, Any] | None:
     """Find the single edcloud-managed instance (any state except terminated)."""
     managed_instances = _list_instances(client, _managed_filter())
@@ -215,7 +239,7 @@ def _resolve_ami(ssm_parameter: str) -> str:
     ssm = _ssm_client()
     try:
         resp = ssm.get_parameter(Name=ssm_parameter)
-        return resp["Parameter"]["Value"]  # type: ignore[no-any-return]
+        return str(resp["Parameter"]["Value"])
     except ClientError as exc:
         # Fallback: if SSM parameter path doesn't work, use a direct lookup
         if "ParameterNotFound" in str(exc):
@@ -234,7 +258,7 @@ def _resolve_ami(ssm_parameter: str) -> str:
             )
             images = sorted(resp["Images"], key=lambda x: x["CreationDate"], reverse=True)
             if images:
-                return images[0]["ImageId"]  # type: ignore[no-any-return]
+                return str(images[0]["ImageId"])
         raise
 
 
@@ -244,7 +268,7 @@ def _get_default_vpc_id(client: Any) -> str:
     vpcs = resp.get("Vpcs", [])
     if not vpcs:
         raise RuntimeError("No default VPC found. Create one or specify a VPC ID.")
-    return vpcs[0]["VpcId"]  # type: ignore[no-any-return]
+    return str(vpcs[0]["VpcId"])
 
 
 def _get_aws_region() -> str:
@@ -325,7 +349,10 @@ def _render_user_data(
 # ---------------------------------------------------------------------------
 
 
-def provision(cfg: InstanceConfig) -> dict[str, str]:
+def provision(
+    cfg: InstanceConfig,
+    require_existing_state_volume: bool = False,
+) -> dict[str, str]:
     """Create the edcloud instance from scratch.
 
     The Tailscale auth key is fetched from SSM at boot time by the instance.
@@ -357,7 +384,7 @@ def provision(cfg: InstanceConfig) -> dict[str, str]:
             Description=SECURITY_GROUP_DESC,
             VpcId=vpc_id,
         )
-        sg_id = resp["GroupId"]
+        sg_id = str(resp["GroupId"])
         _apply_tags(ec2, [sg_id], cfg.tags)
 
         # Revoke the default "allow all outbound" rule? No — we need outbound
@@ -382,7 +409,31 @@ def provision(cfg: InstanceConfig) -> dict[str, str]:
     )
     print(f"  Tailscale auth key will be fetched from SSM: {cfg.tailscale_auth_key_ssm_parameter}")
 
-    # 5. Launch instance -------------------------------------------------------
+    # 3.5 Prefer reusing existing managed state volume when available ----------
+    reused_state_volume_id = _find_orphaned_state_volume_id(ec2)
+
+    if require_existing_state_volume and not reused_state_volume_id:
+        raise RuntimeError(
+            "No reusable managed state volume found. "
+            "Refusing provision due to --require-existing-state-volume."
+        )
+
+    if reused_state_volume_id:
+        state_mapping: dict[str, Any] | None = None
+        print(f"  Reusing managed state volume: {reused_state_volume_id}")
+    else:
+        state_mapping = {
+            "DeviceName": cfg.state_volume_device_name,
+            "Ebs": {
+                "VolumeSize": cfg.state_volume_size_gb,
+                "VolumeType": cfg.state_volume_type,
+                "DeleteOnTermination": False,
+                "Encrypted": True,
+            },
+        }
+        print("  No reusable managed state volume found; creating new state volume.")
+
+    # 4. Launch instance -------------------------------------------------------
     run_resp = ec2.run_instances(
         ImageId=ami_id,
         InstanceType=cfg.instance_type,
@@ -401,15 +452,7 @@ def provision(cfg: InstanceConfig) -> dict[str, str]:
                     "Encrypted": True,
                 },
             },
-            {
-                "DeviceName": cfg.state_volume_device_name,
-                "Ebs": {
-                    "VolumeSize": cfg.state_volume_size_gb,
-                    "VolumeType": cfg.state_volume_type,
-                    "DeleteOnTermination": False,
-                    "Encrypted": True,
-                },
-            },
+            *([state_mapping] if state_mapping else []),
         ],
         TagSpecifications=[
             {
@@ -432,14 +475,58 @@ def provision(cfg: InstanceConfig) -> dict[str, str]:
     instance_id = run_resp["Instances"][0]["InstanceId"]
     print(f"  Instance launched: {instance_id}")
 
-    # 6. Wait for running ------------------------------------------------------
+    # If reusing an existing state volume, attach it explicitly.
+    # AWS RunInstances BlockDeviceMappings does not support attaching by VolumeId.
+    if reused_state_volume_id:
+        print(f"  Attaching reused state volume {reused_state_volume_id} to {instance_id}...")
+        for _attempt in range(12):
+            try:
+                ec2.attach_volume(
+                    VolumeId=reused_state_volume_id,
+                    InstanceId=instance_id,
+                    Device=cfg.state_volume_device_name,
+                )
+                break
+            except ClientError as exc:
+                msg = str(exc)
+                if "IncorrectState" in msg or "is not 'available'" in msg:
+                    time.sleep(2)
+                    continue
+                raise
+        else:
+            raise RuntimeError(
+                f"Failed to attach reused state volume {reused_state_volume_id} to {instance_id}."
+            )
+
+    # 5. Wait for running ------------------------------------------------------
     print("  Waiting for instance to reach 'running' state...")
     waiter = ec2.get_waiter("instance_running")
     waiter.wait(InstanceIds=[instance_id])
 
+    # Refresh and ensure volume role tags are explicit (root/state)
+    inst = _find_instance(ec2)
+    if inst:
+        bdm = inst.get("BlockDeviceMappings", [])
+        root_vol_id = None
+        state_vol_id = None
+        for m in bdm:
+            dev = m.get("DeviceName")
+            vol_id = m.get("Ebs", {}).get("VolumeId")
+            if not vol_id:
+                continue
+            if dev == "/dev/sda1":
+                root_vol_id = vol_id
+            if dev == cfg.state_volume_device_name:
+                state_vol_id = vol_id
+
+        if root_vol_id:
+            _apply_tags(ec2, [root_vol_id], {VOLUME_ROLE_TAG_KEY: ROOT_VOLUME_ROLE})
+        if state_vol_id:
+            _apply_tags(ec2, [state_vol_id], {VOLUME_ROLE_TAG_KEY: STATE_VOLUME_ROLE})
+
     # Refresh instance data
     inst = _find_instance(ec2)
-    public_ip = (inst or {}).get("PublicIpAddress", "none")
+    public_ip = str((inst or {}).get("PublicIpAddress", "none"))
 
     print(f"  Instance running. Public IP: {public_ip}")
     print(f"  Tailscale hostname will be: {cfg.tailscale_hostname}")
@@ -448,8 +535,8 @@ def provision(cfg: InstanceConfig) -> dict[str, str]:
     print("  This takes 2-3 minutes. Run 'edc status' to check progress.")
 
     return {
-        "instance_id": instance_id,
-        "security_group_id": sg_id,
+        "instance_id": str(instance_id),
+        "security_group_id": str(sg_id),
         "public_ip": public_ip,
     }
 
@@ -469,7 +556,7 @@ def start() -> str:
             )
         raise RuntimeError("No edcloud instance found. Run 'edc provision' first.")
 
-    iid = inst["InstanceId"]
+    iid = str(inst["InstanceId"])
     state = inst["State"]["Name"]
 
     if state == "running":
@@ -487,7 +574,7 @@ def start() -> str:
 
     # Refresh for new IP
     inst = _find_instance(ec2)
-    public_ip = (inst or {}).get("PublicIpAddress", "none")
+    public_ip = str((inst or {}).get("PublicIpAddress", "none"))
     print(f"Instance running. Public IP: {public_ip}")
     return iid
 
@@ -506,7 +593,7 @@ def stop() -> str:
             )
         raise RuntimeError("No edcloud instance found.")
 
-    iid = inst["InstanceId"]
+    iid = str(inst["InstanceId"])
     state = inst["State"]["Name"]
 
     if state == "stopped":

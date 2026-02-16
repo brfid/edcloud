@@ -10,15 +10,18 @@ from typing import Any
 # ---------------------------------------------------------------------------
 MANAGER_TAG_KEY = "edcloud:managed"
 MANAGER_TAG_VALUE = "true"
+VOLUME_ROLE_TAG_KEY = "edcloud:volume-role"
+ROOT_VOLUME_ROLE = "root"
+STATE_VOLUME_ROLE = "state"
 NAME_TAG = "edcloud"
 
 # ---------------------------------------------------------------------------
 # EC2 defaults
 # ---------------------------------------------------------------------------
 DEFAULT_INSTANCE_TYPE = "t3a.medium"
-DEFAULT_VOLUME_SIZE_GB = 40
+DEFAULT_VOLUME_SIZE_GB = 30
 DEFAULT_VOLUME_TYPE = "gp3"
-DEFAULT_STATE_VOLUME_SIZE_GB = 10
+DEFAULT_STATE_VOLUME_SIZE_GB = 30
 DEFAULT_STATE_VOLUME_TYPE = "gp3"
 DEFAULT_STATE_VOLUME_DEVICE_NAME = "/dev/sdf"
 

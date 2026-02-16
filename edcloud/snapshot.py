@@ -18,6 +18,22 @@ WEEKLY_PREFIX = "weekly-snapshot"
 MONTHLY_PREFIX = "monthly-snapshot"
 
 
+def auto_snapshot_before_destroy() -> list[str]:
+    """Create automatic snapshot before destructive operation.
+
+    Returns list of snapshot IDs, or empty list if no instance exists.
+    """
+    ec2 = _ec2_client()
+    inst = _find_instance(ec2)
+    if not inst:
+        # No instance to snapshot
+        return []
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
+    description = f"auto-pre-destroy-{ts}"
+    return create_snapshot(description)
+
+
 def create_snapshot(description: str | None = None) -> list[str]:
     """Snapshot all EBS volumes attached to the edcloud instance.
 

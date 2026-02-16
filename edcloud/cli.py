@@ -7,7 +7,9 @@ import json
 import os
 import shlex
 import subprocess
+from collections.abc import Callable
 from datetime import datetime, timezone
+from typing import ParamSpec, TypeVar
 
 import boto3
 import click
@@ -22,6 +24,8 @@ from edcloud.config import (
 )
 
 PRECHANGE_SNAPSHOT_PREFIX = "pre-change"
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 def _resolve_ssh_target(
@@ -58,11 +62,11 @@ def _resolve_ssh_target(
         return ts_ip, ssh_base
 
 
-def require_aws_creds(func):
+def require_aws_creds(func: Callable[P, R]) -> Callable[P, R]:
     """Decorator: verify AWS credentials before running command."""
 
     @functools.wraps(func)
-    def wrapper(*args, **kwargs):
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         valid, message = check_aws_credentials()
         if not valid:
             click.echo(f"AWS credentials error: {message}", err=True)
@@ -120,6 +124,15 @@ def _find_recent_prechange_snapshot(max_age_minutes: int) -> dict[str, object] |
     return freshest[1] if freshest else None
 
 
+def _ensure_no_tailscale_name_conflicts(base_hostname: str = DEFAULT_TAILSCALE_HOSTNAME) -> None:
+    """Fail fast when Tailscale naming drift is detected for edcloud."""
+    if not tailscale.tailscale_available():
+        return
+    conflicts = tailscale.edcloud_name_conflicts(base_hostname=base_hostname)
+    if conflicts:
+        raise RuntimeError(tailscale.format_conflict_message(conflicts))
+
+
 @click.group()
 @click.version_option(package_name="edcloud")
 def main() -> None:
@@ -168,6 +181,35 @@ def main() -> None:
     show_default=True,
     help="SSM parameter name containing Tailscale auth key.",
 )
+@click.option(
+    "--cleanup",
+    is_flag=True,
+    help="Clean up old Tailscale devices and orphaned volumes before provisioning.",
+)
+@click.option(
+    "--allow-delete-state-volume",
+    is_flag=True,
+    help="Allow cleanup workflow to delete protected state volumes.",
+)
+@click.option(
+    "--require-existing-state-volume/--allow-new-state-volume",
+    default=True,
+    show_default=True,
+    help=(
+        "Require reusable managed state volume by default; "
+        "use --allow-new-state-volume to permit creating a fresh state volume."
+    ),
+)
+@click.option(
+    "--skip-snapshot",
+    is_flag=True,
+    help="Skip automatic snapshot before provision (if replacing existing instance).",
+)
+@click.option(
+    "--allow-tailscale-name-conflicts",
+    is_flag=True,
+    help="Skip fail-fast guard for duplicate/suffixed edcloud Tailscale records.",
+)
 @require_aws_creds
 def provision(
     instance_type: str,
@@ -176,11 +218,45 @@ def provision(
     tailscale_hostname: str,
     tailscale_auth_key: str | None,
     tailscale_auth_key_ssm_parameter: str,
+    cleanup: bool,
+    allow_delete_state_volume: bool,
+    require_existing_state_volume: bool,
+    skip_snapshot: bool,
+    allow_tailscale_name_conflicts: bool,
 ) -> None:
     """Create the edcloud EC2 instance from scratch.
 
     The Tailscale auth key is fetched from SSM by the instance at boot.
     """
+    if not allow_tailscale_name_conflicts:
+        _ensure_no_tailscale_name_conflicts(base_hostname=tailscale_hostname)
+
+    # Pre-provision cleanup if requested
+    if cleanup:
+        from edcloud import cleanup as cleanup_module
+
+        # Auto-snapshot if existing instance (unless --skip-snapshot)
+        if not skip_snapshot:
+            click.echo("Checking for existing instance to snapshot...")
+            try:
+                snap_ids = snapshot.auto_snapshot_before_destroy()
+                if snap_ids:
+                    click.echo(f"✅ Created pre-provision snapshot(s): {', '.join(snap_ids)}")
+                    click.echo()
+            except Exception:
+                click.echo(
+                    "Info: no existing instance to snapshot (this is fine for first provision)"
+                )
+                click.echo()
+
+        # Run cleanup workflow
+        if not cleanup_module.run_cleanup_workflow(
+            "pre-provision",
+            skip_snapshot=True,
+            allow_delete_state=allow_delete_state_volume,
+        ):
+            raise SystemExit(0)
+
     ssm = boto3.client("ssm")
 
     # If raw key is provided, store it in SSM
@@ -228,7 +304,10 @@ def provision(
         tailscale_hostname=tailscale_hostname,
         tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
     )
-    result = ec2.provision(cfg)
+    result = ec2.provision(
+        cfg,
+        require_existing_state_volume=require_existing_state_volume,
+    )
     click.echo()
     click.echo(json.dumps(result, indent=2))
 
@@ -278,9 +357,16 @@ def load_tailscale_env_key(
 # up / down
 # ---------------------------------------------------------------------------
 @main.command()
+@click.option(
+    "--allow-tailscale-name-conflicts",
+    is_flag=True,
+    help="Skip fail-fast guard for duplicate/suffixed edcloud Tailscale records.",
+)
 @require_aws_creds
-def up() -> None:
+def up(allow_tailscale_name_conflicts: bool) -> None:
     """Start the edcloud instance."""
+    if not allow_tailscale_name_conflicts:
+        _ensure_no_tailscale_name_conflicts()
     ec2.start()
     ts_ip = tailscale.get_tailscale_ip(DEFAULT_TAILSCALE_HOSTNAME)
     if ts_ip:
@@ -382,12 +468,30 @@ def status() -> None:
     show_default=True,
     help="Maximum snapshot age for --require-fresh-snapshot.",
 )
+@click.option(
+    "--cleanup",
+    is_flag=True,
+    help="Clean up Tailscale devices and orphaned volumes after destroy.",
+)
+@click.option(
+    "--allow-delete-state-volume",
+    is_flag=True,
+    help="Allow cleanup workflow to delete protected state volumes.",
+)
+@click.option(
+    "--skip-snapshot",
+    is_flag=True,
+    help="Skip automatic snapshot before destroy (faster but risky).",
+)
 @require_aws_creds
 def destroy(
     force: bool,
     confirm_instance_id: str | None,
     require_fresh_snapshot: bool,
     fresh_snapshot_max_age_minutes: int,
+    cleanup: bool,
+    allow_delete_state_volume: bool,
+    skip_snapshot: bool,
 ) -> None:
     """Terminate the instance and clean up. EBS volume is preserved."""
     if fresh_snapshot_max_age_minutes <= 0:
@@ -428,7 +532,33 @@ def destroy(
                 f"Using pre-change snapshot: {recent['snapshot_id']} ({recent['start_time']})"
             )
 
+    # Auto-snapshot before destroy (default, unless --skip-snapshot)
+    if cleanup and not skip_snapshot:
+        click.echo("Creating automatic pre-destroy snapshot...")
+        try:
+            snap_ids = snapshot.auto_snapshot_before_destroy()
+            if snap_ids:
+                click.echo(f"✅ Created snapshot(s): {', '.join(snap_ids)}")
+            else:
+                click.echo("Info: no instance found to snapshot")
+        except Exception as e:
+            click.echo(f"⚠️  Snapshot failed: {e}", err=True)
+            if not click.confirm("Continue with destroy anyway?"):
+                click.echo("Aborted.")
+                raise SystemExit(0) from None
+
     ec2.destroy(force=force)
+
+    # Post-destroy cleanup
+    if cleanup:
+        from edcloud import cleanup as cleanup_module
+
+        click.echo()
+        cleanup_module.run_cleanup_workflow(
+            "post-destroy",
+            skip_snapshot=True,
+            allow_delete_state=allow_delete_state_volume,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -534,16 +664,49 @@ def verify_cmd(user: str, public_ip: bool, json_output: bool) -> None:
     ssh_base.extend(["-o", "BatchMode=yes", "-o", "ConnectTimeout=12"])
 
     checks: list[tuple[str, str]] = [
-        ("cloud-init completion marker", "test -f /tmp/edcloud-ready"),
+        ("cloud-init status done", "cloud-init status --wait >/dev/null"),
         ("docker service active", "systemctl is-active --quiet docker"),
+        (
+            "docker data-root points to state volume",
+            "docker info --format '{{.DockerRootDir}}' | grep -qx /opt/edcloud/state/docker",
+        ),
         ("portainer container running", "docker ps --format '{{.Names}}' | grep -qx portainer"),
         ("compose directory exists", "test -d /opt/edcloud/compose"),
+        ("compose directory is mounted", "mountpoint -q /opt/edcloud/compose"),
+        (
+            "compose bind mount configured in fstab",
+            "grep -qE "
+            "'^/opt/edcloud/state/compose[[:space:]]+/opt/edcloud/compose[[:space:]]+"
+            "none[[:space:]]+bind' /etc/fstab",
+        ),
+        ("portainer data directory exists", "test -d /opt/edcloud/portainer-data"),
+        ("portainer data directory is mounted", "mountpoint -q /opt/edcloud/portainer-data"),
+        (
+            "portainer data bind mount configured in fstab",
+            "grep -qE "
+            "'^/opt/edcloud/state/portainer-data[[:space:]]+/opt/edcloud/portainer-data"
+            "[[:space:]]+none[[:space:]]+bind' /etc/fstab",
+        ),
         ("state directory exists", "test -d /opt/edcloud/state"),
         ("state directory is mounted", "mountpoint -q /opt/edcloud/state"),
         ("state directory writable", "test -w /opt/edcloud/state"),
         ("home directory exists", "test -d /home/ubuntu"),
         ("home directory is mounted", "mountpoint -q /home/ubuntu"),
+        (
+            "home bind mount configured in fstab",
+            "grep -qE "
+            "'^/opt/edcloud/state/home/ubuntu[[:space:]]+/home/ubuntu[[:space:]]+"
+            "none[[:space:]]+bind' /etc/fstab",
+        ),
         ("home directory writable", "test -w /home/ubuntu"),
+        ("tailscale state directory exists", "test -d /var/lib/tailscale"),
+        ("tailscale state directory is mounted", "mountpoint -q /var/lib/tailscale"),
+        (
+            "tailscale bind mount configured in fstab",
+            "grep -qE "
+            "'^/opt/edcloud/state/tailscale[[:space:]]+/var/lib/tailscale[[:space:]]+"
+            "none[[:space:]]+bind' /etc/fstab",
+        ),
         ("neovim installed", "command -v nvim >/dev/null"),
         ("byobu installed", "command -v byobu >/dev/null"),
         ("gh installed", "command -v gh >/dev/null"),
@@ -653,6 +816,38 @@ def ssh_cmd(user: str, public_ip: bool, ssh_args: tuple[str, ...]) -> None:
         cmd.extend(ssh_args)
 
     os.execvp(cmd[0], cmd)
+
+
+@main.group("tailscale")
+def tailscale_group() -> None:
+    """Tailscale reconciliation and guardrail helpers."""
+
+
+@tailscale_group.command("reconcile")
+@click.option(
+    "--dry-run/--apply",
+    default=True,
+    show_default=True,
+    help="Preview conflicts or apply manual reconciliation workflow guidance.",
+)
+def tailscale_reconcile(dry_run: bool) -> None:
+    """Show or reconcile Tailscale naming conflicts for edcloud."""
+    if not tailscale.tailscale_available():
+        click.echo("tailscale CLI not found on this operator node.", err=True)
+        raise SystemExit(1)
+
+    conflicts = tailscale.edcloud_name_conflicts()
+    if not conflicts:
+        click.echo("No Tailscale naming conflicts detected for edcloud.")
+        return
+
+    click.echo(tailscale.format_conflict_message(conflicts), err=not dry_run)
+    if dry_run:
+        raise SystemExit(1)
+
+    click.echo()
+    click.echo("Applied mode: manual reconciliation required in Tailscale admin.")
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":

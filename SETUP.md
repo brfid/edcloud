@@ -95,6 +95,12 @@ Use SSM-based provisioning (recommended):
 edc provision --tailscale-auth-key-ssm-parameter /edcloud/tailscale_auth_key
 ```
 
+Secret behavior on new builds:
+
+- SSM values are consumed by bootstrap/provision steps when needed.
+- They are **not** automatically exported as persistent login-shell environment variables.
+- Keep runtime secrets in SSM (or local non-git files such as `~/.secrets`) and load explicitly when required.
+
 Load key into current shell when needed:
 
 ```bash
@@ -159,12 +165,27 @@ If `TAILSCALE_AUTH_KEY_SSM_PARAMETER` is set in your operator env file:
 edc provision
 ```
 
+State-volume guardrails:
+
+- Reuse existing managed state volume is now the default (fail-fast if none exists).
+- Allow creating a new state volume only when intentionally needed:
+
+```bash
+edc provision --allow-new-state-volume
+```
+
 Expected resources:
 
 - 1x EC2 instance (`t3a.medium` default)
 - Security group with zero inbound rules
-- 40 GB gp3 root volume
-- 10 GB gp3 state volume mounted at `/opt/edcloud/state`
+- 30 GB gp3 root volume
+- 30 GB gp3 state volume mounted at `/opt/edcloud/state`
+
+Tailscale identity guardrails:
+
+- `edc provision` now fails fast if duplicate/suffixed `edcloud` Tailscale records exist.
+- Use `edc tailscale reconcile --dry-run` to inspect conflicts before provisioning.
+- Break-glass override: `--allow-tailscale-name-conflicts`.
 
 ## 6. Verify bootstrap
 
@@ -187,7 +208,15 @@ Manual check:
 ```bash
 edc ssh
 docker ps
-cat /tmp/edcloud-ready
+edc ssh 'cloud-init status --wait'
+```
+
+**Note:** `edc ssh` automatically detects the active edcloud device (handles edcloud, edcloud-2, edcloud-3, etc.). See `docs/TAILSCALE-CLEANUP.md` for managing multiple devices.
+
+Preflight recommended before rebuild/provision:
+
+```bash
+edc tailscale reconcile --dry-run
 ```
 
 ## 7. Access Portainer
@@ -229,6 +258,17 @@ edc destroy --confirm-instance-id <instance-id>
 edc destroy --confirm-instance-id <instance-id> --require-fresh-snapshot
 ```
 
+Cleanup volume protection defaults:
+
+- Cleanup only deletes orphaned `root` role volumes by default.
+- Orphaned `state` and unknown-role volumes are protected by default.
+- Override only when intentionally performing full cleanup:
+
+```bash
+edc destroy --confirm-instance-id <instance-id> --cleanup --allow-delete-state-volume
+edc provision --cleanup --allow-delete-state-volume
+```
+
 ## Default host toolset baseline
 
 Core host tools are part of `cloud-init/user-data.yaml` and applied at provision time.
@@ -238,6 +278,34 @@ Persistent home baseline:
 - `~/` for `ubuntu` is bind-mounted to `/opt/edcloud/state/home/ubuntu`.
 - First boot migrates existing `/home/ubuntu` contents into the state volume.
 - This keeps shell/editor/tool settings across reprovision when reusing the state volume.
+
+Persistent Tailscale identity baseline:
+
+- `/var/lib/tailscale` is bind-mounted to `/opt/edcloud/state/tailscale`.
+- This preserves node identity across reprovision and helps prevent DNS suffix drift.
+
+Persistent compose + Portainer baseline:
+
+- `/opt/edcloud/compose` is bind-mounted to `/opt/edcloud/state/compose`.
+- `/opt/edcloud/portainer-data` is bind-mounted to `/opt/edcloud/state/portainer-data`.
+- Portainer runs with `-v /opt/edcloud/portainer-data:/data`, preserving Portainer state across reprovision.
+
+Persistent Docker engine baseline:
+
+- Docker daemon `data-root` is set to `/opt/edcloud/state/docker`.
+- This keeps Docker images/layers/volumes on the durable state volume across reprovision.
+
+Volume role tagging baseline:
+
+- Managed volumes are explicitly tagged with `edcloud:volume-role`:
+  - `root` for `/dev/sda1`
+  - `state` for the configured persistent state device (default `/dev/sdf`)
+- Cleanup and reuse behavior rely on these role tags for safety.
+
+Neovim + LazyVim baseline:
+
+- Cloud-init pins Neovim to upstream `v0.11.3` (installed under `/opt/nvim-linux-x86_64` and linked at `/usr/local/bin/nvim`).
+- This satisfies LazyVim's minimum requirement (`>= 0.11.2`) on fresh builds.
 
 Baseline packages:
 
@@ -250,8 +318,14 @@ Baseline packages:
 - `git`
 - `htop`
 - `jq`
+- `neomutt`
 - `neovim`
+- `python3-dev`
+- `python3-pip`
+- `python3-venv`
+- `rclone`
 - `ripgrep`
+- `screen`
 - `rsync`
 - `tmux`
 - `tree`
@@ -260,6 +334,24 @@ Baseline packages:
 - `vim-tiny`
 - `xclip`
 - `zip`
+
+AI + Python dev baseline:
+
+- Node.js LTS with pinned global AI CLIs:
+  - `npm@11.9.0`
+  - `@openai/codex@0.98.0`
+  - `cline@2.2.2`
+  - `@google/gemini-cli`
+- Python developer tools (user-local):
+  - `ruff`
+  - `mypy`
+  - `pytest`
+  - `ipython`
+
+Default profile notes:
+
+- Game packages are intentionally excluded from the default host build.
+- Baseline focuses on headless/server operations, AI CLIs, and Python development tooling.
 
 Package strategy:
 
@@ -272,9 +364,21 @@ Quick verification:
 ```bash
 edc ssh 'git --version && tmux -V && rg --version && fdfind --version && htop --version | head -n 1'
 edc ssh 'nvim --version | head -n 1 && byobu -V && gh --version | head -n 1 && brew --version | head -n 1'
-edc ssh 'findmnt /home/ubuntu && df -h /home/ubuntu /opt/edcloud/state'
+edc ssh 'node --version && npm --version && codex --version && cline --version && gemini --version'
+edc ssh 'python3 --version && ruff --version && mypy --version && pytest --version'
+edc ssh 'findmnt /home/ubuntu /var/lib/tailscale /opt/edcloud/compose /opt/edcloud/portainer-data && df -h /home/ubuntu /opt/edcloud/state'
+edc ssh "docker info --format '{{.DockerRootDir}}'"
 ```
 
+Rebuild/reinstall workflow (same persistent state volume, no Tailscale name increment):
+
+```bash
+edc tailscale reconcile --dry-run
+edc snapshot -d pre-change-rebuild
+edc destroy --confirm-instance-id <instance-id>
+edc provision
+edc verify
+```
 ## 10. Backup and recovery standard
 
 Operating policy:
@@ -283,6 +387,16 @@ Operating policy:
 - Persist durable state under `/opt/edcloud/state`.
 - Reclone git repositories from upstream on rebuild.
 - Store secrets in SSM, not in git.
+
+Non-secret repo sync baseline:
+
+- If `gh` is authenticated during cloud-init, bootstrap attempts to pull/update:
+  - `https://github.com/<gh-user>/dotfiles.git` → `~/src/dotfiles`
+  - `https://github.com/<gh-user>/bin.git` → `~/src/bin`
+  - `https://github.com/<gh-user>/llm-config.git` → `~/src/llm-config`
+- If `~/src/dotfiles/install.sh` exists and is executable, it is run.
+- Executable files in `~/src/bin` are symlinked into `~/.local/bin`.
+- Keep these repos non-secret; secrets still belong in SSM/local private files.
 
 Snapshot operations:
 
@@ -327,7 +441,7 @@ cat ~/.config/edcloud/restore-drill.tsv
 Typical target at 4 hours/day:
 
 - Compute: about `$4.51/month`
-- Storage: about `$4.00/month`
+- Storage: about `$4.80/month`
 - Snapshots: variable, target soft cap `$5/month`
 
 Use `edc status` and AWS Cost Explorer to track drift.
