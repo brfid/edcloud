@@ -481,6 +481,7 @@ runcmd:
       sync_repo bin
       sync_repo llm-config
 
+      # Link bashrc from dotfiles (includes git-prompt PS1)
       if [ -x "$HOME/src/dotfiles/install.sh" ]; then
         "$HOME/src/dotfiles/install.sh" || true
       fi
