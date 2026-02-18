@@ -1009,14 +1009,17 @@ def resize(
                     )
                 else:
                     print(
-                        f"  Expanding root volume {vol_id}: "
-                        f"{current_size}GB → {volume_size_gb}GB"
+                        f"  Expanding root volume {vol_id}: {current_size}GB → {volume_size_gb}GB"
                     )
                     ec2.modify_volume(VolumeId=vol_id, Size=volume_size_gb)
                     result["root_volume_id"] = vol_id
                     result["root_volume_new_size_gb"] = volume_size_gb
                     print(
-                        "    Modification initiated. Run 'growpart' and 'resize2fs' on instance."
+                        f"    Volume modification initiated (async). May take several minutes.\n"
+                        f"    Poll status: aws ec2 describe-volumes-modifications "
+                        f"--volume-ids {vol_id}\n"
+                        f"    After completion, run on instance: "
+                        f"sudo growpart /dev/sda1 1 && sudo resize2fs /dev/sda1p1"
                     )
 
             elif role == STATE_VOLUME_ROLE and state_volume_size_gb is not None:
@@ -1034,7 +1037,11 @@ def resize(
                     result["state_volume_id"] = vol_id
                     result["state_volume_new_size_gb"] = state_volume_size_gb
                     print(
-                        "    Modification initiated. Run 'growpart' and 'resize2fs' on instance."
+                        f"    Volume modification initiated (async). May take several minutes.\n"
+                        f"    Poll status: aws ec2 describe-volumes-modifications "
+                        f"--volume-ids {vol_id}\n"
+                        f"    After completion, run on instance: "
+                        f"sudo growpart /dev/sda1 1 && sudo resize2fs /dev/sda1p1"
                     )
 
     # ------------------------------------------------------------------
@@ -1061,10 +1068,20 @@ def resize(
                 )
 
             print(f"  Changing instance type: {current_type} → {instance_type}")
-            ec2.modify_instance_attribute(
-                InstanceId=iid,
-                InstanceType={"Value": instance_type},
-            )
+            try:
+                ec2.modify_instance_attribute(
+                    InstanceId=iid,
+                    InstanceType={"Value": instance_type},
+                )
+            except Exception:
+                if stopped_here:
+                    print(
+                        f"  modify_instance_attribute failed; restarting instance {iid} "
+                        "before re-raising..."
+                    )
+                    with suppress(ClientError):
+                        ec2.start_instances(InstanceIds=[iid])
+                raise
             result["instance_type_old"] = str(current_type)
             result["instance_type_new"] = instance_type
 

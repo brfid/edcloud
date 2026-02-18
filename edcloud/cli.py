@@ -876,6 +876,11 @@ def tailscale_reconcile(dry_run: bool) -> None:
     help="Skip automatic pre-reprovision snapshot (faster but risky).",
 )
 @click.option(
+    "--confirm-instance-id",
+    default=None,
+    help="Required safety confirmation. Must match current managed instance ID.",
+)
+@click.option(
     "--allow-tailscale-name-conflicts",
     is_flag=True,
     help="Skip fail-fast guard for duplicate/suffixed edcloud Tailscale records.",
@@ -888,6 +893,7 @@ def reprovision(
     tailscale_hostname: str,
     tailscale_auth_key_ssm_parameter: str,
     skip_snapshot: bool,
+    confirm_instance_id: str | None,
     allow_tailscale_name_conflicts: bool,
 ) -> None:
     """Atomically snapshot → destroy → provision.
@@ -896,9 +902,27 @@ def reprovision(
     current instance, then provisions a fresh one. If provisioning fails after
     destroy, the snapshot IDs are printed prominently so you can restore
     manually.
+
+    Note: provisioning always requires an existing state volume. If the state
+    volume was deleted, use 'edc provision --allow-new-state-volume' directly.
     """
     if not allow_tailscale_name_conflicts:
         _ensure_no_tailscale_name_conflicts(base_hostname=tailscale_hostname)
+
+    # Pre-flight: get current instance state once; use it for confirmation and destroy.
+    info = ec2.status()
+    if info.get("exists"):
+        instance_id = str(info.get("instance_id", ""))
+        if confirm_instance_id != instance_id:
+            click.echo(
+                "Error: destructive action requires explicit instance ID confirmation.",
+                err=True,
+            )
+            click.echo(
+                f"  Re-run with: edc reprovision --confirm-instance-id {instance_id}",
+                err=True,
+            )
+            raise SystemExit(1)
 
     snap_ids: list[str] = []
 
@@ -920,7 +944,6 @@ def reprovision(
                 raise SystemExit(0) from None
 
     # 2. Destroy ----------------------------------------------------------------
-    info = ec2.status()
     if info.get("exists"):
         click.echo("Destroying current instance...")
         ec2.destroy(force=True)
@@ -939,7 +962,7 @@ def reprovision(
     )
     try:
         result = ec2.provision(cfg, require_existing_state_volume=True)
-    except Exception as exc:
+    except (RuntimeError, ec2.TagDriftError, ClientError, BotoCoreError) as exc:
         click.echo(f"❌ Provisioning failed: {exc}", err=True)
         if snap_ids:
             click.echo("", err=True)

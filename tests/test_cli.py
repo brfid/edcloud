@@ -597,10 +597,10 @@ def test_tailscale_check_logs_warning_when_cli_not_found(
     _mock_available,
 ):
     """When tailscale binary is absent, a warning is printed to stderr."""
-    runner = CliRunner(mix_stderr=False)
+    runner = CliRunner()
     result = runner.invoke(main, ["up"])
     assert result.exit_code == 0
-    assert "tailscale CLI not found" in result.stderr
+    assert "tailscale CLI not found" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +640,8 @@ def test_reprovision_snapshots_destroys_and_provisions(
         main,
         [
             "reprovision",
+            "--confirm-instance-id",
+            "i-abc123",
             "--tailscale-auth-key-ssm-parameter",
             "/edcloud/tailscale_auth_key",
         ],
@@ -654,6 +656,7 @@ def test_reprovision_snapshots_destroys_and_provisions(
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.ec2.destroy")
 @patch("edcloud.cli.ec2.status")
+@patch("edcloud.cli.snapshot.auto_snapshot_before_destroy")
 @patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
 @patch("edcloud.cli.tailscale.tailscale_available", return_value=True)
 @patch("edcloud.cli.get_region", return_value="us-east-1")
@@ -663,6 +666,7 @@ def test_reprovision_skip_snapshot_skips_snapshot(
     _mock_region,
     _mock_available,
     _mock_conflicts,
+    mock_snapshot,
     mock_status,
     mock_destroy,
     mock_provision,
@@ -681,12 +685,15 @@ def test_reprovision_skip_snapshot_skips_snapshot(
         [
             "reprovision",
             "--skip-snapshot",
+            "--confirm-instance-id",
+            "i-abc123",
             "--tailscale-auth-key-ssm-parameter",
             "/edcloud/tailscale_auth_key",
         ],
     )
 
     assert result.exit_code == 0, result.output
+    mock_snapshot.assert_not_called()
     mock_provision.assert_called_once()
 
 
@@ -713,18 +720,54 @@ def test_reprovision_surfaces_snapshot_ids_on_provision_failure(
     mock_status.return_value = {"exists": True, "instance_id": "i-abc123"}
     mock_provision.side_effect = RuntimeError("launch failed")
 
-    runner = CliRunner(mix_stderr=False)
+    runner = CliRunner()
     result = runner.invoke(
         main,
         [
             "reprovision",
+            "--confirm-instance-id",
+            "i-abc123",
             "--tailscale-auth-key-ssm-parameter",
             "/edcloud/tailscale_auth_key",
         ],
     )
 
     assert result.exit_code == 1
-    assert "snap-abc123" in result.stderr
+    assert "snap-abc123" in result.output
+
+
+@patch("edcloud.cli.ec2.destroy")
+@patch("edcloud.cli.ec2.status")
+@patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
+@patch("edcloud.cli.tailscale.tailscale_available", return_value=True)
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_reprovision_requires_confirm_instance_id(
+    _mock_creds,
+    _mock_region,
+    _mock_available,
+    _mock_conflicts,
+    mock_status,
+    mock_destroy,
+):
+    """reprovision without --confirm-instance-id is rejected when an instance exists."""
+    mock_status.return_value = {"exists": True, "instance_id": "i-abc123"}
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "reprovision",
+            "--skip-snapshot",
+            "--tailscale-auth-key-ssm-parameter",
+            "/edcloud/tailscale_auth_key",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "requires explicit instance ID confirmation" in result.output
+    assert "--confirm-instance-id i-abc123" in result.output
+    mock_destroy.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
