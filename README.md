@@ -23,7 +23,7 @@ aws ssm put-parameter --name /edcloud/tailscale_auth_key \
   --type SecureString --value 'tskey-auth-...'
 
 # Provision
-edc provision --tailscale-auth-key-ssm-parameter /edcloud/tailscale_auth_key
+edc provision
 ```
 
 ARM/Linux operator note:
@@ -64,8 +64,8 @@ LazyVim compatibility:
 
 ## Architecture
 
-**Compute:** t3a.medium, Ubuntu 24.04, Tailscale SSH only
-**Storage:** 30GB root (disposable), 30GB state at `/opt/edcloud/state` (persistent)
+**Compute:** t3a.small, Ubuntu 24.04, Tailscale SSH only
+**Storage:** 16GB root (disposable), 20GB state at `/opt/edcloud/state` (persistent)
 **Discovery:** Tag `edcloud:managed=true` on all resources
 **Secrets:** AWS SSM Parameter Store
 **Baseline:** Docker, Portainer, Node.js, Python, and a broad dev tooling set defined in `cloud-init/user-data.yaml` and documented in `SETUP.md`.
@@ -90,7 +90,7 @@ Durable rebuild baseline:
 
 ## Cost
 
-4hr/day usage: ~$4.51 compute + ~$4 storage + ~$5 snapshots = **~$13.51/month**
+4hr/day usage: ~$2.26 compute + ~$2.88 storage + ~$5 snapshots ≈ **~$7–10/month**
 Auto-shutdown after 30min idle.
 
 ## Docs

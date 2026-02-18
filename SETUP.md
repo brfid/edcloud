@@ -4,14 +4,10 @@ Operator runbook for provisioning, operating, and recovering a single-instance e
 
 ## Active priorities
 
-Open items only:
+Open items:
 
-- [x] Harden destructive lifecycle actions: require explicit instance-id confirmation for `edc destroy`, and add an option to require a fresh pre-change snapshot before deletion/rebuild.
-- [ ] Add a safe rebuild workflow (`snapshot -> reprovision -> verify`) as a single documented operator path.
+- [ ] Add a safe rebuild workflow (`snapshot -> reprovision -> verify`) as a single documented operator path. (`edc reprovision` exists; document the full drill including verify.)
 - [ ] Improve automatic repo loading: currently dotfiles/bin/llm-config cloning depends on gh auth during cloud-init; consider making repo list configurable and/or adding explicit clone step to provision workflow (e.g., `edc provision --sync-repos`).
-- [x] Persist user home on the state volume (`/opt/edcloud/state/home/ubuntu`) via cloud-init-managed bind mount and migration checks.
-- [x] Define default dev environment in cloud-init: `neovim` + LazyVim bootstrap, `byobu`, `gh`, and required runtime dependencies.
-- [x] Decide and codify package strategy for non-APT tooling (APT-first vs Linuxbrew) for repeatable, non-interactive provisioning.
 - [ ] Evaluate a secure operator login workflow that starts from one memorized string without weakening Tailscale/AWS MFA controls.
 - [ ] Centralize default SSH username in repo config (for example `edcloud/config.py`) and have `edc ssh`/`edc verify` read that value.
 - [ ] Run weekly + monthly snapshot cadence for durable state.
@@ -20,11 +16,14 @@ Open items only:
 - [ ] Record restore drill date and result for auditability.
 - [ ] Back up non-repo durable state under `/opt/edcloud/state`; reclone repos from upstream on rebuild.
 
+### Testing gaps (deferred)
+
+- [ ] `cleanup.py` unit tests (`test_cleanup_tailscale_devices`, `test_cleanup_orphaned_volumes_delete_mode`, `test_run_cleanup_workflow`)
+- [ ] Integration tests for `--cleanup` workflow end-to-end
+- [ ] End-to-end provision/destroy cycle tests
+
 ### Architectural improvements (deferred)
 
-_Lower-priority refactors identified 2026-02-16 during docstring/config review:_
-
-- [ ] **Output separation**: Library modules (`ec2.py`, `iam.py`, `snapshot.py`) use `print()` while CLI uses `click.echo()`. Cleanest fix: return structured data from library functions, move all output rendering to CLI layer, or introduce `logging` module. Current split works but complicates testing.
 - [ ] **Centralize boto3 client factories**: `cli.py` and `cleanup.py` call `boto3.client()` directly instead of reusing `_ec2_client()`/`_ssm_client()` factories from `ec2.py`. Better: shared session or factory module. Simplifies mock patching in tests.
 - [ ] **Declarative verification checks**: The 24-item `checks` list in `verify_cmd` (cli.py ~700-725) is maintenance-heavy inline data. Extract to typed dataclass list or YAML for easier additions and self-documenting check catalog.
 
@@ -78,6 +77,27 @@ Configure and verify credentials:
 ```bash
 aws configure
 aws sts get-caller-identity
+```
+
+### IAM: manual fallback reference
+
+`edc provision` creates and attaches the IAM instance profile (`edcloud-instance-profile` / `edcloud-instance-role`) automatically. If automated setup fails, create it manually:
+
+```bash
+# Trust policy
+aws iam create-role --role-name edcloud-instance-role \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+# SSM read policy (read /edcloud/* parameters)
+aws iam put-role-policy --role-name edcloud-instance-role \
+  --policy-name edcloud-ssm-read \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ssm:GetParameter","Resource":"arn:aws:ssm:*:*:parameter/edcloud/*"}]}'
+
+# Instance profile
+aws iam create-instance-profile --instance-profile-name edcloud-instance-profile
+aws iam add-role-to-instance-profile \
+  --instance-profile-name edcloud-instance-profile \
+  --role-name edcloud-instance-role
 ```
 
 ## 2. Tailscale auth key
@@ -161,32 +181,6 @@ which edc
 edc --version
 edc status
 ```
-
-Cline account auth transfer (operator -> edcloud):
-
-Use this when `cline` on the instance prompts for login even though your local operator machine is already authenticated.
-
-```bash
-# Copy authenticated Cline runtime files from local operator host to edcloud instance
-cat ~/.cline/data/secrets.json | edc ssh "mkdir -p ~/.cline/data && chmod 700 ~/.cline ~/.cline/data && cat > ~/.cline/data/secrets.json"
-cat ~/.cline/data/globalState.json | edc ssh "cat > ~/.cline/data/globalState.json && chmod 600 ~/.cline/data/secrets.json ~/.cline/data/globalState.json"
-```
-
-Verify transfer:
-
-```bash
-edc ssh "jq -r 'keys[]' ~/.cline/data/secrets.json"
-edc ssh "cline 'auth smoke test'"
-```
-
-Expected key list should include:
-
-- `openai-codex-oauth-credentials`
-
-Security note:
-
-- `~/.cline/data/secrets.json` contains sensitive credentials.
-- Do not commit it, share it in tickets, or store it in git-tracked files.
 
 Optional automation templates:
 
@@ -464,7 +458,22 @@ edc provision
 edc verify
 ```
 
+Or use `edc reprovision` for the same steps as a single atomic command:
+
+```bash
+edc reprovision --confirm-instance-id <instance-id>
+```
+
 Volume size adjustment:
+
+For an online volume expand, use `edc resize`:
+
+```bash
+edc resize --volume-size 24          # expand root volume online
+edc resize --state-volume-size 30    # expand state volume online
+```
+
+The manual AWS CLI commands below remain as a reference:
 
 ```bash
 # Provision with custom sizes (smaller or larger)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -14,6 +15,8 @@ from edcloud.config import (
     managed_filter,
 )
 from edcloud.ec2 import find_instance, get_ec2_client
+
+log = logging.getLogger(__name__)
 
 WEEKLY_PREFIX = "weekly-snapshot"
 MONTHLY_PREFIX = "monthly-snapshot"
@@ -130,9 +133,9 @@ def auto_snapshot_before_destroy() -> list[str]:
     description = f"auto-pre-destroy-{ts}"
     snap_ids = create_snapshot(description)
     if snap_ids:
-        print("Waiting for snapshot(s) to complete before proceeding...")
+        log.info("Waiting for snapshot(s) to complete before proceeding...")
         wait_for_snapshot_completion(snap_ids)
-        print("Snapshot(s) completed.")
+        log.info("Snapshot(s) completed.")
     return snap_ids
 
 
@@ -163,7 +166,7 @@ def create_snapshot(description: str | None = None) -> list[str]:
 
     snapshot_ids = []
     for vid in vol_ids:
-        print(f"Creating snapshot of {vid}...")
+        log.info("Creating snapshot of %s...", vid)
         resp = ec2.create_snapshot(
             VolumeId=vid,
             Description=desc,
@@ -181,10 +184,9 @@ def create_snapshot(description: str | None = None) -> list[str]:
         )
         sid = resp["SnapshotId"]
         snapshot_ids.append(sid)
-        print(f"  Snapshot started: {sid}")
+        log.info("  Snapshot started: %s", sid)
 
-    print()
-    print("Snapshots are creating in the background. Use 'edc snapshot --list' to check.")
+    log.info("Snapshots are creating in the background. Use 'edc snapshot --list' to check.")
     return snapshot_ids
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -121,6 +122,10 @@ def _ensure_no_tailscale_name_conflicts(base_hostname: str = DEFAULT_TAILSCALE_H
 @click.version_option(package_name="edcloud")
 def main() -> None:
     """Manage your personal cloud lab on AWS."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.getLogger("edcloud").addHandler(handler)
+    logging.getLogger("edcloud").setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------------
@@ -361,8 +366,8 @@ def up(allow_tailscale_name_conflicts: bool) -> None:
         )
 
 
-@require_aws_creds
 @main.command()
+@require_aws_creds
 def down() -> None:
     """Stop the edcloud instance."""
     ec2.stop()

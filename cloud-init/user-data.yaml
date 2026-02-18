@@ -93,6 +93,15 @@ packages:
 # Write files before runcmd
 # --------------------------------------------------------------------------
 write_files:
+  # Baseline interactive shell aliases (applies to all users/login shells)
+  - path: /etc/profile.d/edcloud-shell-defaults.sh
+    permissions: "0644"
+    content: |
+      # edcloud baseline aliases
+      alias ll='ls -alF --color=auto'
+      alias la='ls -A --color=auto'
+      alias l='ls -CF --color=auto'
+
   # Idle-shutdown: powers down if no Tailscale SSH + low CPU for 30 min
   - path: /usr/local/bin/edcloud-idle-shutdown
     permissions: "0755"
@@ -409,9 +418,24 @@ runcmd:
 
   # --- Node.js LTS (via NodeSource) ---
   - |
+    umask 022
     curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
     apt-get install -y nodejs
     npm install -g npm@11.9.0 @openai/codex@0.98.0 cline@2.2.2 @google/gemini-cli @anthropic-ai/claude-code
+
+    # Normalize permissions for package source stanzas so command-not-found
+    # and non-root tooling can read repository metadata without warnings.
+    find /etc/apt/sources.list.d -maxdepth 1 -type f \
+      \( -name '*.list' -o -name '*.sources' \) \
+      -exec chown root:root {} \; \
+      -exec chmod 0644 {} \;
+
+    # Ensure globally-installed npm CLIs are executable by non-root users.
+    if [ -d /usr/lib/node_modules ]; then
+      find /usr/lib/node_modules -mindepth 1 -maxdepth 1 -type d \
+        -exec chown -R root:root {} \; \
+        -exec chmod -R a+rX {} \;
+    fi
 
   # --- Python developer tooling (pipx-managed, persistent on state volume) ---
   - |
@@ -488,6 +512,29 @@ runcmd:
 
       if [ -d "$HOME/src/bin" ]; then
         find "$HOME/src/bin" -maxdepth 1 -type f -perm -u+x -exec ln -sfn {} "$HOME/.local/bin/" \;
+      fi
+    '
+
+  # --- Ensure ubuntu always has baseline aliases, even with custom dotfiles ---
+  - |
+    runuser -u ubuntu -- bash -lc '
+      set -euo pipefail
+      mkdir -p "$HOME"
+
+      if [ ! -f "$HOME/.bash_aliases" ]; then
+        cat > "$HOME/.bash_aliases" <<"ALIASES"
+      alias ll="ls -alF --color=auto"
+      alias la="ls -A --color=auto"
+      alias l="ls -CF --color=auto"
+      ALIASES
+      fi
+
+      if ! grep -q "\\.bash_aliases" "$HOME/.bashrc" 2>/dev/null; then
+        cat >> "$HOME/.bashrc" <<"BASHRC_SNIPPET"
+      if [ -f ~/.bash_aliases ]; then
+          . ~/.bash_aliases
+      fi
+      BASHRC_SNIPPET
       fi
     '
 
