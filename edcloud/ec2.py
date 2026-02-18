@@ -6,6 +6,7 @@ Tag ``edcloud:managed = true`` identifies all managed resources.
 
 from __future__ import annotations
 
+import random
 import re
 import time
 from contextlib import suppress
@@ -65,6 +66,33 @@ def _ec2_resource() -> Any:
 def _ssm_client() -> Any:
     """Return a low-level SSM client."""
     return boto3.client("ssm")
+
+
+def get_ec2_client() -> Any:
+    """Return a low-level EC2 client (public API)."""
+    return _ec2_client()
+
+
+def find_instance(client: Any) -> dict[str, Any] | None:
+    """Locate the managed instance (public API).
+
+    Delegates to the internal ``_find_instance`` helper.
+    """
+    return _find_instance(client)
+
+
+def fetch_tailscale_auth_key_from_ssm(parameter_name: str) -> str:
+    """Read a Tailscale auth key from SSM Parameter Store.
+
+    Args:
+        parameter_name: The SSM parameter path (SecureString supported).
+
+    Returns:
+        The decrypted parameter value.
+    """
+    ssm = _ssm_client()
+    resp = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+    return str(resp["Parameter"]["Value"])
 
 
 def _instance_state_filter() -> dict[str, Any]:
@@ -472,6 +500,16 @@ def provision(
             "Run 'edc destroy' first if you want to reprovision."
         )
 
+    # Pre-provision orphan check: warn if managed resources exist without an instance
+    orphaned = _managed_orphan_report(ec2)
+    if orphaned["security_groups"] or orphaned["volumes"]:
+        print(
+            "Warning: orphaned managed resources found (no active instance). "
+            "These may be reused or cleaned up during provisioning:"
+        )
+        print(_orphaned_resources_text(orphaned))
+        print()
+
     print("Provisioning edcloud instance...")
 
     # 1. Security group -------------------------------------------------------
@@ -592,8 +630,12 @@ def provision(
                 "Invalid IAM Instance Profile" in msg
                 or ("InvalidParameterValue" in msg and "iamInstanceProfile" in msg)
             ) and attempt < 12:
-                print("  IAM instance profile not yet propagated; retrying launch...")
-                time.sleep(5)
+                sleep_s = min(2**attempt + random.uniform(0, 1), 30)
+                print(
+                    f"  IAM instance profile not yet propagated; "
+                    f"retrying in {sleep_s:.1f}s (attempt {attempt}/12)..."
+                )
+                time.sleep(sleep_s)
                 continue
             raise
 
@@ -903,3 +945,156 @@ def destroy(force: bool = False) -> None:
         print("Preserved EBS volumes (delete manually if not needed):")
         for v in orphaned:
             print(f"  {v['VolumeId']}  {v['Size']}GB  {v['State']}")
+
+
+def resize(
+    instance_type: str | None = None,
+    volume_size_gb: int | None = None,
+    state_volume_size_gb: int | None = None,
+) -> dict[str, Any]:
+    """Resize the edcloud instance type and/or EBS volumes in place.
+
+    Instance type change requires a stop → modify → start cycle.
+    Volume size changes (expand only) are applied online without a restart.
+
+    Args:
+        instance_type: New EC2 instance type (e.g. ``"t3a.medium"``).
+        volume_size_gb: New root volume size in GiB (must be >= current size).
+        state_volume_size_gb: New state volume size in GiB (must be >= current size).
+
+    Returns:
+        Dict summarising the changes applied.
+
+    Raises:
+        RuntimeError: If no managed instance exists or an operation fails.
+        ValueError: If no resize parameters are specified.
+    """
+    if instance_type is None and volume_size_gb is None and state_volume_size_gb is None:
+        raise ValueError(
+            "At least one of --instance-type, --volume-size, or "
+            "--state-volume-size must be specified."
+        )
+
+    ec2 = _ec2_client()
+    inst = _find_instance(ec2)
+    if not inst:
+        raise RuntimeError("No edcloud instance found. Run 'edc provision' first.")
+
+    iid = inst["InstanceId"]
+    current_state = inst["State"]["Name"]
+    result: dict[str, Any] = {"instance_id": iid}
+
+    # ------------------------------------------------------------------
+    # Volume resizes (online — no instance stop required)
+    # ------------------------------------------------------------------
+    if volume_size_gb is not None or state_volume_size_gb is not None:
+        bdm = inst.get("BlockDeviceMappings", [])
+        for mapping in bdm:
+            dev = mapping.get("DeviceName")
+            vol_id = mapping.get("Ebs", {}).get("VolumeId")
+            if not vol_id:
+                continue
+
+            vol_resp = ec2.describe_volumes(VolumeIds=[vol_id])
+            vol_info = vol_resp.get("Volumes", [{}])[0]
+            current_size = vol_info.get("Size", 0)
+            tags = {t["Key"]: t["Value"] for t in vol_info.get("Tags", [])}
+            role = tags.get(VOLUME_ROLE_TAG_KEY)
+
+            if dev == "/dev/sda1" and volume_size_gb is not None:
+                if volume_size_gb <= current_size:
+                    print(
+                        f"  Root volume {vol_id}: requested {volume_size_gb}GB "
+                        f"<= current {current_size}GB — skipping."
+                    )
+                else:
+                    print(
+                        f"  Expanding root volume {vol_id}: {current_size}GB → {volume_size_gb}GB"
+                    )
+                    ec2.modify_volume(VolumeId=vol_id, Size=volume_size_gb)
+                    result["root_volume_id"] = vol_id
+                    result["root_volume_new_size_gb"] = volume_size_gb
+                    print(
+                        f"    Volume modification initiated (async). May take several minutes.\n"
+                        f"    Poll status: aws ec2 describe-volumes-modifications "
+                        f"--volume-ids {vol_id}\n"
+                        f"    After completion, run on instance: "
+                        f"sudo growpart /dev/sda1 1 && sudo resize2fs /dev/sda1p1"
+                    )
+
+            elif role == STATE_VOLUME_ROLE and state_volume_size_gb is not None:
+                if state_volume_size_gb <= current_size:
+                    print(
+                        f"  State volume {vol_id}: requested {state_volume_size_gb}GB "
+                        f"<= current {current_size}GB — skipping."
+                    )
+                else:
+                    print(
+                        f"  Expanding state volume {vol_id}: "
+                        f"{current_size}GB → {state_volume_size_gb}GB"
+                    )
+                    ec2.modify_volume(VolumeId=vol_id, Size=state_volume_size_gb)
+                    result["state_volume_id"] = vol_id
+                    result["state_volume_new_size_gb"] = state_volume_size_gb
+                    print(
+                        f"    Volume modification initiated (async). May take several minutes.\n"
+                        f"    Poll status: aws ec2 describe-volumes-modifications "
+                        f"--volume-ids {vol_id}\n"
+                        f"    After completion, run on instance: "
+                        f"sudo growpart /dev/sda1 1 && sudo resize2fs /dev/sda1p1"
+                    )
+
+    # ------------------------------------------------------------------
+    # Instance type change (requires stop → modify → start)
+    # ------------------------------------------------------------------
+    if instance_type is not None:
+        current_type = inst.get("InstanceType")
+        if instance_type == current_type:
+            print(f"  Instance type is already {current_type} — skipping.")
+        else:
+            # Stop if running
+            stopped_here = False
+            if current_state == "running":
+                print(f"  Stopping instance {iid} to change type...")
+                ec2.stop_instances(InstanceIds=[iid])
+                waiter = ec2.get_waiter("instance_stopped")
+                waiter.wait(InstanceIds=[iid])
+                print("  Instance stopped.")
+                stopped_here = True
+            elif current_state != "stopped":
+                raise RuntimeError(
+                    f"Instance {iid} is in state '{current_state}'; "
+                    "cannot change instance type unless running or stopped."
+                )
+
+            print(f"  Changing instance type: {current_type} → {instance_type}")
+            try:
+                ec2.modify_instance_attribute(
+                    InstanceId=iid,
+                    InstanceType={"Value": instance_type},
+                )
+            except Exception:
+                if stopped_here:
+                    print(
+                        f"  modify_instance_attribute failed; restarting instance {iid} "
+                        "before re-raising..."
+                    )
+                    with suppress(ClientError):
+                        ec2.start_instances(InstanceIds=[iid])
+                raise
+            result["instance_type_old"] = str(current_type)
+            result["instance_type_new"] = instance_type
+
+            # Restart if we stopped it
+            if stopped_here:
+                print(f"  Restarting instance {iid}...")
+                ec2.start_instances(InstanceIds=[iid])
+                waiter = ec2.get_waiter("instance_running")
+                waiter.wait(InstanceIds=[iid])
+                # Refresh for new IP
+                refreshed = _find_instance(ec2)
+                public_ip = str((refreshed or {}).get("PublicIpAddress", "none"))
+                print(f"  Instance running. Public IP: {public_ip}")
+                result["public_ip"] = public_ip
+
+    return result

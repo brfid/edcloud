@@ -8,7 +8,6 @@ import os
 import shlex
 import subprocess
 from collections.abc import Callable
-from datetime import datetime, timezone
 from typing import ParamSpec, TypeVar
 
 import boto3
@@ -23,7 +22,6 @@ from edcloud.config import (
     InstanceConfig,
 )
 
-PRECHANGE_SNAPSHOT_PREFIX = "pre-change"
 P = ParamSpec("P")
 R = TypeVar("R")
 
@@ -99,54 +97,7 @@ def require_aws_creds(func: Callable[P, R]) -> Callable[P, R]:
 
 def _fetch_tailscale_auth_key_from_ssm(parameter_name: str) -> str:
     """Read a Tailscale auth key from SSM Parameter Store."""
-    ssm = boto3.client("ssm")
-    resp = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
-    return str(resp["Parameter"]["Value"])
-
-
-def _snapshot_start_time(start_time: str) -> datetime | None:
-    """Parse an ISO-format snapshot timestamp into a UTC-aware datetime.
-
-    Tolerates trailing ``Z`` and naive timestamps (assumed UTC).
-    Returns ``None`` on any parse failure.
-    """
-    raw = start_time.strip()
-    if not raw:
-        return None
-    if raw.endswith("Z"):
-        raw = raw[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def _find_recent_prechange_snapshot(max_age_minutes: int) -> dict[str, object] | None:
-    """Return the freshest completed pre-change snapshot within *max_age_minutes*.
-
-    Returns:
-        Snapshot info dict, or ``None`` if nothing qualifies.
-    """
-    now = datetime.now(timezone.utc)
-    freshest: tuple[datetime, dict[str, object]] | None = None
-    for snap_info in snapshot.list_snapshots():
-        description = str(snap_info.get("description", "")).strip().lower()
-        if not description.startswith(PRECHANGE_SNAPSHOT_PREFIX):
-            continue
-        if snap_info.get("state") != "completed":
-            continue
-        parsed = _snapshot_start_time(str(snap_info.get("start_time", "")))
-        if not parsed:
-            continue
-        age_minutes = (now - parsed).total_seconds() / 60
-        if age_minutes < 0 or age_minutes > max_age_minutes:
-            continue
-        if freshest is None or parsed > freshest[0]:
-            freshest = (parsed, snap_info)
-    return freshest[1] if freshest else None
+    return ec2.fetch_tailscale_auth_key_from_ssm(parameter_name)
 
 
 def _ensure_no_tailscale_name_conflicts(base_hostname: str = DEFAULT_TAILSCALE_HOSTNAME) -> None:
@@ -156,6 +107,10 @@ def _ensure_no_tailscale_name_conflicts(base_hostname: str = DEFAULT_TAILSCALE_H
         RuntimeError: If conflicting/suffixed edcloud records are found.
     """
     if not tailscale.tailscale_available():
+        click.echo(
+            "Warning: tailscale CLI not found on PATH; name conflict check skipped.",
+            err=True,
+        )
         return
     conflicts = tailscale.edcloud_name_conflicts(base_hostname=base_hostname)
     if conflicts:
@@ -541,7 +496,7 @@ def destroy(
             raise SystemExit(1)
 
         if require_fresh_snapshot:
-            recent = _find_recent_prechange_snapshot(fresh_snapshot_max_age_minutes)
+            recent = snapshot.find_recent_prechange_snapshot(fresh_snapshot_max_age_minutes)
             if not recent:
                 click.echo(
                     "Error: no fresh pre-change snapshot found for this guardrail.",
@@ -876,6 +831,207 @@ def tailscale_reconcile(dry_run: bool) -> None:
     click.echo()
     click.echo("Applied mode: manual reconciliation required in Tailscale admin.")
     raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# reprovision
+# ---------------------------------------------------------------------------
+@main.command("reprovision")
+@click.option(
+    "--instance-type",
+    default=InstanceConfig.instance_type,
+    show_default=True,
+    help="EC2 instance type.",
+)
+@click.option(
+    "--volume-size",
+    default=InstanceConfig.volume_size_gb,
+    type=int,
+    show_default=True,
+    help="Root EBS volume size in GB.",
+)
+@click.option(
+    "--state-volume-size",
+    default=InstanceConfig.state_volume_size_gb,
+    type=int,
+    show_default=True,
+    help="Persistent state EBS volume size in GB.",
+)
+@click.option(
+    "--tailscale-hostname",
+    default=DEFAULT_TAILSCALE_HOSTNAME,
+    show_default=True,
+    help="Tailscale MagicDNS hostname.",
+)
+@click.option(
+    "--tailscale-auth-key-ssm-parameter",
+    default=DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER,
+    envvar="TAILSCALE_AUTH_KEY_SSM_PARAMETER",
+    show_default=True,
+    help="SSM parameter name containing Tailscale auth key.",
+)
+@click.option(
+    "--skip-snapshot",
+    is_flag=True,
+    help="Skip automatic pre-reprovision snapshot (faster but risky).",
+)
+@click.option(
+    "--confirm-instance-id",
+    default=None,
+    help="Required safety confirmation. Must match current managed instance ID.",
+)
+@click.option(
+    "--allow-tailscale-name-conflicts",
+    is_flag=True,
+    help="Skip fail-fast guard for duplicate/suffixed edcloud Tailscale records.",
+)
+@require_aws_creds
+def reprovision(
+    instance_type: str,
+    volume_size: int,
+    state_volume_size: int,
+    tailscale_hostname: str,
+    tailscale_auth_key_ssm_parameter: str,
+    skip_snapshot: bool,
+    confirm_instance_id: str | None,
+    allow_tailscale_name_conflicts: bool,
+) -> None:
+    """Atomically snapshot → destroy → provision.
+
+    Takes a pre-reprovision snapshot (unless --skip-snapshot), destroys the
+    current instance, then provisions a fresh one. If provisioning fails after
+    destroy, the snapshot IDs are printed prominently so you can restore
+    manually.
+
+    Note: provisioning always requires an existing state volume. If the state
+    volume was deleted, use 'edc provision --allow-new-state-volume' directly.
+    """
+    if not allow_tailscale_name_conflicts:
+        _ensure_no_tailscale_name_conflicts(base_hostname=tailscale_hostname)
+
+    # Pre-flight: get current instance state once; use it for confirmation and destroy.
+    info = ec2.status()
+    if info.get("exists"):
+        instance_id = str(info.get("instance_id", ""))
+        if confirm_instance_id != instance_id:
+            click.echo(
+                "Error: destructive action requires explicit instance ID confirmation.",
+                err=True,
+            )
+            click.echo(
+                f"  Re-run with: edc reprovision --confirm-instance-id {instance_id}",
+                err=True,
+            )
+            raise SystemExit(1)
+
+    snap_ids: list[str] = []
+
+    # 1. Pre-reprovision snapshot -----------------------------------------------
+    if not skip_snapshot:
+        click.echo("Creating pre-reprovision snapshot...")
+        try:
+            snap_ids = snapshot.auto_snapshot_before_destroy()
+            if snap_ids:
+                click.echo(f"✅ Pre-reprovision snapshot(s) completed: {', '.join(snap_ids)}")
+                click.echo()
+            else:
+                click.echo("Info: no existing instance to snapshot.")
+                click.echo()
+        except (RuntimeError, BotoCoreError, ClientError) as exc:
+            click.echo(f"⚠️  Snapshot failed: {exc}", err=True)
+            if not click.confirm("Continue with reprovision anyway (no snapshot)?"):
+                click.echo("Aborted.")
+                raise SystemExit(0) from None
+
+    # 2. Destroy ----------------------------------------------------------------
+    if info.get("exists"):
+        click.echo("Destroying current instance...")
+        ec2.destroy(force=True)
+        click.echo()
+    else:
+        click.echo("Info: no existing instance found — skipping destroy step.")
+        click.echo()
+
+    # 3. Provision --------------------------------------------------------------
+    cfg = InstanceConfig(
+        instance_type=instance_type,
+        volume_size_gb=volume_size,
+        state_volume_size_gb=state_volume_size,
+        tailscale_hostname=tailscale_hostname,
+        tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
+    )
+    try:
+        result = ec2.provision(cfg, require_existing_state_volume=True)
+    except (RuntimeError, ec2.TagDriftError, ClientError, BotoCoreError) as exc:
+        click.echo(f"❌ Provisioning failed: {exc}", err=True)
+        if snap_ids:
+            click.echo("", err=True)
+            click.echo(
+                "⚠️  The instance was destroyed but reprovisioning failed.",
+                err=True,
+            )
+            click.echo(
+                f"   Snapshot IDs for manual restore: {', '.join(snap_ids)}",
+                err=True,
+            )
+            click.echo(
+                "   Use 'edc provision' after restoring the state volume from a snapshot.",
+                err=True,
+            )
+        raise SystemExit(1) from exc
+
+    click.echo()
+    click.echo(json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# resize
+# ---------------------------------------------------------------------------
+@main.command("resize")
+@click.option(
+    "--instance-type",
+    default=None,
+    help="New EC2 instance type (e.g. t3a.medium). Requires stop/start cycle.",
+)
+@click.option(
+    "--volume-size",
+    default=None,
+    type=int,
+    help="New root EBS volume size in GB (expand only, applied online).",
+)
+@click.option(
+    "--state-volume-size",
+    default=None,
+    type=int,
+    help="New state EBS volume size in GB (expand only, applied online).",
+)
+@require_aws_creds
+def resize_cmd(
+    instance_type: str | None,
+    volume_size: int | None,
+    state_volume_size: int | None,
+) -> None:
+    """Resize the instance type and/or EBS volumes in place.
+
+    Instance type changes require a stop/start cycle (data is preserved).
+    Volume size changes are applied online without a restart.
+    Volume shrinking is not supported by AWS.
+    """
+    if instance_type is None and volume_size is None and state_volume_size is None:
+        click.echo(
+            "Error: specify at least one of --instance-type, --volume-size, "
+            "or --state-volume-size.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    result = ec2.resize(
+        instance_type=instance_type,
+        volume_size_gb=volume_size,
+        state_volume_size_gb=state_volume_size,
+    )
+    click.echo()
+    click.echo(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
