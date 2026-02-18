@@ -577,3 +577,189 @@ def test_tailscale_reconcile_dry_run_reports_conflicts(
     result = runner.invoke(main, ["tailscale", "reconcile", "--dry-run"])
     assert result.exit_code == 1
     assert "Tailscale naming conflict detected" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Tailscale check warning when CLI not available
+# ---------------------------------------------------------------------------
+
+
+@patch("edcloud.cli.tailscale.tailscale_available", return_value=False)
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+@patch("edcloud.cli.ec2.start")
+@patch("edcloud.cli.tailscale.get_tailscale_ip", return_value=None)
+def test_tailscale_check_logs_warning_when_cli_not_found(
+    _mock_ip,
+    _mock_start,
+    _mock_creds,
+    _mock_region,
+    _mock_available,
+):
+    """When tailscale binary is absent, a warning is printed to stderr."""
+    runner = CliRunner(mix_stderr=False)
+    result = runner.invoke(main, ["up"])
+    assert result.exit_code == 0
+    assert "tailscale CLI not found" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# reprovision command
+# ---------------------------------------------------------------------------
+
+
+@patch("edcloud.cli.ec2.provision")
+@patch("edcloud.cli.ec2.destroy")
+@patch("edcloud.cli.ec2.status")
+@patch("edcloud.cli.snapshot.auto_snapshot_before_destroy")
+@patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
+@patch("edcloud.cli.tailscale.tailscale_available", return_value=True)
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_reprovision_snapshots_destroys_and_provisions(
+    _mock_creds,
+    _mock_region,
+    _mock_available,
+    _mock_conflicts,
+    mock_snapshot,
+    mock_status,
+    mock_destroy,
+    mock_provision,
+):
+    """reprovision: snapshot → destroy → provision in order."""
+    mock_snapshot.return_value = ["snap-abc"]
+    mock_status.return_value = {"exists": True, "instance_id": "i-abc123"}
+    mock_provision.return_value = {
+        "instance_id": "i-new",
+        "security_group_id": "sg-new",
+        "public_ip": "1.2.3.4",
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "reprovision",
+            "--tailscale-auth-key-ssm-parameter",
+            "/edcloud/tailscale_auth_key",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    mock_snapshot.assert_called_once()
+    mock_destroy.assert_called_once_with(force=True)
+    mock_provision.assert_called_once()
+
+
+@patch("edcloud.cli.ec2.provision")
+@patch("edcloud.cli.ec2.destroy")
+@patch("edcloud.cli.ec2.status")
+@patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
+@patch("edcloud.cli.tailscale.tailscale_available", return_value=True)
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_reprovision_skip_snapshot_skips_snapshot(
+    _mock_creds,
+    _mock_region,
+    _mock_available,
+    _mock_conflicts,
+    mock_status,
+    mock_destroy,
+    mock_provision,
+):
+    """reprovision --skip-snapshot does not call snapshot."""
+    mock_status.return_value = {"exists": True, "instance_id": "i-abc123"}
+    mock_provision.return_value = {
+        "instance_id": "i-new",
+        "security_group_id": "sg-new",
+        "public_ip": "1.2.3.4",
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "reprovision",
+            "--skip-snapshot",
+            "--tailscale-auth-key-ssm-parameter",
+            "/edcloud/tailscale_auth_key",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    mock_provision.assert_called_once()
+
+
+@patch("edcloud.cli.ec2.provision")
+@patch("edcloud.cli.ec2.destroy")
+@patch("edcloud.cli.ec2.status")
+@patch("edcloud.cli.snapshot.auto_snapshot_before_destroy")
+@patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
+@patch("edcloud.cli.tailscale.tailscale_available", return_value=True)
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_reprovision_surfaces_snapshot_ids_on_provision_failure(
+    _mock_creds,
+    _mock_region,
+    _mock_available,
+    _mock_conflicts,
+    mock_snapshot,
+    mock_status,
+    mock_destroy,
+    mock_provision,
+):
+    """On provision failure after destroy, snapshot IDs are shown prominently."""
+    mock_snapshot.return_value = ["snap-abc123"]
+    mock_status.return_value = {"exists": True, "instance_id": "i-abc123"}
+    mock_provision.side_effect = RuntimeError("launch failed")
+
+    runner = CliRunner(mix_stderr=False)
+    result = runner.invoke(
+        main,
+        [
+            "reprovision",
+            "--tailscale-auth-key-ssm-parameter",
+            "/edcloud/tailscale_auth_key",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "snap-abc123" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# resize command
+# ---------------------------------------------------------------------------
+
+
+@patch("edcloud.cli.ec2.resize")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_resize_requires_at_least_one_option(_mock_creds, _mock_region, mock_resize):
+    """resize without any options exits with error."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["resize"])
+    assert result.exit_code == 1
+    assert "specify at least one" in result.output
+
+
+@patch("edcloud.cli.ec2.resize")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_resize_instance_type_calls_ec2_resize(_mock_creds, _mock_region, mock_resize):
+    """resize --instance-type delegates to ec2.resize."""
+    mock_resize.return_value = {
+        "instance_id": "i-abc123",
+        "instance_type_old": "t3a.small",
+        "instance_type_new": "t3a.medium",
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["resize", "--instance-type", "t3a.medium"])
+
+    assert result.exit_code == 0, result.output
+    mock_resize.assert_called_once_with(
+        instance_type="t3a.medium",
+        volume_size_gb=None,
+        state_volume_size_gb=None,
+    )
