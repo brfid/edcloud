@@ -522,19 +522,19 @@ runcmd:
       mkdir -p "$HOME"
 
       if [ ! -f "$HOME/.bash_aliases" ]; then
-        cat > "$HOME/.bash_aliases" <<"ALIASES"
-      alias ll="ls -alF --color=auto"
-      alias la="ls -A --color=auto"
-      alias l="ls -CF --color=auto"
-      ALIASES
+        printf "%s\n" \
+          "alias ll=\"ls -alF --color=auto\"" \
+          "alias la=\"ls -A --color=auto\"" \
+          "alias l=\"ls -CF --color=auto\"" \
+          > "$HOME/.bash_aliases"
       fi
 
-      if ! grep -q "\\.bash_aliases" "$HOME/.bashrc" 2>/dev/null; then
-        cat >> "$HOME/.bashrc" <<"BASHRC_SNIPPET"
-      if [ -f ~/.bash_aliases ]; then
-          . ~/.bash_aliases
-      fi
-      BASHRC_SNIPPET
+      if ! grep -q "\.bash_aliases" "$HOME/.bashrc" 2>/dev/null; then
+        printf "%s\n" \
+          "if [ -f ~/.bash_aliases ]; then" \
+          "    . ~/.bash_aliases" \
+          "fi" \
+          >> "$HOME/.bashrc"
       fi
     '
 
