@@ -359,17 +359,17 @@ runcmd:
 
   # --- Homebrew + LazyVim baseline ---
   - |
-    export HOME="${HOME:-/root}"
     NVIM_VERSION="v0.11.3"
     NVIM_TARBALL_URL="https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz"
     curl -fsSL "$NVIM_TARBALL_URL" -o /tmp/nvim-linux-x86_64.tar.gz
     rm -rf /opt/nvim-linux-x86_64
     tar -C /opt -xzf /tmp/nvim-linux-x86_64.tar.gz
+    chmod -R a+rX /opt/nvim-linux-x86_64
     ln -sfn /opt/nvim-linux-x86_64/bin/nvim /usr/local/bin/nvim
 
     export NONINTERACTIVE=1
     if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
-      if ! /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+      if ! runuser -u ubuntu -- /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
         logger -t edcloud "Homebrew install failed; continuing bootstrap without brew."
       fi
     fi
@@ -493,13 +493,11 @@ runcmd:
       set -euo pipefail
       mkdir -p "$HOME"
 
-      if [ ! -f "$HOME/.bash_aliases" ]; then
-        printf "%s\n" \
-          "alias ll=\"ls -alF --color=auto\"" \
-          "alias la=\"ls -A --color=auto\"" \
-          "alias l=\"ls -CF --color=auto\"" \
-          > "$HOME/.bash_aliases"
-      fi
+      printf "%s\n" \
+        "alias ll=\"ls -alF --color=auto\"" \
+        "alias la=\"ls -A --color=auto\"" \
+        "alias l=\"ls -CF --color=auto\"" \
+        > "$HOME/.bash_aliases"
 
       if ! grep -q "\.bash_aliases" "$HOME/.bashrc" 2>/dev/null; then
         printf "%s\n" \
