@@ -79,7 +79,7 @@ edc reprovision --confirm-instance-id <instance-id>
 edc verify
 ```
 
-See `SETUP.md` section **"Canonical safe rebuild workflow (golden path)"** for details and expected outcomes.
+See `RUNBOOK.md` section **"Canonical safe rebuild workflow (golden path)"** for details and expected outcomes.
 
 **Destroy defaults:** Auto-snapshot and cleanup (Tailscale devices + orphaned volumes) both run by default. Opt-out: `--skip-snapshot`, `--skip-cleanup`.
 
@@ -104,7 +104,7 @@ LazyVim compatibility:
 **Storage:** 16GB root (disposable), 20GB state at `/opt/edcloud/state` (persistent)
 **Discovery:** Tag `edcloud:managed=true` on all resources
 **Secrets:** AWS SSM Parameter Store
-**Baseline:** Docker, Portainer, Node.js, Python, and a broad dev tooling set defined in `cloud-init/user-data.yaml` and documented in `SETUP.md`.
+**Baseline:** Docker, Portainer, Node.js, Python, and a broad dev tooling set defined in `cloud-init/user-data.yaml` and documented in `RUNBOOK.md`.
 
 Non-secret personalization bootstrap:
 
@@ -131,7 +131,8 @@ Auto-shutdown after 30min idle.
 
 ## Docs
 
-- `SETUP.md` - Complete runbook
+- `RUNBOOK.md` - Complete operator runbook
+- `CHANGELOG.md` - Project history + current mutable status (`[Unreleased]`)
 - `DESIGN.md` - Design rationale
 - `SECURITY.md` - Threat model
 - `docs/TAILSCALE-CLEANUP.md` - Tailscale naming guardrails and reconcile workflow

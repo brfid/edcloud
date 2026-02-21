@@ -1,45 +1,16 @@
-# edcloud setup guide
+# edcloud runbook
 
 Operator runbook for provisioning, operating, and recovering a single-instance edcloud deployment.
 
-## Active priorities
+## Scope
 
-### Session handoff (context switch quick-start)
+This file is the stable operator procedure guide.
 
-Use this section as the canonical "working memory" for fast handoff to a fresh context.
-Keep updates short and overwrite stale entries rather than appending long logs.
+- Mutable project status, active queue, and agent working memory live in
+  `CHANGELOG.md` under `## [Unreleased]`.
+- Use this runbook for durable procedures, recovery drills, and operational checklists.
 
-Template:
-
-- Last updated: `YYYY-MM-DD HH:MM TZ`
-- Current focus: `<one sentence>`
-- Last completed:
-  - `<item>`
-  - `<item>`
-- Next actions (max 3):
-  - [ ] `<next step>`
-  - [ ] `<next step>`
-  - [ ] `<next step>`
-- Risks / blockers:
-  - `<risk or "none">`
-- Validation status:
-  - `<tests/checks run, or "none">`
-
-Example:
-
-- Last updated: `2026-02-21 11:05 EST`
-- Current focus: `Phase 2 thin-CLI extraction planning`
-- Last completed:
-  - `Centralized AWS client factories into edcloud/aws_clients.py`
-  - `Added shared instance discovery helpers in edcloud/discovery.py`
-- Next actions (max 3):
-  - [ ] `Extract provision/destroy/reprovision orchestration from cli.py`
-  - [ ] `Keep click commands as thin adapters`
-  - [ ] `Run focused pytest for impacted modules`
-- Risks / blockers:
-  - `Need to keep CLI UX and output stable during refactor`
-- Validation status:
-  - `pytest -q tests/test_aws_check.py tests/test_cleanup.py tests/test_cli.py tests/test_resource_audit.py tests/test_tailscale.py tests/test_iam.py (pass)`
+## Deferred backlog
 
 Open items:
 
