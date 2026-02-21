@@ -7,8 +7,10 @@ edcloud/
 ├── cli.py          # Click commands (thin wrappers)
 ├── ec2.py          # EC2 lifecycle via boto3
 ├── snapshot.py     # EBS snapshot ops + auto-snapshot
+├── dlm.py          # AWS DLM lifecycle policy management (planned — see below)
 ├── tailscale.py    # Device discovery, SSH helpers
 ├── cleanup.py      # Cleanup orchestration
+├── iam.py          # IAM role + instance profile management
 ├── config.py       # Defaults, InstanceConfig dataclass
 └── aws_check.py    # Credential validation
 ```
@@ -111,6 +113,78 @@ Auto-snapshot → Destroy (root vol auto-deleted) → Tailscale cleanup → Orph
 ```
 Auto-snapshot (if instance exists) → Tailscale cleanup prompt → Volume cleanup → Provision
 ```
+
+## DLM snapshot lifecycle (planned — not yet implemented)
+
+Replace the ad-hoc weekly/monthly systemd timers with AWS Data Lifecycle Manager (DLM), which handles scheduling, retention, and pruning natively at no extra cost.
+
+### What changes
+
+| Before | After |
+|---|---|
+| `templates/operator/systemd-user/edc-weekly-snapshot.*` | deleted |
+| `templates/operator/systemd-user/edc-monthly-snapshot.*` | deleted |
+| `prune_snapshots()` / `edc snapshot --prune` | kept as manual escape hatch only |
+| No automatic pruning | DLM handles it |
+
+### New resources provisioned by `edc provision`
+
+**IAM role: `edcloud-dlm-role`**
+- Trust: `dlm.amazonaws.com`
+- Attached managed policy: `arn:aws:iam::aws:policy/service-role/AmazonDLMServiceRole`
+- Created in `dlm.py:ensure_dlm_role()`, deleted in `dlm.py:delete_dlm_role()`
+
+**DLM lifecycle policy**
+- Description (used as stable identifier): `edcloud-snapshot-lifecycle`
+- Targets volumes tagged: `edcloud:volume-role=state`
+- Tagged: `edcloud:managed=true`
+- Three schedules, each with `RetainRule.Count=1`:
+  - `daily` — every 24h at 03:00 UTC
+  - `weekly` — cron `cron(0 3 ? * SUN *)`
+  - `monthly` — cron `cron(0 3 1 * ? *)`
+- Result: 3 managed snapshots at steady state; ramps up naturally over ~30 days
+- Created in `dlm.py:ensure_dlm_policy()`, deleted in `dlm.py:delete_dlm_policy()`
+
+### dlm.py API (to be created)
+
+```python
+ensure_dlm_role(tags: dict[str, str]) -> str        # idempotent; returns role ARN
+ensure_dlm_policy(role_arn: str, tags: dict) -> str  # idempotent; returns policy ID
+find_dlm_policy() -> str | None                      # finds by TargetTag + description
+delete_dlm_policy() -> None
+delete_dlm_role() -> None
+```
+
+### Integration points
+
+- `ec2.py provision()`: after step 2 (IAM instance profile), call `ensure_dlm_role()` then `ensure_dlm_policy()`
+- `ec2.py destroy()`: after `delete_instance_profile()`, call `delete_dlm_policy()` then `delete_dlm_role()`
+
+### Key boto3 API notes
+
+```python
+dlm = boto3.client('dlm')
+
+# Tags on the DLM policy itself use dict format (not [{Key,Value}] list)
+Tags={'edcloud:managed': 'true'}
+
+# Finding existing policy — filter format is "key=value" string
+dlm.get_lifecycle_policies(TargetTags=['edcloud:volume-role=state'])
+# Then filter results by Description == 'edcloud-snapshot-lifecycle'
+
+# CronExpression and Interval+IntervalUnit are mutually exclusive in CreateRule
+# IntervalUnit for CreateRule is 'HOURS' only (not DAYS)
+```
+
+### Pre-destroy snapshots
+
+`auto_snapshot_before_destroy()` (called on `edc destroy`/`reprovision`) creates on-demand snapshots that DLM does **not** manage or prune. These accumulate slowly and can be manually pruned with `edc snapshot --prune --apply`. No change needed there.
+
+### Operator IAM requirements added
+
+The operator running `edc provision` needs:
+- `dlm:CreateLifecyclePolicy`, `dlm:DeleteLifecyclePolicy`, `dlm:GetLifecyclePolicies`
+- `iam:PassRole` (to pass the DLM role to the DLM service)
 
 ## Future enhancements
 
