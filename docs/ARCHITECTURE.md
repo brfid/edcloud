@@ -69,28 +69,32 @@ run_cleanup_workflow(phase: str, skip_snapshot: bool, interactive: bool, allow_d
 auto_snapshot_before_destroy() -> list[str]
     # Auto-snapshot with timestamped description
     # Returns [] if no instance exists (safe for first provision)
-    # Used by --cleanup (default on, opt-out with --skip-snapshot)
+    # Called by default on destroy; opt-out with --skip-snapshot
 ```
 
 ## Default behaviors
 
-**Auto-snapshot:** ON by default with `--cleanup`. Opt-out: `--skip-snapshot`.
+**Auto-snapshot on destroy:** ON by default. Opt-out: `--skip-snapshot`.
+
+**Cleanup on destroy:** ON by default (Tailscale devices + orphaned volumes). Opt-out: `--skip-cleanup`.
+
+**Root volume lifecycle:** `DeleteOnTermination=True` — root volume is auto-deleted by AWS on instance termination. Only the state volume survives.
 
 **Rationale:**
 - Snapshots cheap (~$2-5/month)
 - Prevents data loss
-- Industry standard (AWS RDS auto-snapshots)
+- Default-safe: no orphaned volumes from normal destroy/reprovision cycles
 
 **Volume cleanup modes:**
-- Interactive: Prompt with options (default)
-- Delete: Auto-delete all (for testing)
+- Interactive: Prompt with options (default for `provision --cleanup`)
+- Delete: Auto-delete root-tagged volumes (used by `reprovision` and `destroy` cleanup)
 - Keep: Skip deletion (reuse state volume)
 
 ## Data flow
 
-### destroy --cleanup
+### destroy (default)
 ```
-Auto-snapshot → Destroy → Tailscale cleanup prompt → Volume cleanup prompt
+Auto-snapshot → Destroy (root vol auto-deleted) → Tailscale cleanup → Orphaned volume cleanup
 ```
 
 ### provision --cleanup

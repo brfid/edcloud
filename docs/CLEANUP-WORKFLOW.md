@@ -4,10 +4,16 @@
 
 ## Usage
 
-### Destroy with cleanup
+### Destroy (cleanup runs by default)
 ```bash
-edc destroy --confirm-instance-id i-xxx --cleanup
-# Auto-snapshots → destroys → shows Tailscale/volume cleanup prompts
+edc destroy --confirm-instance-id i-xxx
+# Auto-snapshots → destroys → Tailscale/volume cleanup runs automatically
+```
+
+To skip cleanup or snapshot individually:
+```bash
+edc destroy --confirm-instance-id i-xxx --skip-snapshot   # No pre-destroy snapshot
+edc destroy --confirm-instance-id i-xxx --skip-cleanup    # No post-destroy cleanup
 ```
 
 ### Provision with cleanup
@@ -16,34 +22,32 @@ edc provision --cleanup
 # Auto-snapshots existing instance (if any) → cleanup prompts → provisions
 ```
 
-### Skip auto-snapshot
+### Skip auto-snapshot on provision
 ```bash
-edc destroy --cleanup --skip-snapshot  # Faster, for testing
 edc provision --cleanup --skip-snapshot
 ```
 
-## Default behavior
+## Default behavior on destroy
 
-**With `--cleanup`:**
-1. Auto-snapshot before destructive operation (skip with `--skip-snapshot`)
-2. Detect offline Tailscale devices → show manual removal instructions
-3. Detect orphaned volumes → prompt for delete/keep/abort
+1. Auto-snapshot before destroy (skip with `--skip-snapshot`)
+2. Terminate instance (root volume auto-deleted — `DeleteOnTermination=True`)
+3. Detect offline Tailscale devices → show manual removal instructions
+4. Detect orphaned managed volumes → delete root-tagged volumes automatically
 
 **Tailscale cleanup:** Detection is automated (`edc tailscale reconcile` / `edc tailscale reconcile --dry-run`). Deletion requires the Tailscale admin web UI (https://login.tailscale.com/admin/machines). Delete offline `edcloud*` devices to prevent name incrementing.
 
 **Volume cleanup:**
-- Option 1: Delete all (fresh start)
-- Option 2: Keep (reuses state volume = preserves data)
-- Option 3: Abort
+- Root volumes are deleted automatically at termination (`DeleteOnTermination=True`)
+- Orphaned root-tagged volumes from older instances are deleted by cleanup
+- State volumes are protected by default; use `--allow-delete-state-volume` to override
 
 ## Recommended workflow
 
 ```bash
-# Snapshot happens automatically with --cleanup
-edc destroy --confirm-instance-id i-xxx --cleanup
-# Clean up Tailscale devices (30sec manual step)
-edc provision --cleanup
-# Choose option 2 to keep state volume
+edc destroy --confirm-instance-id i-xxx
+# Clean up Tailscale devices if prompted (30sec manual step in admin UI)
+edc provision
+# State volume is reused automatically; data is preserved
 ```
 
 **Result:** Instance named `edcloud` (no suffix), data preserved on state volume.
@@ -54,7 +58,7 @@ Snapshots: ~$0.05/GB/month. 36GB ≈ $1.80/month (default: 16GB root + 20GB stat
 
 ## Atomic alternative: edc reprovision
 
-Instead of the four-step manual workflow above, use `edc reprovision` for an atomic snapshot → destroy → provision cycle:
+Instead of the manual destroy → provision workflow, use `edc reprovision` for an atomic snapshot → destroy → cleanup → provision cycle:
 
 ```bash
 edc reprovision --confirm-instance-id i-xxx

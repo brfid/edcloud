@@ -43,12 +43,12 @@ edc verify                   # Bootstrap validation
 edc snapshot [-d desc]       # Create snapshot
 edc snapshot --list          # List snapshots
 edc snapshot --prune         # Prune old snapshots
-edc destroy --confirm-instance-id ID [--cleanup]  # Terminate instance
+edc destroy --confirm-instance-id ID  # Terminate instance (snapshot + cleanup run by default)
 ```
 
 Use `--allow-tailscale-name-conflicts` only for break-glass cases.
 
-**Cleanup flags:** Auto-snapshot before destroy/provision, clean up Tailscale devices and orphaned volumes. Opt-out: `--skip-snapshot`.
+**Destroy defaults:** Auto-snapshot and cleanup (Tailscale devices + orphaned volumes) both run by default. Opt-out: `--skip-snapshot`, `--skip-cleanup`.
 
 Volume safety guardrails:
 

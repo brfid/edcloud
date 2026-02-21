@@ -19,7 +19,7 @@ Open items:
 ### Testing gaps (deferred)
 
 - [ ] `cleanup.py` unit tests (`test_cleanup_tailscale_devices`, `test_cleanup_orphaned_volumes_delete_mode`, `test_run_cleanup_workflow`)
-- [ ] Integration tests for `--cleanup` workflow end-to-end
+- [ ] Integration tests for destroy/cleanup workflow end-to-end
 - [ ] End-to-end provision/destroy cycle tests
 
 ### Architectural improvements (deferred)
@@ -341,7 +341,7 @@ Cleanup volume protection defaults:
 - Override only when intentionally performing full cleanup:
 
 ```bash
-edc destroy --confirm-instance-id <instance-id> --cleanup --allow-delete-state-volume
+edc destroy --confirm-instance-id <instance-id> --allow-delete-state-volume
 edc provision --cleanup --allow-delete-state-volume
 ```
 
