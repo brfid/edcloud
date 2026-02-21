@@ -40,9 +40,9 @@ edc up/down                          # Start/stop instance (up also fail-fast on
 edc ssh [command]                    # SSH via Tailscale
 edc status                   # Instance state, IPs, cost estimate
 edc verify                   # Bootstrap validation
-edc snapshot [-d desc]       # Create snapshot
+edc snapshot [-d desc]       # Create snapshot (state volume only)
 edc snapshot --list          # List snapshots
-edc snapshot --prune         # Prune old snapshots
+edc snapshot --prune [--keep N] [--apply]  # Keep last N snapshots (default 3), dry-run by default
 edc destroy --confirm-instance-id ID  # Terminate instance (snapshot + cleanup run by default)
 ```
 
@@ -90,7 +90,7 @@ Durable rebuild baseline:
 
 ## Cost
 
-4hr/day usage: ~$2.26 compute + ~$2.88 storage + ~$5 snapshots ≈ **~$7–10/month**
+4hr/day usage: ~$2.26 compute + ~$2.88 storage + ~$1.50 snapshots ≈ **~$6–7/month**
 Auto-shutdown after 30min idle.
 
 ## Docs

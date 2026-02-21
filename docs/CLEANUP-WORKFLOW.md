@@ -54,7 +54,7 @@ edc provision
 
 ## Cost
 
-Snapshots: ~$0.05/GB/month. 36GB ≈ $1.80/month (default: 16GB root + 20GB state). Use `edc snapshot --prune` for retention management.
+Snapshots: ~$0.05/GB/month. Only the 30GB state volume is snapshotted (root is disposable). 3 snapshots × 30GB ≈ $1.50/month. Run `edc snapshot --prune --apply` after reprovisioning to stay within the keep-last-3 policy.
 
 ## Atomic alternative: edc reprovision
 

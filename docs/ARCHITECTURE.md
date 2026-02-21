@@ -63,13 +63,22 @@ run_cleanup_workflow(phase: str, skip_snapshot: bool, interactive: bool, allow_d
     # Phases: "pre-provision" or "post-destroy"
 ```
 
-## snapshot.py additions
+## snapshot.py API
 
 ```python
 auto_snapshot_before_destroy() -> list[str]
-    # Auto-snapshot with timestamped description
-    # Returns [] if no instance exists (safe for first provision)
-    # Called by default on destroy; opt-out with --skip-snapshot
+    # Snapshots state volume only; returns [] if no instance exists
+    # Called by default on destroy/reprovision; opt-out with --skip-snapshot
+
+create_snapshot(description) -> list[str]
+    # Snapshots only volumes tagged edcloud:volume-role=state
+    # Root volume is disposable (rebuilt by cloud-init) and never snapshotted
+    # Falls back to all volumes if no state-tagged volume is found
+
+prune_snapshots(keep_last=3, dry_run=True) -> dict
+    # Deletes all but the most recent keep_last snapshots
+    # All snapshots eligible regardless of description prefix
+    # CLI: edc snapshot --prune [--keep N] [--apply]
 ```
 
 ## Default behaviors
@@ -80,9 +89,10 @@ auto_snapshot_before_destroy() -> list[str]
 
 **Root volume lifecycle:** `DeleteOnTermination=True` — root volume is auto-deleted by AWS on instance termination. Only the state volume survives.
 
+**Snapshot scope:** State volume only. Root is disposable and rebuilt by cloud-init on every provision; snapshotting it is wasteful. ~$1.50/month for 3 × 30GB snapshots.
+
 **Rationale:**
-- Snapshots cheap (~$2-5/month)
-- Prevents data loss
+- Prevents state data loss across reprovision cycles
 - Default-safe: no orphaned volumes from normal destroy/reprovision cycles
 
 **Volume cleanup modes:**

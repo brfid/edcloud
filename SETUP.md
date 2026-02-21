@@ -10,8 +10,7 @@ Open items:
 - [ ] Improve automatic repo loading: currently dotfiles/bin/llm-config cloning depends on gh auth during cloud-init; consider making repo list configurable and/or adding explicit clone step to provision workflow (e.g., `edc provision --sync-repos`).
 - [ ] Evaluate a secure operator login workflow that starts from one memorized string without weakening Tailscale/AWS MFA controls.
 - [ ] Centralize default SSH username in repo config (for example `edcloud/config.py`) and have `edc ssh`/`edc verify` read that value.
-- [ ] Run weekly + monthly snapshot cadence for durable state.
-- [ ] Keep snapshot spend under soft cap `$5/month`; adjust retention if exceeded.
+- [ ] Keep snapshot spend under soft cap `$2/month`; adjust `--keep` if exceeded.
 - [ ] Run restore drills from recent snapshots and verify SSH, Docker, Tailscale, Portainer, and data under `/opt/edcloud/state`.
 - [ ] Record restore drill date and result for auditability.
 - [ ] Back up non-repo durable state under `/opt/edcloud/state`; reclone repos from upstream on rebuild.
@@ -184,10 +183,6 @@ edc status
 
 Optional automation templates:
 
-- `templates/operator/systemd-user/edc-weekly-snapshot.service`
-- `templates/operator/systemd-user/edc-weekly-snapshot.timer`
-- `templates/operator/systemd-user/edc-monthly-snapshot.service`
-- `templates/operator/systemd-user/edc-monthly-snapshot.timer`
 - `templates/operator/run-reprovision-verify.sh`
 - `templates/operator/record-restore-drill.sh`
 
@@ -521,24 +516,23 @@ Non-secret repo sync baseline:
 Snapshot operations:
 
 ```bash
-edc snapshot
-edc snapshot --list
-edc snapshot -d pre-change-<reason>
+edc snapshot                        # Snapshot state volume
+edc snapshot --list                 # List all snapshots
+edc snapshot -d pre-change-<reason> # Named pre-change snapshot
 ```
 
-Retention and pruning:
+Retention and pruning (state volume only; root is never snapshotted):
 
 ```bash
-edc snapshot --prune --keep-weekly 8 --keep-monthly 3 --dry-run
-edc snapshot --prune --keep-weekly 8 --keep-monthly 3 --apply
+edc snapshot --prune                 # Dry-run: show what would be deleted (keep last 3)
+edc snapshot --prune --apply         # Delete all but the 3 most recent snapshots
+edc snapshot --prune --keep 5 --apply  # Keep 5 instead
 ```
 
 Policy targets:
 
-- Weekly + monthly periodic snapshots
-- Keep 8 weekly and 3 monthly snapshots
-- Keep pre-change snapshots only while rollback value exists
-- Keep snapshot spend under `$5/month`
+- Keep last 3 snapshots (covers ~3 reprovision events)
+- Keep snapshot spend under `$2/month`
 
 Restore drill baseline (monthly):
 
@@ -558,12 +552,12 @@ cat ~/.config/edcloud/restore-drill.tsv
 
 ## 11. Cost guardrail
 
-Typical target at 4 hours/day with default settings (`t3a.small`, 16GB root, 20GB state):
+Typical target at 4 hours/day with default settings (`t3a.small`, 16GB root, 30GB state):
 
 - Compute: about `$2.26/month` (t3a.small) or `$4.51/month` (t3a.medium)
-- Storage: about `$2.88/month` (36GB total) — was $4.80/month with 60GB
-- Snapshots: variable, target soft cap `$5/month`
-- **New monthly total: ~$7-10** (down from ~$9-14)
+- Storage: about `$3.68/month` (46GB total: 16GB root + 30GB state)
+- Snapshots: ~`$1.50/month` (3 × 30GB state snapshots at $0.05/GB)
+- **Monthly total: ~$7–8**
 
 Instance type selection:
 
