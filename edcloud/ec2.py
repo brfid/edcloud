@@ -14,10 +14,12 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-import boto3
 from botocore.exceptions import ClientError
 
 from edcloud.aws_check import get_region
+from edcloud.aws_clients import ec2_client as _shared_ec2_client
+from edcloud.aws_clients import ec2_resource as _shared_ec2_resource
+from edcloud.aws_clients import ssm_client as _shared_ssm_client
 from edcloud.config import (
     DEFAULT_HOURS_PER_DAY,
     EBS_MONTHLY_RATE_PER_GB,
@@ -35,12 +37,12 @@ from edcloud.config import (
     has_managed_tag,
     managed_filter,
 )
+from edcloud.discovery import list_instances
 from edcloud.iam import delete_instance_profile, ensure_instance_profile
 
 log = logging.getLogger(__name__)
 
 _USER_DATA_PATH = Path(__file__).resolve().parent.parent / "cloud-init" / "user-data.yaml"
-_ACTIVE_INSTANCE_STATES = ["pending", "running", "stopping", "stopped"]
 
 
 class TagDriftError(RuntimeError):
@@ -58,17 +60,17 @@ class TagDriftError(RuntimeError):
 
 def _ec2_client() -> Any:
     """Return a low-level EC2 client."""
-    return boto3.client("ec2")
+    return _shared_ec2_client()
 
 
 def _ec2_resource() -> Any:
     """Return a high-level EC2 resource."""
-    return boto3.resource("ec2")
+    return _shared_ec2_resource()
 
 
 def _ssm_client() -> Any:
     """Return a low-level SSM client."""
-    return boto3.client("ssm")
+    return _shared_ssm_client()
 
 
 def get_ec2_client() -> Any:
@@ -98,11 +100,6 @@ def fetch_tailscale_auth_key_from_ssm(parameter_name: str) -> str:
     return str(resp["Parameter"]["Value"])
 
 
-def _instance_state_filter() -> dict[str, Any]:
-    """Filter clause limiting results to non-terminated instance states."""
-    return {"Name": "instance-state-name", "Values": _ACTIVE_INSTANCE_STATES}
-
-
 def _instance_summary(instances: list[dict[str, Any]]) -> str:
     """Format a compact ``id (state)`` summary for one or more instances."""
     return ", ".join(f"{i['InstanceId']} ({i['State']['Name']})" for i in instances)
@@ -110,11 +107,7 @@ def _instance_summary(instances: list[dict[str, Any]]) -> str:
 
 def _list_instances(client: Any, filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Describe instances matching *filters*, excluding terminated ones."""
-    resp = client.describe_instances(Filters=[*filters, _instance_state_filter()])
-    instances: list[dict[str, Any]] = []
-    for reservation in resp.get("Reservations", []):
-        instances.extend(reservation.get("Instances", []))
-    return instances
+    return list_instances(client, filters)
 
 
 def _validate_instance_volume_tags(client: Any, instance: dict[str, Any]) -> None:

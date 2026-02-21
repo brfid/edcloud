@@ -75,13 +75,19 @@ Single-instance workloads do not need EFS. This keeps cost and backup scope pred
 Trade-off:
 No shared filesystem for multi-instance scaling.
 
-### 6. Snapshot policy over replication
+### 6. DLM snapshot policy over replication
 
 Decision:
-Protect data with periodic snapshots and restore drills.
+Protect data with AWS-native EBS lifecycle policies (DLM) and restore drills.
 
 Why:
-The system is a personal lab; snapshot-based recovery is sufficient and cost-aware.
+The system is a personal lab; DLM-managed snapshot recovery is sufficient and cost-aware.
+
+Current retention baseline:
+
+- Daily schedule keep-last 7
+- Weekly schedule keep-last 4 (roughly 28-day spaced recovery points)
+- Monthly schedule keep-last 2 (roughly 1-2 month recovery points)
 
 Trade-off:
 Recovery depends on tested restore procedure, not instant failover.

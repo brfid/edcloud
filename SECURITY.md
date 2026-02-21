@@ -33,6 +33,7 @@ Core assumptions:
 - Do not commit credentials, keys, or tokens to git.
 - Use MFA on AWS and your identity provider.
 - Rotate Tailscale auth keys and remove unused devices.
+- Keep AWS DLM backup policy enabled and review `edc backup-policy status` periodically.
 - Run restore drills and validate backup recovery.
 
 ## Vulnerability reporting

@@ -4,16 +4,63 @@ Operator runbook for provisioning, operating, and recovering a single-instance e
 
 ## Active priorities
 
+### Session handoff (context switch quick-start)
+
+Use this section as the canonical "working memory" for fast handoff to a fresh context.
+Keep updates short and overwrite stale entries rather than appending long logs.
+
+Template:
+
+- Last updated: `YYYY-MM-DD HH:MM TZ`
+- Current focus: `<one sentence>`
+- Last completed:
+  - `<item>`
+  - `<item>`
+- Next actions (max 3):
+  - [ ] `<next step>`
+  - [ ] `<next step>`
+  - [ ] `<next step>`
+- Risks / blockers:
+  - `<risk or "none">`
+- Validation status:
+  - `<tests/checks run, or "none">`
+
+Example:
+
+- Last updated: `2026-02-21 11:05 EST`
+- Current focus: `Phase 2 thin-CLI extraction planning`
+- Last completed:
+  - `Centralized AWS client factories into edcloud/aws_clients.py`
+  - `Added shared instance discovery helpers in edcloud/discovery.py`
+- Next actions (max 3):
+  - [ ] `Extract provision/destroy/reprovision orchestration from cli.py`
+  - [ ] `Keep click commands as thin adapters`
+  - [ ] `Run focused pytest for impacted modules`
+- Risks / blockers:
+  - `Need to keep CLI UX and output stable during refactor`
+- Validation status:
+  - `pytest -q tests/test_aws_check.py tests/test_cleanup.py tests/test_cli.py tests/test_resource_audit.py tests/test_tailscale.py tests/test_iam.py (pass)`
+
 Open items:
 
-- [ ] Add a safe rebuild workflow (`snapshot -> reprovision -> verify`) as a single documented operator path. (`edc reprovision` exists; document the full drill including verify.)
+- [x] Add a safe rebuild workflow (`snapshot -> reprovision -> verify`) as a single documented operator path. (`edc reprovision` now prints a post-run reminder to run `edc verify`.)
 - [ ] Improve automatic repo loading: currently dotfiles/bin/llm-config cloning depends on gh auth during cloud-init; consider making repo list configurable and/or adding explicit clone step to provision workflow (e.g., `edc provision --sync-repos`).
 - [ ] Evaluate a secure operator login workflow that starts from one memorized string without weakening Tailscale/AWS MFA controls.
 - [ ] Centralize default SSH username in repo config (for example `edcloud/config.py`) and have `edc ssh`/`edc verify` read that value.
-- [ ] Keep snapshot spend under soft cap `$2/month`; adjust `--keep` if exceeded.
+- [ ] Keep snapshot spend under soft cap `$2/month`; adjust DLM retention (`edc backup-policy apply --daily-keep N --weekly-keep M --monthly-keep K`) if exceeded.
 - [ ] Run restore drills from recent snapshots and verify SSH, Docker, Tailscale, Portainer, and data under `/opt/edcloud/state`.
 - [ ] Record restore drill date and result for auditability.
 - [ ] Back up non-repo durable state under `/opt/edcloud/state`; reclone repos from upstream on rebuild.
+
+### Agent tooling (deferred)
+
+- [ ] **Agent-agnostic skills system**: store reusable agent skills in a
+  format-neutral source (e.g. plain markdown with structured frontmatter) and
+  emit them into agent-specific formats on demand — `.claude/skills/` for
+  Claude Code, `AGENTS.md` skill blocks for Codex/Cline, `GEMINI.md` sections
+  for Gemini CLI, etc. Keeps skills DRY across a multi-agent workflow without
+  locking into any one tool's convention. Likely a small CLI or script;
+  location TBD (could live here, in a dotfiles repo, or as a standalone tool).
 
 ### Testing gaps (deferred)
 
@@ -36,6 +83,10 @@ Open items:
 
 A small ARM Linux operator node is supported if it can run Python, AWS CLI, and Tailscale.
 
+Operator model note: this runbook follows the canonical policy in `README.md`
+section **"Operator model"** (CLI-first on a lightweight terminal device;
+AWS Console as inspection/break-glass fallback).
+
 ## 1. AWS setup
 
 Required IAM actions:
@@ -54,11 +105,16 @@ ec2:DescribeVolumes
 ec2:CreateSnapshot
 ec2:DescribeSnapshots
 ec2:DescribeImages
+dlm:CreateLifecyclePolicy
+dlm:GetLifecyclePolicies
+dlm:GetLifecyclePolicy
+dlm:UpdateLifecyclePolicy
 ssm:GetParameter
 ssm:PutParameter
 iam:CreateRole
 iam:GetRole
 iam:PutRolePolicy
+iam:AttachRolePolicy
 iam:DeleteRolePolicy
 iam:ListRolePolicies
 iam:DeleteRole
@@ -150,41 +206,41 @@ edc --help
 
 `edc` is the primary command surface. `edcloud` remains a compatibility alias.
 
-## 4. Optional: operator wrapper for ARM/Linux nodes
+## 4. Operator command execution on ARM/Linux nodes
 
-This removes the need to manually activate the venv for every command.
-The command surface is unchanged: use the same lifecycle commands (`edc provision`, `edc up`, `edc down`, `edc status`, `edc ssh`).
-
-```bash
-mkdir -p ~/.local/bin ~/.config/edcloud
-install -m 0755 templates/operator/edc-wrapper.sh ~/.local/bin/edc
-cp templates/operator/edc.env.example ~/.config/edcloud/edc.env
-```
-
-If repo path differs from `~/edcloud`, set:
+Run `edc` from the repo-local virtualenv to keep tooling reproducible and avoid
+system-level installs.
 
 ```bash
-EDCLOUD_REPO=/path/to/edcloud
-```
-
-To make `edc provision` work without repeated key flags, keep this in `~/.config/edcloud/edc.env`:
-
-```bash
-TAILSCALE_AUTH_KEY_SSM_PARAMETER=/edcloud/tailscale_auth_key
-```
-
-Sanity checks after wrapper install:
-
-```bash
-which edc
+source .venv/bin/activate
 edc --version
 edc status
+```
+
+Or invoke directly without activating:
+
+```bash
+.venv/bin/edc --version
+.venv/bin/edc status
+```
+
+Optional shell convenience for this terminal session:
+
+```bash
+alias edc="$PWD/.venv/bin/edc"
+```
+
+To make `edc provision` work without repeating key flags, set:
+
+```bash
+export TAILSCALE_AUTH_KEY_SSM_PARAMETER=/edcloud/tailscale_auth_key
 ```
 
 Optional automation templates:
 
 - `templates/operator/run-reprovision-verify.sh`
 - `templates/operator/record-restore-drill.sh`
+- `edc sync-cline-auth` (sync Cline ChatGPT Subscription auth from a browser-capable machine to a headless edcloud host)
 
 ## 5. Provision
 
@@ -443,7 +499,25 @@ edc ssh 'findmnt /home/ubuntu /var/lib/tailscale /opt/edcloud/compose /opt/edclo
 edc ssh "docker info --format '{{.DockerRootDir}}'"
 ```
 
-Rebuild/reinstall workflow (same persistent state volume, no Tailscale name increment):
+### Canonical safe rebuild workflow (golden path)
+
+Use this as the default operator drill whenever making potentially disruptive host changes.
+
+```bash
+edc tailscale reconcile --dry-run
+edc snapshot -d pre-change-rebuild
+edc reprovision --confirm-instance-id <instance-id>
+edc verify
+```
+
+Expected outcome:
+
+- Fresh instance is provisioned.
+- Existing managed state volume is reused.
+- Tailscale identity and durable state under `/opt/edcloud/state` persist.
+- `edc verify` passes before resuming normal operations.
+
+Manual equivalent (same persistent state volume, no Tailscale name increment):
 
 ```bash
 edc tailscale reconcile --dry-run
@@ -453,7 +527,7 @@ edc provision
 edc verify
 ```
 
-Or use `edc reprovision` for the same steps as a single atomic command:
+`edc reprovision` is the preferred single-command path for destroy + provision.
 
 ```bash
 edc reprovision --confirm-instance-id <instance-id>
@@ -513,7 +587,16 @@ Non-secret repo sync baseline:
 - Executable files in `~/src/bin` are symlinked into `~/.local/bin`.
 - Keep these repos non-secret; secrets still belong in SSM/local private files.
 
-Snapshot operations:
+AWS-native policy operations (recommended baseline):
+
+```bash
+edc backup-policy status
+edc backup-policy apply                    # daily keep 7 + weekly keep 4 + monthly keep 2
+edc backup-policy apply --daily-keep 7 --weekly-keep 4 --monthly-keep 2
+edc backup-policy disable
+```
+
+Ad-hoc snapshot operations (manual guardrails / pre-change points):
 
 ```bash
 edc snapshot                        # Snapshot state volume
@@ -521,7 +604,7 @@ edc snapshot --list                 # List all snapshots
 edc snapshot -d pre-change-<reason> # Named pre-change snapshot
 ```
 
-Retention and pruning (state volume only; root is never snapshotted):
+Manual retention cleanup for ad-hoc snapshots (state volume only; root is never snapshotted):
 
 ```bash
 edc snapshot --prune                 # Dry-run: show what would be deleted (keep last 3)
@@ -531,16 +614,69 @@ edc snapshot --prune --keep 5 --apply  # Keep 5 instead
 
 Policy targets:
 
-- Keep last 3 snapshots (covers ~3 reprovision events)
+- Use DLM retention tiers: daily keep 7 + weekly keep 4 + monthly keep 2 (~1-2 month recovery points)
 - Keep snapshot spend under `$2/month`
 
-Restore drill baseline (monthly):
+Restore drill baseline (monthly, non-destructive "shadow" drill):
 
-1. Restore from a recent snapshot.
-2. Verify Tailscale connectivity.
-3. Verify Docker and Portainer.
-4. Verify durable data under `/opt/edcloud/state`.
-5. Run `edc verify`.
+Use a temporary volume restored from a snapshot. Do **not** detach or modify the
+production state volume.
+
+```bash
+# 0) Identify current state volume + latest completed snapshot
+STATE_VOL_ID=$(aws ec2 describe-volumes \
+  --filters Name=tag:edcloud:managed,Values=true Name=tag:edcloud:volume-role,Values=state \
+  --query 'Volumes[0].VolumeId' --output text)
+
+SNAP_ID=$(aws ec2 describe-snapshots \
+  --filters Name=volume-id,Values="$STATE_VOL_ID" Name=status,Values=completed \
+  --owner-ids self \
+  --query 'reverse(sort_by(Snapshots,&StartTime))[0].SnapshotId' --output text)
+
+# 1) Create temporary restore-drill volume (same AZ as live instance)
+AZ=$(aws ec2 describe-volumes --volume-ids "$STATE_VOL_ID" --query 'Volumes[0].AvailabilityZone' --output text)
+TMP_VOL_ID=$(aws ec2 create-volume \
+  --snapshot-id "$SNAP_ID" \
+  --availability-zone "$AZ" \
+  --volume-type gp3 \
+  --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=restore-drill-temp},{Key=purpose,Value=restore-drill},{Key=edcloud:managed,Value=false}]' \
+  --query 'VolumeId' --output text)
+
+aws ec2 wait volume-available --volume-ids "$TMP_VOL_ID"
+
+# 2) Attach temp volume to live instance as a secondary device (do not replace state volume)
+INSTANCE_ID=$(edc status | awk '/^Instance:/ {print $2}')
+aws ec2 attach-volume --volume-id "$TMP_VOL_ID" --instance-id "$INSTANCE_ID" --device /dev/sdg
+aws ec2 wait volume-in-use --volume-ids "$TMP_VOL_ID"
+
+# 3) Use direct SSH (not edc subcommands) while temp unmanaged volume is attached
+ssh ubuntu@edcloud 'lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE'
+
+# 4) Mount restored volume read-only and verify expected durable layout
+ssh ubuntu@edcloud 'sudo mkdir -p /mnt/restore-drill && sudo mount -o ro,noload /dev/nvme2n1 /mnt/restore-drill'
+ssh ubuntu@edcloud 'findmnt /mnt/restore-drill && sudo ls -la /mnt/restore-drill'
+
+# Optional write-safety check (should fail with Read-only file system)
+ssh ubuntu@edcloud "sudo sh -c 'touch /mnt/restore-drill/.restore-drill-write-test'" || true
+
+# 5) Cleanup (always): unmount, detach, delete temp volume
+ssh ubuntu@edcloud 'sudo umount /mnt/restore-drill && sudo rmdir /mnt/restore-drill'
+aws ec2 detach-volume --volume-id "$TMP_VOL_ID"
+aws ec2 wait volume-available --volume-ids "$TMP_VOL_ID"
+aws ec2 delete-volume --volume-id "$TMP_VOL_ID"
+
+# 6) Final normal checks on live host
+edc status
+edc verify
+```
+
+Safety notes:
+
+- Keep temporary drill resources tagged for purpose/audit (`purpose=restore-drill`).
+- Keep temporary drill resources **out of managed discovery** (`edcloud:managed=false`).
+- While a temporary unmanaged volume is attached, some `edc` subcommands may fail
+  with tag-drift guardrails; use direct `ssh` for drill checks and run `edc`
+  commands again after cleanup.
 
 Optional drill record helper:
 
@@ -574,6 +710,22 @@ Use `edc status` and AWS Cost Explorer to track drift.
 - Validate instance and reachability: `edc status`
 
 If Cline still asks for browser login on the instance:
+
+Preferred (automation-friendly) path:
+
+```bash
+# Run from your browser-capable source machine where Cline auth works
+cd ~/edcloud
+edc sync-cline-auth --remote ubuntu@edcloud
+# Optional: print remote user/home/config path + cline version before syncing
+edc sync-cline-auth --remote ubuntu@edcloud --remote-diagnostics
+```
+
+This syncs `~/.cline/data/secrets.json` and `~/.cline/data/globalState.json`
+to the remote with backup/permissions and avoids interactive browser auth on
+EC2. Use `--secrets-only` to skip `globalState.json` when needed.
+
+Fallback interactive path (port forward):
 
 1. Start auth on edcloud and note the localhost port it prints:
 

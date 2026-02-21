@@ -5,11 +5,11 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import boto3
 import click
 from botocore.exceptions import BotoCoreError, ClientError
 
 from edcloud import tailscale
+from edcloud.aws_clients import ec2_client as _ec2_client
 from edcloud.config import (
     MANAGER_TAG_KEY,
     MANAGER_TAG_VALUE,
@@ -66,7 +66,7 @@ def cleanup_orphaned_volumes(mode: str = "interactive", allow_delete_state: bool
     Returns:
         ``True`` if cleanup completed, ``False`` if the user aborted.
     """
-    ec2_client = boto3.client("ec2")
+    ec2_client = _ec2_client()
     resp = ec2_client.describe_volumes(
         Filters=[
             {"Name": f"tag:{MANAGER_TAG_KEY}", "Values": [MANAGER_TAG_VALUE]},

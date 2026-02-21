@@ -2,6 +2,17 @@
 
 Single-instance AWS EC2 personal cloud lab for x86_64 Linux workloads.
 
+## Operator model
+
+edcloud is designed to be operated from a lightweight terminal device (including
+small ARM/Linux nodes) using AWS + CLI tooling, not primarily from the AWS
+Console.
+
+- Primary path: `edc` + AWS CLI + Python + Tailscale from an operator device.
+- AWS Console path: inspection and break-glass/manual fallback.
+- Recurring lifecycle workflows (provision, verify, snapshot, reprovision,
+  cleanup) should stay CLI-driven for repeatability and safety guardrails.
+
 **Core design:**
 - Tailscale-only access (zero inbound rules)
 - Tag-based resource discovery (no state files)
@@ -28,8 +39,8 @@ edc provision
 
 ARM/Linux operator note:
 
-- If you run commands from a small ARM/Linux operator node and want to skip manual venv activation, use the optional wrapper flow in `SETUP.md` section **"4. Optional: operator wrapper for ARM/Linux nodes"**.
-- Command surface stays the same (`edc provision`, `edc up`, `edc down`, `edc status`).
+- Prefer running from the repo-local virtualenv (`.venv`) to keep tooling reproducible.
+- Use either `source .venv/bin/activate` or invoke commands directly as `.venv/bin/edc ...`.
 
 ## Commands
 
@@ -39,16 +50,41 @@ edc provision [--cleanup]  # Create instance (requires existing state volume by 
 edc up/down                          # Start/stop instance (up also fail-fast on naming conflicts)
 edc ssh [command]                    # SSH via Tailscale
 edc status                   # Instance state, IPs, cost estimate
+edc setup-ssm-tokens         # Store GitHub/Tailscale tokens in SSM
+edc sync-cline-auth          # Sync Cline OAuth secrets to headless remote host
+edc sync-cline-auth --remote-diagnostics  # Print remote Cline path/version + config target
 edc verify                   # Bootstrap validation
+edc backup-policy status     # Show AWS DLM backup policy status
+edc backup-policy apply      # Ensure DLM policy (daily 7 + weekly 4 + monthly 2)
+edc backup-policy disable    # Disable managed DLM policy
 edc snapshot [-d desc]       # Create snapshot (state volume only)
 edc snapshot --list          # List snapshots
-edc snapshot --prune [--keep N] [--apply]  # Keep last N snapshots (default 3), dry-run by default
+edc snapshot --prune [--keep N] [--apply]  # Optional manual cleanup for ad-hoc snapshots
 edc destroy --confirm-instance-id ID  # Terminate instance (snapshot + cleanup run by default)
 ```
 
 Use `--allow-tailscale-name-conflicts` only for break-glass cases.
 
+Auth-sync diagnostics note:
+
+- `--remote-diagnostics` is provided by `edc sync-cline-auth`.
+- It is **not** a flag on `cline auth`.
+
+Safe rebuild golden path:
+
+```bash
+edc tailscale reconcile --dry-run
+edc snapshot -d pre-change-rebuild
+edc reprovision --confirm-instance-id <instance-id>
+edc verify
+```
+
+See `SETUP.md` section **"Canonical safe rebuild workflow (golden path)"** for details and expected outcomes.
+
 **Destroy defaults:** Auto-snapshot and cleanup (Tailscale devices + orphaned volumes) both run by default. Opt-out: `--skip-snapshot`, `--skip-cleanup`.
+
+**Backup defaults:** AWS DLM is the native retention engine. Recommended baseline:
+`edc backup-policy apply` (daily keep 7 + weekly keep 4 + monthly keep 2 ≈ dense recent points plus ~1 and ~2 month recovery points).
 
 Volume safety guardrails:
 

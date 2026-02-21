@@ -40,12 +40,15 @@ AMI_SSM_PARAMETER = (
 # ---------------------------------------------------------------------------
 DEFAULT_TAILSCALE_HOSTNAME = "edcloud"
 DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER = "/edcloud/tailscale_auth_key"
+DEFAULT_SSH_USER = "ubuntu"
 
 # ---------------------------------------------------------------------------
 # IAM
 # ---------------------------------------------------------------------------
 INSTANCE_ROLE_NAME = "edcloud-instance-role"
 INSTANCE_PROFILE_NAME = "edcloud-instance-profile"
+DLM_LIFECYCLE_ROLE_NAME = "edcloud-dlm-lifecycle-role"
+DLM_LIFECYCLE_POLICY_NAME = "edcloud-dlm-policy"
 
 # ---------------------------------------------------------------------------
 # Networking
@@ -64,7 +67,10 @@ HOURLY_RATES: dict[str, float] = {
     "t3a.medium": 0.0376,  # 2 vCPU, 4 GB RAM - heavier Docker workloads
 }
 EBS_MONTHLY_RATE_PER_GB = 0.08
+SNAPSHOT_MONTHLY_RATE_PER_GB = 0.05
+EIP_UNATTACHED_MONTHLY_RATE = 3.60
 DEFAULT_HOURS_PER_DAY = 4
+DEFAULT_SNAPSHOT_KEEP_LAST = 3
 
 
 # ---------------------------------------------------------------------------

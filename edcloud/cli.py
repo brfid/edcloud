@@ -7,21 +7,26 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 from collections.abc import Callable
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import ParamSpec, TypeVar
 
-import boto3
 import click
 from botocore.exceptions import BotoCoreError, ClientError
 
-from edcloud import ec2, snapshot, tailscale
+from edcloud import backup_policy, ec2, iam, snapshot, tailscale
 from edcloud.aws_check import check_aws_credentials, get_region
+from edcloud.aws_clients import ssm_client
 from edcloud.config import (
+    DEFAULT_SSH_USER,
     DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER,
     DEFAULT_TAILSCALE_HOSTNAME,
     InstanceConfig,
 )
+from edcloud.resource_audit import audit_resources
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -101,6 +106,15 @@ def _fetch_tailscale_auth_key_from_ssm(parameter_name: str) -> str:
     return ec2.fetch_tailscale_auth_key_from_ssm(parameter_name)
 
 
+def _run_checked(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess command and raise RuntimeError on failure."""
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "unknown error"
+        raise RuntimeError(f"Command failed: {' '.join(shlex.quote(p) for p in cmd)}\n{detail}")
+    return proc
+
+
 def _ensure_no_tailscale_name_conflicts(base_hostname: str = DEFAULT_TAILSCALE_HOSTNAME) -> None:
     """Fail fast when Tailscale naming drift is detected.
 
@@ -116,6 +130,42 @@ def _ensure_no_tailscale_name_conflicts(base_hostname: str = DEFAULT_TAILSCALE_H
     conflicts = tailscale.edcloud_name_conflicts(base_hostname=base_hostname)
     if conflicts:
         raise RuntimeError(tailscale.format_conflict_message(conflicts))
+
+
+def _print_audit_summary(phase: str) -> None:
+    """Run and print a concise resource-audit summary (warn-only)."""
+    try:
+        report = audit_resources()
+    except Exception as exc:
+        click.echo(f"Resource audit ({phase}): skipped ({exc})")
+        click.echo()
+        return
+    findings = report.findings
+    click.echo(f"Resource audit ({phase}):")
+    if findings:
+        click.echo(f"  Findings: {len(findings)} unanticipated resource(s)")
+        for finding in findings[:10]:
+            cost_suffix = (
+                f" (~${finding.estimated_monthly_cost:.2f}/mo)"
+                if finding.estimated_monthly_cost
+                else ""
+            )
+            click.echo(
+                f"  - [{finding.category}] {finding.resource_id}: {finding.message}{cost_suffix}"
+            )
+        if len(findings) > 10:
+            click.echo(f"  ... and {len(findings) - 10} more")
+    else:
+        click.echo("  Findings: none")
+
+    click.echo(
+        "  Cost summary: "
+        f"baseline=${report.cost.baseline_monthly:.2f}/mo, "
+        f"unanticipated=${report.cost.unanticipated_monthly:.2f}/mo, "
+        f"total=${report.cost.total_monthly:.2f}/mo"
+    )
+    click.echo(f"  Note: {report.cost.note}")
+    click.echo()
 
 
 @click.group()
@@ -220,6 +270,8 @@ def provision(
     if not allow_tailscale_name_conflicts:
         _ensure_no_tailscale_name_conflicts(base_hostname=tailscale_hostname)
 
+    _print_audit_summary("pre-provision")
+
     # Pre-provision cleanup if requested
     if cleanup:
         from edcloud import cleanup as cleanup_module
@@ -245,7 +297,7 @@ def provision(
         ):
             raise SystemExit(0)
 
-    ssm = boto3.client("ssm")
+    ssm = ssm_client()
 
     # If raw key is provided, store it in SSM
     if tailscale_auth_key:
@@ -296,6 +348,7 @@ def provision(
         cfg,
         require_existing_state_volume=require_existing_state_volume,
     )
+    _print_audit_summary("post-provision")
     click.echo()
     click.echo(json.dumps(result, indent=2))
 
@@ -339,6 +392,244 @@ def load_tailscale_env_key(
 
     click.echo("No output selected. Use --shell-export.", err=True)
     raise SystemExit(1)
+
+
+@main.command("setup-ssm-tokens")
+@click.option(
+    "--github-token",
+    default=None,
+    envvar="GITHUB_TOKEN",
+    help="GitHub token to store in SSM (default: auto-read from gh CLI when available).",
+)
+@click.option(
+    "--tailscale-auth-key",
+    default=None,
+    envvar="TAILSCALE_AUTH_KEY",
+    help="Tailscale auth key to store in SSM.",
+)
+@click.option(
+    "--prompt/--no-prompt",
+    default=True,
+    show_default=True,
+    help="Prompt interactively for a missing Tailscale auth key.",
+)
+@require_aws_creds
+def setup_ssm_tokens(
+    github_token: str | None,
+    tailscale_auth_key: str | None,
+    prompt: bool,
+) -> None:
+    """Store GitHub and Tailscale auth tokens in SSM Parameter Store."""
+    ssm = ssm_client()
+
+    if not github_token and shutil.which("gh"):
+        try:
+            _run_checked(["gh", "auth", "status"])
+            github_token = _run_checked(["gh", "auth", "token"]).stdout.strip()
+            if github_token:
+                click.echo("Using GitHub token from gh auth token")
+        except RuntimeError:
+            click.echo(
+                "GitHub token not detected from gh; skipping unless --github-token is provided."
+            )
+
+    if github_token:
+        ssm.put_parameter(
+            Name="/edcloud/github_token",
+            Description="GitHub personal access token for edcloud instance",
+            Type="SecureString",
+            Value=github_token,
+            Overwrite=True,
+        )
+        click.echo("Stored /edcloud/github_token")
+
+    if not tailscale_auth_key and prompt:
+        tailscale_auth_key = click.prompt(
+            "Paste your Tailscale auth key (starts with tskey-auth-, leave blank to skip)",
+            default="",
+            show_default=False,
+        ).strip()
+        tailscale_auth_key = tailscale_auth_key or None
+
+    if (
+        tailscale_auth_key
+        and not tailscale_auth_key.startswith("tskey-auth-")
+        and (
+            not prompt
+            or not click.confirm(
+                "Key does not start with tskey-auth-. Continue anyway?",
+                default=False,
+            )
+        )
+    ):
+        raise RuntimeError("Refusing to store non-standard Tailscale key.")
+
+    if tailscale_auth_key:
+        ssm.put_parameter(
+            Name="/edcloud/tailscale_auth_key",
+            Description="Tailscale auth key for edcloud instance provisioning",
+            Type="SecureString",
+            Value=tailscale_auth_key,
+            Overwrite=True,
+        )
+        click.echo("Stored /edcloud/tailscale_auth_key")
+
+    response = ssm.describe_parameters(
+        ParameterFilters=[
+            {"Key": "Name", "Option": "BeginsWith", "Values": ["/edcloud/"]},
+        ]
+    )
+    names = sorted(p["Name"] for p in response.get("Parameters", []))
+    click.echo("\nCurrent /edcloud/ parameters:")
+    for name in names:
+        click.echo(f"- {name}")
+
+
+@main.command("sync-cline-auth")
+@click.option("--remote", default="ubuntu@edcloud", show_default=True, help="Remote SSH target.")
+@click.option(
+    "--ssh-opt",
+    "ssh_opts",
+    multiple=True,
+    help="Repeatable SSH/SCP option (example: --ssh-opt -i --ssh-opt /path/key).",
+)
+@click.option(
+    "--source-secrets",
+    default="~/.cline/data/secrets.json",
+    show_default=True,
+    help="Local source secrets.json path.",
+)
+@click.option(
+    "--remote-config-dir",
+    default=".cline/data",
+    show_default=True,
+    help="Remote Cline config directory under $HOME.",
+)
+@click.option(
+    "--include-global-state/--secrets-only",
+    default=True,
+    show_default=True,
+    help="Sync globalState.json alongside secrets.json (recommended for session reuse).",
+)
+@click.option(
+    "--remote-diagnostics",
+    is_flag=True,
+    help="Run remote whoami/path/cline diagnostics before syncing.",
+)
+@click.option("--dry-run", is_flag=True, help="Print actions without changing remote state.")
+def sync_cline_auth(
+    remote: str,
+    ssh_opts: tuple[str, ...],
+    source_secrets: str,
+    remote_config_dir: str,
+    include_global_state: bool,
+    remote_diagnostics: bool,
+    dry_run: bool,
+) -> None:
+    """Sync Cline OAuth files from local machine to a remote host with backup semantics."""
+    source_secrets_path = Path(source_secrets).expanduser().resolve()
+    if not source_secrets_path.exists():
+        raise click.ClickException(f"Source secrets file not found: {source_secrets_path}")
+
+    with source_secrets_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if "openai-codex-oauth-credentials" not in payload:
+        raise click.ClickException(
+            "Missing expected key in secrets.json: openai-codex-oauth-credentials"
+        )
+
+    source_global_state = source_secrets_path.with_name("globalState.json")
+    if include_global_state and not source_global_state.exists():
+        click.echo(
+            "Warning: globalState.json not found next to secrets.json; "
+            "continuing with secrets-only sync.",
+            err=True,
+        )
+        include_global_state = False
+
+    click.echo(f"Remote target: {remote}")
+    click.echo(f"Source secrets: {source_secrets_path}")
+    if include_global_state:
+        click.echo(f"Source globalState: {source_global_state}")
+
+    if remote_diagnostics:
+        diagnostics_script = (
+            "set -euo pipefail; "
+            'echo "remote diagnostics:"; '
+            'echo "  user: $(whoami)"; '
+            'echo "  home: $HOME"; '
+            f'echo "  config_dir: $HOME/{remote_config_dir}"; '
+            "if command -v cline >/dev/null 2>&1; then "
+            'echo "  cline_path: $(command -v cline)"; '
+            'echo "  cline_version: $(cline --version 2>/dev/null || echo unknown)"; '
+            'else echo "  cline_path: missing"; fi'
+        )
+        diagnostics = _run_checked(["ssh", *ssh_opts, remote, diagnostics_script])
+        out = diagnostics.stdout.strip()
+        if out:
+            click.echo(out)
+
+    if dry_run:
+        click.echo(f"[dry-run] Would backup and sync files under ~/{remote_config_dir}/")
+        return
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    remote_backup_dir = f"{remote_config_dir}/backups"
+    remote_secrets = f"{remote_config_dir}/secrets.json"
+    remote_global_state = f"{remote_config_dir}/globalState.json"
+
+    backup_script = (
+        "set -euo pipefail; "
+        f'mkdir -p "$HOME/{remote_config_dir}" "$HOME/{remote_backup_dir}"; '
+        f'if [[ -f "$HOME/{remote_secrets}" ]]; then cp "$HOME/{remote_secrets}" '
+        f'"$HOME/{remote_backup_dir}/secrets.json.{ts}"; fi; '
+        f'if [[ {1 if include_global_state else 0} -eq 1 && -f "$HOME/{remote_global_state}" ]]; '
+        f'then cp "$HOME/{remote_global_state}" '
+        f'"$HOME/{remote_backup_dir}/globalState.json.{ts}"; fi'
+    )
+    _run_checked(["ssh", *ssh_opts, remote, backup_script])
+
+    _run_checked(
+        [
+            "scp",
+            *ssh_opts,
+            str(source_secrets_path),
+            f"{remote}:~/{remote_config_dir}/secrets.json.new",
+        ]
+    )
+    if include_global_state:
+        _run_checked(
+            [
+                "scp",
+                *ssh_opts,
+                str(source_global_state),
+                f"{remote}:~/{remote_config_dir}/globalState.json.new",
+            ]
+        )
+
+    install_script = (
+        "set -euo pipefail; "
+        f'mv "$HOME/{remote_config_dir}/secrets.json.new" "$HOME/{remote_secrets}"; '
+        f'chmod 600 "$HOME/{remote_secrets}"; '
+        f"if [[ {1 if include_global_state else 0} -eq 1 ]]; "
+        f'then mv "$HOME/{remote_config_dir}/globalState.json.new" '
+        f'"$HOME/{remote_global_state}"; chmod 600 "$HOME/{remote_global_state}"; fi'
+    )
+    _run_checked(["ssh", *ssh_opts, remote, install_script])
+
+    verify_script = (
+        "set -euo pipefail; "
+        f'test -s "$HOME/{remote_secrets}"; '
+        f"grep -q 'openai-codex-oauth-credentials' \"$HOME/{remote_secrets}\"; "
+        f"stat -c 'remote file: %n owner=%U:%G mode=%a size=%s' \"$HOME/{remote_secrets}\"; "
+        f"if [[ {1 if include_global_state else 0} -eq 1 ]]; then "
+        f'test -s "$HOME/{remote_global_state}"; '
+        f"stat -c 'remote file: %n owner=%U:%G mode=%a size=%s' \"$HOME/{remote_global_state}\"; "
+        "fi"
+    )
+    _run_checked(["ssh", *ssh_opts, remote, verify_script])
+
+    click.echo("Cline auth sync complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -625,10 +916,63 @@ def snapshot_cmd(
 
 
 # ---------------------------------------------------------------------------
+# backup-policy (AWS DLM)
+# ---------------------------------------------------------------------------
+@main.group("backup-policy")
+def backup_policy_group() -> None:
+    """Manage AWS-native DLM snapshot lifecycle policy."""
+
+
+@backup_policy_group.command("status")
+@require_aws_creds
+def backup_policy_status_cmd() -> None:
+    """Show current DLM backup policy status."""
+    status = backup_policy.policy_status()
+    click.echo(json.dumps(status, indent=2))
+
+
+@backup_policy_group.command("apply")
+@click.option("--daily-keep", default=7, type=int, show_default=True)
+@click.option("--weekly-keep", default=4, type=int, show_default=True)
+@click.option("--monthly-keep", default=2, type=int, show_default=True)
+@click.option("--disabled", is_flag=True, help="Create/update policy in DISABLED state.")
+@require_aws_creds
+def backup_policy_apply_cmd(
+    daily_keep: int,
+    weekly_keep: int,
+    monthly_keep: int,
+    disabled: bool,
+) -> None:
+    """Create or update the managed DLM backup policy."""
+    role_arn = iam.ensure_dlm_lifecycle_role(
+        {
+            "edcloud:managed": "true",
+            "Name": "edcloud",
+        }
+    )
+    result = backup_policy.ensure_policy(
+        execution_role_arn=role_arn,
+        daily_keep=daily_keep,
+        weekly_keep=weekly_keep,
+        monthly_keep=monthly_keep,
+        enabled=not disabled,
+    )
+    click.echo(json.dumps(result, indent=2))
+
+
+@backup_policy_group.command("disable")
+@require_aws_creds
+def backup_policy_disable_cmd() -> None:
+    """Disable the managed DLM backup policy."""
+    result = backup_policy.disable_policy()
+    click.echo(json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
 # verify
 # ---------------------------------------------------------------------------
 @main.command("verify")
-@click.option("--user", default="ubuntu", show_default=True, help="SSH user.")
+@click.option("--user", default=DEFAULT_SSH_USER, show_default=True, help="SSH user.")
 @click.option(
     "--public-ip",
     is_flag=True,
@@ -748,7 +1092,7 @@ def verify_cmd(user: str, public_ip: bool, json_output: bool) -> None:
 # ssh
 # ---------------------------------------------------------------------------
 @main.command("ssh", context_settings={"ignore_unknown_options": True})
-@click.option("--user", default="ubuntu", show_default=True, help="SSH user.")
+@click.option("--user", default=DEFAULT_SSH_USER, show_default=True, help="SSH user.")
 @click.option(
     "--public-ip",
     is_flag=True,
@@ -985,6 +1329,8 @@ def reprovision(
             )
         raise SystemExit(1) from exc
 
+    click.echo()
+    click.echo("Next step: run 'edc verify' to confirm rebuild health.")
     click.echo()
     click.echo(json.dumps(result, indent=2))
 

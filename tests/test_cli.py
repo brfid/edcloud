@@ -8,7 +8,7 @@ from click.testing import CliRunner
 from edcloud.cli import main
 
 
-@patch("edcloud.cli.boto3.client")
+@patch("edcloud.cli.ssm_client")
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
 @patch("edcloud.cli.get_region", return_value="us-east-1")
@@ -18,11 +18,11 @@ def test_provision_reads_tailscale_key_from_ssm(
     _mock_region,
     _mock_conflicts,
     mock_provision,
-    mock_boto3_client,
+    mock_ssm_client,
 ):
     ssm = MagicMock()
     ssm.get_parameter.return_value = {"Parameter": {"Value": "tailscale-test-key"}}
-    mock_boto3_client.return_value = ssm
+    mock_ssm_client.return_value = ssm
     mock_provision.return_value = {
         "instance_id": "i-abc123",
         "security_group_id": "sg-abc123",
@@ -47,7 +47,7 @@ def test_provision_reads_tailscale_key_from_ssm(
     assert call_kwargs["WithDecryption"] is False
 
 
-@patch("edcloud.cli.boto3.client")
+@patch("edcloud.cli.ssm_client")
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
 @patch("edcloud.cli.get_region", return_value="us-east-1")
@@ -57,11 +57,11 @@ def test_provision_reads_tailscale_key_from_ssm_envvar(
     _mock_region,
     _mock_conflicts,
     mock_provision,
-    mock_boto3_client,
+    mock_ssm_client,
 ):
     ssm = MagicMock()
     ssm.get_parameter.return_value = {"Parameter": {"Value": "exists"}}
-    mock_boto3_client.return_value = ssm
+    mock_ssm_client.return_value = ssm
     mock_provision.return_value = {
         "instance_id": "i-abc123",
         "security_group_id": "sg-abc123",
@@ -84,7 +84,7 @@ def test_provision_reads_tailscale_key_from_ssm_envvar(
     assert call_kwargs["WithDecryption"] is False
 
 
-@patch("edcloud.cli.boto3.client")
+@patch("edcloud.cli.ssm_client")
 @patch("edcloud.cli.tailscale.tailscale_available", return_value=False)
 @patch("edcloud.cli.get_region", return_value="us-east-1")
 @patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
@@ -92,7 +92,7 @@ def test_provision_requires_tailscale_key(
     _mock_creds,
     _mock_region,
     _mock_tailscale_available,
-    mock_boto3_client,
+    mock_ssm_client,
 ):
     from botocore.exceptions import ClientError
 
@@ -101,7 +101,7 @@ def test_provision_requires_tailscale_key(
         {"Error": {"Code": "ParameterNotFound"}},
         "GetParameter",
     )
-    mock_boto3_client.return_value = ssm
+    mock_ssm_client.return_value = ssm
     runner = CliRunner()
     result = runner.invoke(main, ["provision"])
 
@@ -257,6 +257,67 @@ def test_snapshot_rejects_conflicting_modes(_mock_creds, _mock_region):
     assert "use either --list or --prune" in result.output
 
 
+@patch("edcloud.cli.backup_policy.policy_status")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_backup_policy_status_outputs_json(
+    _mock_creds,
+    _mock_region,
+    mock_status,
+):
+    mock_status.return_value = {
+        "exists": True,
+        "policy_id": "policy-123",
+        "state": "ENABLED",
+    }
+    runner = CliRunner()
+    result = runner.invoke(main, ["backup-policy", "status"])
+    assert result.exit_code == 0
+    assert "policy-123" in result.output
+
+
+@patch("edcloud.cli.backup_policy.ensure_policy")
+@patch("edcloud.cli.iam.ensure_dlm_lifecycle_role")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_backup_policy_apply_uses_defaults(
+    _mock_creds,
+    _mock_region,
+    mock_ensure_role,
+    mock_ensure_policy,
+):
+    mock_ensure_role.return_value = "arn:aws:iam::123:role/edcloud-dlm-lifecycle-role"
+    mock_ensure_policy.return_value = {
+        "action": "created",
+        "policy_id": "policy-123",
+    }
+    runner = CliRunner()
+    result = runner.invoke(main, ["backup-policy", "apply"])
+    assert result.exit_code == 0
+    mock_ensure_policy.assert_called_once_with(
+        execution_role_arn="arn:aws:iam::123:role/edcloud-dlm-lifecycle-role",
+        daily_keep=7,
+        weekly_keep=4,
+        monthly_keep=2,
+        enabled=True,
+    )
+
+
+@patch("edcloud.cli.backup_policy.disable_policy")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_backup_policy_disable(
+    _mock_creds,
+    _mock_region,
+    mock_disable,
+):
+    mock_disable.return_value = {"exists": True, "state": "DISABLED"}
+    runner = CliRunner()
+    result = runner.invoke(main, ["backup-policy", "disable"])
+    assert result.exit_code == 0
+    assert "DISABLED" in result.output
+
+
 @patch("edcloud.cli.subprocess.run")
 @patch("edcloud.cli.ec2.status")
 @patch("edcloud.cli.get_region", return_value="us-east-1")
@@ -300,46 +361,211 @@ def test_verify_fails_when_remote_checks_fail(
     assert "Overall: FAIL" in result.output
 
 
-@patch("edcloud.cli.boto3.client")
+@patch("edcloud.cli._fetch_tailscale_auth_key_from_ssm", return_value="tailscale-test-key")
 @patch("edcloud.cli.get_region", return_value="us-east-1")
 @patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
 def test_load_tailscale_env_key_shell_export(
     _mock_creds,
     _mock_region,
-    mock_boto3_client,
+    _mock_fetch,
 ):
-    ssm = MagicMock()
-    ssm.get_parameter.return_value = {"Parameter": {"Value": "tailscale-test-key"}}
-    mock_boto3_client.return_value = ssm
-
     runner = CliRunner()
     result = runner.invoke(main, ["load-tailscale-env-key"])
 
     assert result.exit_code == 0
     assert "export TAILSCALE_AUTH_KEY=tailscale-test-key" in result.output
-    ssm.get_parameter.assert_called_once_with(
-        Name="/edcloud/tailscale_auth_key",
-        WithDecryption=True,
-    )
 
 
-@patch("edcloud.cli.boto3.client")
+@patch("edcloud.cli._fetch_tailscale_auth_key_from_ssm", return_value="tailscale-test-key")
 @patch("edcloud.cli.get_region", return_value="us-east-1")
 @patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
 def test_load_tailscale_env_key_requires_output_mode(
     _mock_creds,
     _mock_region,
-    mock_boto3_client,
+    _mock_fetch,
 ):
-    ssm = MagicMock()
-    ssm.get_parameter.return_value = {"Parameter": {"Value": "tailscale-test-key"}}
-    mock_boto3_client.return_value = ssm
-
     runner = CliRunner()
     result = runner.invoke(main, ["load-tailscale-env-key", "--no-shell-export"])
 
     assert result.exit_code == 1
     assert "No output selected" in result.output
+
+
+@patch("edcloud.cli.ssm_client")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_setup_ssm_tokens_stores_tokens(_mock_creds, _mock_region, mock_ssm_client):
+    ssm = MagicMock()
+    ssm.describe_parameters.return_value = {
+        "Parameters": [
+            {"Name": "/edcloud/github_token"},
+            {"Name": "/edcloud/tailscale_auth_key"},
+        ]
+    }
+    mock_ssm_client.return_value = ssm
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "setup-ssm-tokens",
+            "--github-token",
+            "ghp-test",
+            "--tailscale-auth-key",
+            "tskey-auth-test",
+            "--no-prompt",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert ssm.put_parameter.call_count == 2
+    put_calls = [call.kwargs["Name"] for call in ssm.put_parameter.call_args_list]
+    assert "/edcloud/github_token" in put_calls
+    assert "/edcloud/tailscale_auth_key" in put_calls
+
+
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_setup_ssm_tokens_rejects_nonstandard_tailscale_key_without_prompt(
+    _mock_creds, _mock_region
+):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "setup-ssm-tokens",
+            "--tailscale-auth-key",
+            "bad-key",
+            "--no-prompt",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Refusing to store non-standard Tailscale key" in result.output
+
+
+def test_sync_cline_auth_dry_run_success(tmp_path):
+    secrets_file = tmp_path / "secrets.json"
+    secrets_file.write_text(
+        '{"openai-codex-oauth-credentials": {"token": "abc"}}',
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "sync-cline-auth",
+            "--source-secrets",
+            str(secrets_file),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Would backup and sync files" in result.output
+
+
+def test_sync_cline_auth_missing_expected_key_fails(tmp_path):
+    secrets_file = tmp_path / "secrets.json"
+    secrets_file.write_text('{"other": true}', encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["sync-cline-auth", "--source-secrets", str(secrets_file), "--dry-run"],
+    )
+
+    assert result.exit_code == 1
+    assert "Missing expected key in secrets.json" in result.output
+
+
+@patch("edcloud.cli._run_checked")
+def test_sync_cline_auth_runs_ssh_scp_flow(mock_run_checked, tmp_path):
+    secrets_file = tmp_path / "secrets.json"
+    global_state_file = tmp_path / "globalState.json"
+    secrets_file.write_text(
+        '{"openai-codex-oauth-credentials": {"token": "abc"}}',
+        encoding="utf-8",
+    )
+    global_state_file.write_text('{"x": 1}', encoding="utf-8")
+
+    mock_run_checked.return_value = MagicMock(stdout="")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "sync-cline-auth",
+            "--remote",
+            "ubuntu@edcloud",
+            "--source-secrets",
+            str(secrets_file),
+            "--include-global-state",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert mock_run_checked.call_count == 5
+
+
+def test_sync_cline_auth_missing_global_state_warns_and_continues_dry_run(tmp_path):
+    secrets_file = tmp_path / "secrets.json"
+    secrets_file.write_text(
+        '{"openai-codex-oauth-credentials": {"token": "abc"}}',
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "sync-cline-auth",
+            "--source-secrets",
+            str(secrets_file),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Warning: globalState.json not found" in result.output
+    assert "Would backup and sync files" in result.output
+
+
+@patch("edcloud.cli._run_checked")
+def test_sync_cline_auth_remote_diagnostics_runs_before_sync(mock_run_checked, tmp_path):
+    secrets_file = tmp_path / "secrets.json"
+    secrets_file.write_text(
+        '{"openai-codex-oauth-credentials": {"token": "abc"}}',
+        encoding="utf-8",
+    )
+
+    mock_run_checked.side_effect = [
+        MagicMock(stdout="remote diagnostics:\n  user: ubuntu\n"),
+        MagicMock(stdout=""),
+        MagicMock(stdout=""),
+        MagicMock(stdout=""),
+        MagicMock(stdout=""),
+    ]
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "sync-cline-auth",
+            "--source-secrets",
+            str(secrets_file),
+            "--remote-diagnostics",
+            "--secrets-only",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "remote diagnostics:" in result.output
+    assert mock_run_checked.call_count == 5
+    first_cmd = mock_run_checked.call_args_list[0].args[0]
+    assert first_cmd[0] == "ssh"
+    assert "whoami" in first_cmd[-1]
 
 
 @patch("edcloud.cli.ec2.destroy")
@@ -664,6 +890,7 @@ def test_reprovision_snapshots_destroys_and_provisions(
     mock_snapshot.assert_called_once()
     mock_destroy.assert_called_once_with(force=True)
     mock_provision.assert_called_once()
+    assert "Next step: run 'edc verify' to confirm rebuild health." in result.output
 
 
 @patch("edcloud.cleanup.cleanup_orphaned_volumes", return_value=True)
