@@ -376,7 +376,17 @@ def test_destroy_with_matching_confirm_id_calls_destroy(
     mock_status.return_value = {"exists": True, "instance_id": "i-abc123"}
 
     runner = CliRunner()
-    result = runner.invoke(main, ["destroy", "--force", "--confirm-instance-id", "i-abc123"])
+    result = runner.invoke(
+        main,
+        [
+            "destroy",
+            "--force",
+            "--confirm-instance-id",
+            "i-abc123",
+            "--skip-snapshot",
+            "--skip-cleanup",
+        ],
+    )
 
     assert result.exit_code == 0
     mock_destroy.assert_called_once_with(force=True)
@@ -445,6 +455,8 @@ def test_destroy_require_fresh_snapshot_passes_with_recent_snapshot(
             "--confirm-instance-id",
             "i-abc123",
             "--require-fresh-snapshot",
+            "--skip-snapshot",
+            "--skip-cleanup",
         ],
     )
 
@@ -548,7 +560,6 @@ def test_destroy_cleanup_passes_allow_delete_state_volume(
             "--force",
             "--confirm-instance-id",
             "i-abc123",
-            "--cleanup",
             "--skip-snapshot",
             "--allow-delete-state-volume",
         ],
@@ -608,6 +619,7 @@ def test_tailscale_check_logs_warning_when_cli_not_found(
 # ---------------------------------------------------------------------------
 
 
+@patch("edcloud.cleanup.cleanup_orphaned_volumes", return_value=True)
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.ec2.destroy")
 @patch("edcloud.cli.ec2.status")
@@ -625,6 +637,7 @@ def test_reprovision_snapshots_destroys_and_provisions(
     mock_status,
     mock_destroy,
     mock_provision,
+    _mock_vol_cleanup,
 ):
     """reprovision: snapshot → destroy → provision in order."""
     mock_snapshot.return_value = ["snap-abc"]
@@ -653,6 +666,7 @@ def test_reprovision_snapshots_destroys_and_provisions(
     mock_provision.assert_called_once()
 
 
+@patch("edcloud.cleanup.cleanup_orphaned_volumes", return_value=True)
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.ec2.destroy")
 @patch("edcloud.cli.ec2.status")
@@ -670,6 +684,7 @@ def test_reprovision_skip_snapshot_skips_snapshot(
     mock_status,
     mock_destroy,
     mock_provision,
+    _mock_vol_cleanup,
 ):
     """reprovision --skip-snapshot does not call snapshot."""
     mock_status.return_value = {"exists": True, "instance_id": "i-abc123"}
@@ -697,6 +712,7 @@ def test_reprovision_skip_snapshot_skips_snapshot(
     mock_provision.assert_called_once()
 
 
+@patch("edcloud.cleanup.cleanup_orphaned_volumes", return_value=True)
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.ec2.destroy")
 @patch("edcloud.cli.ec2.status")
@@ -714,6 +730,7 @@ def test_reprovision_surfaces_snapshot_ids_on_provision_failure(
     mock_status,
     mock_destroy,
     mock_provision,
+    _mock_vol_cleanup,
 ):
     """On provision failure after destroy, snapshot IDs are shown prominently."""
     mock_snapshot.return_value = ["snap-abc123"]

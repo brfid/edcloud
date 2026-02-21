@@ -424,6 +424,15 @@ def status() -> None:
             f"Volume:    {vol['volume_id']}  {vol['size_gb']}GB {vol['type']}  ({vol['state']})"
         )
 
+    # Orphaned volume warning
+    orphaned = info.get("orphaned_volumes", [])
+    if orphaned:
+        click.echo()
+        click.echo(f"Warning: {len(orphaned)} orphaned managed volume(s) accruing cost:")
+        for vol_id in orphaned:
+            click.echo(f"  {vol_id}")
+        click.echo("  Delete manually: aws ec2 delete-volume --volume-id <id>")
+
     # Cost
     cost = info.get("cost_estimate", {})
     if cost:
@@ -457,9 +466,9 @@ def status() -> None:
     help="Maximum snapshot age for --require-fresh-snapshot.",
 )
 @click.option(
-    "--cleanup",
+    "--skip-cleanup",
     is_flag=True,
-    help="Clean up Tailscale devices and orphaned volumes after destroy.",
+    help="Skip Tailscale device and orphaned volume cleanup after destroy.",
 )
 @click.option(
     "--allow-delete-state-volume",
@@ -477,11 +486,11 @@ def destroy(
     confirm_instance_id: str | None,
     require_fresh_snapshot: bool,
     fresh_snapshot_max_age_minutes: int,
-    cleanup: bool,
+    skip_cleanup: bool,
     allow_delete_state_volume: bool,
     skip_snapshot: bool,
 ) -> None:
-    """Terminate the instance and clean up. EBS volume is preserved."""
+    """Terminate the instance and clean up. State volume is preserved."""
     if fresh_snapshot_max_age_minutes <= 0:
         click.echo("Error: --fresh-snapshot-max-age-minutes must be > 0.", err=True)
         raise SystemExit(1)
@@ -520,8 +529,8 @@ def destroy(
                 f"Using pre-change snapshot: {recent['snapshot_id']} ({recent['start_time']})"
             )
 
-    # Auto-snapshot before destroy (default, unless --skip-snapshot)
-    if cleanup and not skip_snapshot:
+    # Auto-snapshot before destroy (runs by default; skip with --skip-snapshot)
+    if not skip_snapshot:
         click.echo("Creating automatic pre-destroy snapshot...")
         try:
             snap_ids = snapshot.auto_snapshot_before_destroy()
@@ -537,8 +546,8 @@ def destroy(
 
     ec2.destroy(force=force)
 
-    # Post-destroy cleanup
-    if cleanup:
+    # Post-destroy cleanup (runs by default; skip with --skip-cleanup)
+    if not skip_cleanup:
         from edcloud import cleanup as cleanup_module
 
         click.echo()
@@ -952,6 +961,9 @@ def reprovision(
     if info.get("exists"):
         click.echo("Destroying current instance...")
         ec2.destroy(force=True)
+        from edcloud import cleanup as cleanup_module
+
+        cleanup_module.cleanup_orphaned_volumes(mode="delete", allow_delete_state=False)
         click.echo()
     else:
         click.echo("Info: no existing instance found — skipping destroy step.")
