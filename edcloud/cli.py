@@ -564,20 +564,13 @@ def destroy(
 @main.command("snapshot")
 @click.option("--list", "list_", is_flag=True, help="List existing snapshots.")
 @click.option("--description", "-d", default=None, help="Snapshot description.")
-@click.option("--prune", is_flag=True, help="Prune old periodic snapshots per retention settings.")
+@click.option("--prune", is_flag=True, help="Delete all but the most recent snapshots.")
 @click.option(
-    "--keep-weekly",
-    default=8,
-    type=int,
-    show_default=True,
-    help="Weekly snapshots to keep when pruning.",
-)
-@click.option(
-    "--keep-monthly",
+    "--keep",
     default=3,
     type=int,
     show_default=True,
-    help="Monthly snapshots to keep when pruning.",
+    help="Number of most-recent snapshots to retain when pruning.",
 )
 @click.option(
     "--dry-run/--apply",
@@ -590,8 +583,7 @@ def snapshot_cmd(
     list_: bool,
     description: str | None,
     prune: bool,
-    keep_weekly: int,
-    keep_monthly: int,
+    keep: int,
     dry_run: bool,
 ) -> None:
     """Create or list EBS snapshots."""
@@ -616,17 +608,13 @@ def snapshot_cmd(
                 f"{s['start_time'][:19]:<20} {s['description']}"
             )
     elif prune:
-        result = snapshot.prune_snapshots(
-            keep_weekly=keep_weekly,
-            keep_monthly=keep_monthly,
-            dry_run=dry_run,
-        )
+        result = snapshot.prune_snapshots(keep_last=keep, dry_run=dry_run)
         if result["delete_count"] == 0:
-            click.echo("No snapshots matched prune criteria.")
+            click.echo(f"Nothing to prune — {result['total']} snapshot(s), keep={keep}.")
             return
         click.echo(
-            f"{'Would delete' if dry_run else 'Deleting'} {result['delete_count']} snapshots "
-            f"(weekly keep={keep_weekly}, monthly keep={keep_monthly}):"
+            f"{'Would delete' if dry_run else 'Deleting'} {result['delete_count']} of "
+            f"{result['total']} snapshot(s) (keeping {keep} most recent):"
         )
         for snap in result["to_delete"]:
             click.echo(f"  {snap['snapshot_id']}  {snap['description']}")

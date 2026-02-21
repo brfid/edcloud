@@ -11,6 +11,8 @@ from edcloud.config import (
     MANAGER_TAG_KEY,
     MANAGER_TAG_VALUE,
     NAME_TAG,
+    STATE_VOLUME_ROLE,
+    VOLUME_ROLE_TAG_KEY,
     get_volume_ids,
     managed_filter,
 )
@@ -18,8 +20,6 @@ from edcloud.ec2 import find_instance, get_ec2_client
 
 log = logging.getLogger(__name__)
 
-WEEKLY_PREFIX = "weekly-snapshot"
-MONTHLY_PREFIX = "monthly-snapshot"
 PRECHANGE_SNAPSHOT_PREFIX = "pre-change"
 _SNAPSHOT_WAIT_TIMEOUT_S = 600
 _SNAPSHOT_WAIT_POLL_S = 15
@@ -157,9 +157,21 @@ def create_snapshot(description: str | None = None) -> list[str]:
         raise RuntimeError("No edcloud instance found. Nothing to snapshot.")
 
     iid = inst["InstanceId"]
-    vol_ids = get_volume_ids(inst)
-    if not vol_ids:
+    all_vol_ids = get_volume_ids(inst)
+    if not all_vol_ids:
         raise RuntimeError(f"No EBS volumes found on instance {iid}.")
+
+    # Only snapshot state volumes — root is disposable and rebuilt by cloud-init.
+    vol_resp = ec2.describe_volumes(VolumeIds=all_vol_ids)
+    vol_ids = [
+        v["VolumeId"]
+        for v in vol_resp.get("Volumes", [])
+        if {t["Key"]: t["Value"] for t in v.get("Tags", [])}.get(VOLUME_ROLE_TAG_KEY)
+        == STATE_VOLUME_ROLE
+    ]
+    if not vol_ids:
+        log.warning("No state-tagged volumes found; snapshotting all volumes as fallback.")
+        vol_ids = all_vol_ids
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M")
     desc = description or f"edcloud snapshot {ts}"
@@ -223,49 +235,40 @@ def list_snapshots() -> list[dict[str, Any]]:
 
 
 def prune_snapshots(
-    keep_weekly: int = 8,
-    keep_monthly: int = 3,
+    keep_last: int = 3,
     dry_run: bool = True,
 ) -> dict[str, Any]:
-    """Prune old periodic snapshots per a retention policy.
+    """Delete all but the most recent *keep_last* snapshots.
 
-    Retention:
-        * Keep newest *keep_weekly* snapshots prefixed ``weekly-snapshot``.
-        * Keep newest *keep_monthly* snapshots prefixed ``monthly-snapshot``.
-        * Snapshots with other descriptions (e.g. ``pre-change``) are never pruned.
+    Snapshots are ordered newest-first; the oldest beyond *keep_last* are
+    removed.  All snapshots are eligible regardless of description prefix.
 
     Args:
-        keep_weekly: Number of weekly snapshots to retain.
-        keep_monthly: Number of monthly snapshots to retain.
+        keep_last: Number of most-recent snapshots to retain.
         dry_run: Preview deletions without applying when ``True``.
 
     Returns:
         Summary dict with counts and the list of snapshots to delete.
 
     Raises:
-        ValueError: If retention counts are negative.
+        ValueError: If *keep_last* is negative.
     """
-    if keep_weekly < 0 or keep_monthly < 0:
-        raise ValueError("Retention counts must be >= 0.")
+    if keep_last < 0:
+        raise ValueError("keep_last must be >= 0.")
 
     ec2 = get_ec2_client()
-    snapshots = list_snapshots()
+    snapshots = list_snapshots()  # newest first
 
-    weekly = [s for s in snapshots if s["description"].startswith(WEEKLY_PREFIX)]
-    monthly = [s for s in snapshots if s["description"].startswith(MONTHLY_PREFIX)]
-
-    to_delete = [*weekly[keep_weekly:], *monthly[keep_monthly:]]
+    to_delete = snapshots[keep_last:]
 
     if not dry_run:
         for snap in to_delete:
             ec2.delete_snapshot(SnapshotId=snap["snapshot_id"])
 
     return {
-        "keep_weekly": keep_weekly,
-        "keep_monthly": keep_monthly,
+        "keep_last": keep_last,
         "dry_run": dry_run,
-        "weekly_total": len(weekly),
-        "monthly_total": len(monthly),
+        "total": len(snapshots),
         "delete_count": len(to_delete),
         "to_delete": to_delete,
     }
