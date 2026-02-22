@@ -1,13 +1,15 @@
 {
 	"folders": [
 		{
-			"name": "edcloud",
 			"path": "."
 		}
 	],
 	"settings": {
 		"chat.tools.terminal.autoApprove": {
-			"pip": true
+			"pip": true,
+			".venv/bin/pip": true,
+			".venv/bin/pytest": true,
+			".venv/bin/ruff": true
 		}
 	}
 }

@@ -1,37 +1,51 @@
-"""EBS snapshot management."""
+"""EBS snapshot management: create, list, and prune edcloud snapshots."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
 
-import boto3
-
-from edcloud.config import MANAGER_TAG_KEY, MANAGER_TAG_VALUE, NAME_TAG
-from edcloud.ec2 import _find_instance, _managed_filter
+from edcloud.config import (
+    MANAGER_TAG_KEY,
+    MANAGER_TAG_VALUE,
+    NAME_TAG,
+    get_volume_ids,
+    managed_filter,
+)
+from edcloud.ec2 import _ec2_client, _find_instance
 
 WEEKLY_PREFIX = "weekly-snapshot"
 MONTHLY_PREFIX = "monthly-snapshot"
 
 
-def _ec2_client() -> Any:
-    return boto3.client("ec2")
+def auto_snapshot_before_destroy() -> list[str]:
+    """Snapshot all volumes of the current instance before a destructive op.
 
+    Returns:
+        List of snapshot IDs created, or empty list if no instance exists.
+    """
+    ec2 = _ec2_client()
+    inst = _find_instance(ec2)
+    if not inst:
+        # No instance to snapshot
+        return []
 
-def _get_volume_ids(instance: dict[str, Any]) -> list[str]:
-    """Extract EBS volume IDs from an instance description."""
-    vol_ids = []
-    for bdm in instance.get("BlockDeviceMappings", []):
-        vid = bdm.get("Ebs", {}).get("VolumeId")
-        if vid:
-            vol_ids.append(vid)
-    return vol_ids
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
+    description = f"auto-pre-destroy-{ts}"
+    return create_snapshot(description)
 
 
 def create_snapshot(description: str | None = None) -> list[str]:
-    """Snapshot all EBS volumes attached to the edcloud instance.
+    """Snapshot every EBS volume attached to the edcloud instance.
 
-    Returns list of snapshot IDs.
+    Args:
+        description: Optional description; auto-generated if omitted.
+
+    Returns:
+        List of created snapshot IDs.
+
+    Raises:
+        RuntimeError: If no instance or no volumes are found.
     """
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
@@ -39,7 +53,7 @@ def create_snapshot(description: str | None = None) -> list[str]:
         raise RuntimeError("No edcloud instance found. Nothing to snapshot.")
 
     iid = inst["InstanceId"]
-    vol_ids = _get_volume_ids(inst)
+    vol_ids = get_volume_ids(inst)
     if not vol_ids:
         raise RuntimeError(f"No EBS volumes found on instance {iid}.")
 
@@ -74,10 +88,15 @@ def create_snapshot(description: str | None = None) -> list[str]:
 
 
 def list_snapshots() -> list[dict[str, Any]]:
-    """List all edcloud-managed snapshots."""
+    """List all edcloud-managed snapshots, most recent first.
+
+    Returns:
+        Dicts with keys: ``snapshot_id``, ``volume_id``, ``size_gb``,
+        ``state``, ``progress``, ``start_time``, ``description``, ``name``.
+    """
     ec2 = _ec2_client()
     resp = ec2.describe_snapshots(
-        Filters=_managed_filter(),
+        Filters=managed_filter(),
         OwnerIds=["self"],
     )
     snapshots = []
@@ -105,13 +124,23 @@ def prune_snapshots(
     keep_monthly: int = 3,
     dry_run: bool = True,
 ) -> dict[str, Any]:
-    """Prune old periodic snapshots.
+    """Prune old periodic snapshots per a retention policy.
 
-    Retention policy:
-    - Keep newest ``keep_weekly`` snapshots whose description starts with ``weekly-snapshot``.
-    - Keep newest ``keep_monthly`` snapshots whose description starts with ``monthly-snapshot``.
+    Retention:
+        * Keep newest *keep_weekly* snapshots prefixed ``weekly-snapshot``.
+        * Keep newest *keep_monthly* snapshots prefixed ``monthly-snapshot``.
+        * Snapshots with other descriptions (e.g. ``pre-change``) are never pruned.
 
-    Snapshots with other descriptions (for example pre-change snapshots) are not pruned.
+    Args:
+        keep_weekly: Number of weekly snapshots to retain.
+        keep_monthly: Number of monthly snapshots to retain.
+        dry_run: Preview deletions without applying when ``True``.
+
+    Returns:
+        Summary dict with counts and the list of snapshots to delete.
+
+    Raises:
+        ValueError: If retention counts are negative.
     """
     if keep_weekly < 0 or keep_monthly < 0:
         raise ValueError("Retention counts must be >= 0.")

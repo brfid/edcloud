@@ -1,33 +1,50 @@
-"""EC2 lifecycle: provision, start, stop, status, destroy.
+"""EC2 lifecycle management: provision, start, stop, status, destroy.
 
-Resources are tracked by AWS tags (no local state file needed).
+Resources are tracked by AWS tags — no local state file needed.
 Tag ``edcloud:managed = true`` identifies all managed resources.
 """
 
 from __future__ import annotations
 
+import re
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError
 
+from edcloud.aws_check import get_region
 from edcloud.config import (
+    DEFAULT_HOURS_PER_DAY,
+    EBS_MONTHLY_RATE_PER_GB,
+    HOURLY_RATES,
     MANAGER_TAG_KEY,
     MANAGER_TAG_VALUE,
     NAME_TAG,
+    ROOT_VOLUME_ROLE,
     SECURITY_GROUP_DESC,
     SECURITY_GROUP_NAME,
+    STATE_VOLUME_ROLE,
+    VOLUME_ROLE_TAG_KEY,
     InstanceConfig,
+    get_volume_ids,
+    has_managed_tag,
+    managed_filter,
 )
+from edcloud.iam import delete_instance_profile, ensure_instance_profile
 
 _USER_DATA_PATH = Path(__file__).resolve().parent.parent / "cloud-init" / "user-data.yaml"
 _ACTIVE_INSTANCE_STATES = ["pending", "running", "stopping", "stopped"]
 
 
 class TagDriftError(RuntimeError):
-    """Tag-based discovery invariants were violated."""
+    """Tag-based discovery invariants were violated.
+
+    Raised when managed-resource tags are missing, duplicated, or
+    inconsistent — situations that cannot be resolved automatically.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -36,40 +53,32 @@ class TagDriftError(RuntimeError):
 
 
 def _ec2_client() -> Any:
+    """Return a low-level EC2 client."""
     return boto3.client("ec2")
 
 
 def _ec2_resource() -> Any:
+    """Return a high-level EC2 resource."""
     return boto3.resource("ec2")
 
 
 def _ssm_client() -> Any:
+    """Return a low-level SSM client."""
     return boto3.client("ssm")
 
 
-def _managed_filter() -> list[dict[str, Any]]:
-    """Tag filter that matches edcloud-managed resources."""
-    return [{"Name": f"tag:{MANAGER_TAG_KEY}", "Values": [MANAGER_TAG_VALUE]}]
-
-
 def _instance_state_filter() -> dict[str, Any]:
+    """Filter clause limiting results to non-terminated instance states."""
     return {"Name": "instance-state-name", "Values": _ACTIVE_INSTANCE_STATES}
 
 
-def _has_managed_tag(tags: list[dict[str, str]] | None) -> bool:
-    if not tags:
-        return False
-    for tag in tags:
-        if tag.get("Key") == MANAGER_TAG_KEY and tag.get("Value") == MANAGER_TAG_VALUE:
-            return True
-    return False
-
-
 def _instance_summary(instances: list[dict[str, Any]]) -> str:
+    """Format a compact ``id (state)`` summary for one or more instances."""
     return ", ".join(f"{i['InstanceId']} ({i['State']['Name']})" for i in instances)
 
 
 def _list_instances(client: Any, filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Describe instances matching *filters*, excluding terminated ones."""
     resp = client.describe_instances(Filters=[*filters, _instance_state_filter()])
     instances: list[dict[str, Any]] = []
     for reservation in resp.get("Reservations", []):
@@ -78,18 +87,18 @@ def _list_instances(client: Any, filters: list[dict[str, Any]]) -> list[dict[str
 
 
 def _validate_instance_volume_tags(client: Any, instance: dict[str, Any]) -> None:
-    """Ensure attached volumes keep the managed tag."""
-    volume_ids = [
-        bdm.get("Ebs", {}).get("VolumeId")
-        for bdm in instance.get("BlockDeviceMappings", [])
-        if bdm.get("Ebs", {}).get("VolumeId")
-    ]
+    """Ensure every volume attached to *instance* carries the managed tag.
+
+    Raises:
+        TagDriftError: If any attached volume is missing the managed tag.
+    """
+    volume_ids = get_volume_ids(instance)
     if not volume_ids:
         return
 
     resp = client.describe_volumes(VolumeIds=volume_ids)
     untagged = [
-        v["VolumeId"] for v in resp.get("Volumes", []) if not _has_managed_tag(v.get("Tags", []))
+        v["VolumeId"] for v in resp.get("Volumes", []) if not has_managed_tag(v.get("Tags", []))
     ]
     if not untagged:
         return
@@ -105,16 +114,20 @@ def _validate_instance_volume_tags(client: Any, instance: dict[str, Any]) -> Non
 
 
 def _managed_orphan_report(client: Any) -> dict[str, list[str]]:
-    """Return orphaned managed resources outside an active managed instance."""
+    """Scan for managed resources not attached to an active instance.
+
+    Returns:
+        Dict with ``security_groups`` and ``volumes`` lists of orphaned IDs.
+    """
     report: dict[str, list[str]] = {"security_groups": [], "volumes": []}
 
-    sg_resp = client.describe_security_groups(Filters=_managed_filter())
+    sg_resp = client.describe_security_groups(Filters=managed_filter())
     for sg in sg_resp.get("SecurityGroups", []):
         group_name = sg.get("GroupName")
         if group_name == SECURITY_GROUP_NAME:
             report["security_groups"].append(sg["GroupId"])
 
-    vol_resp = client.describe_volumes(Filters=_managed_filter())
+    vol_resp = client.describe_volumes(Filters=managed_filter())
     for volume in vol_resp.get("Volumes", []):
         if volume.get("State") == "available":
             report["volumes"].append(volume["VolumeId"])
@@ -123,6 +136,7 @@ def _managed_orphan_report(client: Any) -> dict[str, list[str]]:
 
 
 def _orphaned_resources_text(report: dict[str, list[str]]) -> str:
+    """Render human-readable lines for orphaned-resource IDs."""
     lines: list[str] = []
     security_groups = report.get("security_groups", [])
     volumes = report.get("volumes", [])
@@ -139,9 +153,75 @@ def _apply_tags(client: Any, resource_ids: list[str], tags: dict[str, str]) -> N
     client.create_tags(Resources=resource_ids, Tags=tag_list)
 
 
+def _find_orphaned_state_volume_id(client: Any) -> str | None:
+    """Return the single available managed state volume ID, if present.
+
+    Raises:
+        TagDriftError: If multiple available state volumes exist.
+    """
+    resp = client.describe_volumes(
+        Filters=[
+            {"Name": f"tag:{MANAGER_TAG_KEY}", "Values": [MANAGER_TAG_VALUE]},
+            {"Name": f"tag:{VOLUME_ROLE_TAG_KEY}", "Values": [STATE_VOLUME_ROLE]},
+            {"Name": "status", "Values": ["available"]},
+        ]
+    )
+    vols = [v["VolumeId"] for v in resp.get("Volumes", [])]
+    if not vols:
+        return None
+    if len(vols) > 1:
+        raise TagDriftError(
+            "Tag drift detected: multiple available managed state volumes found: "
+            f"{', '.join(vols)}\n"
+            "Remediation: keep a single state volume for this environment."
+        )
+    return str(vols[0])
+
+
+def _state_volume_az(client: Any, volume_id: str) -> str:
+    """Return the availability zone of an EBS volume.
+
+    Raises:
+        RuntimeError: If the volume is not found.
+    """
+    resp = client.describe_volumes(VolumeIds=[volume_id])
+    volumes = resp.get("Volumes", [])
+    if not volumes:
+        raise RuntimeError(f"State volume not found: {volume_id}")
+    return str(volumes[0]["AvailabilityZone"])
+
+
+def _default_subnet_for_az(client: Any, az: str) -> str:
+    """Return the default subnet ID in a given availability zone.
+
+    Raises:
+        RuntimeError: If no default subnet exists in the AZ.
+    """
+    resp = client.describe_subnets(
+        Filters=[
+            {"Name": "availability-zone", "Values": [az]},
+            {"Name": "default-for-az", "Values": ["true"]},
+        ]
+    )
+    subnets = resp.get("Subnets", [])
+    if not subnets:
+        raise RuntimeError(
+            f"No default subnet found in AZ {az}. "
+            "Create/enable a default subnet in this AZ or choose a state volume in a supported AZ."
+        )
+    return str(subnets[0]["SubnetId"])
+
+
 def _find_instance(client: Any) -> dict[str, Any] | None:
-    """Find the single edcloud-managed instance (any state except terminated)."""
-    managed_instances = _list_instances(client, _managed_filter())
+    """Locate the single edcloud-managed instance (any non-terminated state).
+
+    Returns:
+        Instance dict from ``describe_instances``, or ``None``.
+
+    Raises:
+        TagDriftError: On duplicate managed instances or missing tags.
+    """
+    managed_instances = _list_instances(client, managed_filter())
     if len(managed_instances) > 1:
         raise TagDriftError(
             "Tag drift detected: multiple managed instances found: "
@@ -152,7 +232,7 @@ def _find_instance(client: Any) -> dict[str, Any] | None:
 
     if not managed_instances:
         named_instances = _list_instances(client, [{"Name": "tag:Name", "Values": [NAME_TAG]}])
-        untagged_named = [i for i in named_instances if not _has_managed_tag(i.get("Tags", []))]
+        untagged_named = [i for i in named_instances if not has_managed_tag(i.get("Tags", []))]
         if untagged_named:
             instance_ids = " ".join(i["InstanceId"] for i in untagged_named)
             instance_list = ", ".join(i["InstanceId"] for i in untagged_named)
@@ -172,7 +252,11 @@ def _find_instance(client: Any) -> dict[str, Any] | None:
 
 
 def _find_security_group(client: Any) -> str | None:
-    """Return the edcloud security group ID, or None."""
+    """Return the edcloud security-group ID, or ``None`` if it doesn't exist.
+
+    Raises:
+        TagDriftError: On duplicate or untagged security groups.
+    """
     try:
         resp = client.describe_security_groups(
             Filters=[{"Name": "group-name", "Values": [SECURITY_GROUP_NAME]}]
@@ -181,8 +265,8 @@ def _find_security_group(client: Any) -> str | None:
         return None
 
     groups = resp.get("SecurityGroups", [])
-    managed_groups = [g for g in groups if _has_managed_tag(g.get("Tags", []))]
-    unmanaged_groups = [g for g in groups if not _has_managed_tag(g.get("Tags", []))]
+    managed_groups = [g for g in groups if has_managed_tag(g.get("Tags", []))]
+    unmanaged_groups = [g for g in groups if not has_managed_tag(g.get("Tags", []))]
 
     if len(managed_groups) > 1:
         raise TagDriftError(
@@ -216,11 +300,15 @@ def _find_security_group(client: Any) -> str | None:
 
 
 def _resolve_ami(ssm_parameter: str) -> str:
-    """Resolve an AMI ID from an SSM public parameter."""
+    """Resolve an AMI ID from an SSM public parameter.
+
+    Falls back to a ``describe_images`` search if the SSM parameter is
+    missing.
+    """
     ssm = _ssm_client()
     try:
         resp = ssm.get_parameter(Name=ssm_parameter)
-        return resp["Parameter"]["Value"]  # type: ignore[no-any-return]
+        return str(resp["Parameter"]["Value"])
     except ClientError as exc:
         # Fallback: if SSM parameter path doesn't work, use a direct lookup
         if "ParameterNotFound" in str(exc):
@@ -239,24 +327,111 @@ def _resolve_ami(ssm_parameter: str) -> str:
             )
             images = sorted(resp["Images"], key=lambda x: x["CreationDate"], reverse=True)
             if images:
-                return images[0]["ImageId"]  # type: ignore[no-any-return]
+                return str(images[0]["ImageId"])
         raise
 
 
 def _get_default_vpc_id(client: Any) -> str:
-    """Get the default VPC ID."""
+    """Return the default VPC ID.
+
+    Raises:
+        RuntimeError: If no default VPC exists.
+    """
     resp = client.describe_vpcs(Filters=[{"Name": "is-default", "Values": ["true"]}])
     vpcs = resp.get("Vpcs", [])
     if not vpcs:
         raise RuntimeError("No default VPC found. Create one or specify a VPC ID.")
-    return vpcs[0]["VpcId"]  # type: ignore[no-any-return]
+    return str(vpcs[0]["VpcId"])
 
 
-def _render_user_data(tailscale_auth_key: str, tailscale_hostname: str) -> str:
-    """Read cloud-init template and interpolate variables."""
+def _get_aws_region() -> str:
+    """Return the current AWS region from the boto3 session.
+
+    Raises:
+        RuntimeError: If no region is configured.
+    """
+    region = get_region()
+    if not region:
+        raise RuntimeError(
+            "No AWS region configured. Set AWS_DEFAULT_REGION or run 'aws configure'."
+        )
+    return region
+
+
+def _validate_user_data_inputs(
+    tailscale_hostname: str,
+    tailscale_auth_key: str | None = None,
+    tailscale_auth_key_ssm_parameter: str | None = None,
+    aws_region: str | None = None,
+) -> None:
+    """Validate user-data template inputs to prevent injection attacks.
+
+    Args:
+        tailscale_hostname: DNS-safe hostname (1-63 chars, alphanumeric/hyphen).
+        tailscale_auth_key: Raw auth key value (checked for shell-dangerous chars).
+        tailscale_auth_key_ssm_parameter: SSM parameter path (path-safe chars only).
+        aws_region: AWS region string (e.g. ``us-east-1``).
+
+    Raises:
+        ValueError: If any input contains invalid or dangerous characters.
+    """
+    # Validate hostname: DNS-safe, 1-63 chars
+    if not re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$", tailscale_hostname):
+        raise ValueError(
+            f"Invalid tailscale_hostname: {tailscale_hostname!r}. "
+            "Must be 1-63 alphanumeric/hyphen characters, cannot start/end with hyphen."
+        )
+
+    # Validate auth key if provided (transitional, for old flow)
+    if tailscale_auth_key is not None:
+        dangerous_chars = ["\n", "\r", "`", "$(", "${", ";", "'", '"', "|", "&"]
+        for char in dangerous_chars:
+            if char in tailscale_auth_key:
+                raise ValueError(
+                    f"Invalid tailscale_auth_key: contains dangerous character {char!r}"
+                )
+
+    # Validate SSM parameter path if provided
+    if tailscale_auth_key_ssm_parameter is not None and not re.match(
+        r"^[a-zA-Z0-9/_.-]+$", tailscale_auth_key_ssm_parameter
+    ):
+        raise ValueError(
+            f"Invalid tailscale_auth_key_ssm_parameter: {tailscale_auth_key_ssm_parameter!r}. "
+            "Must contain only alphanumeric, /, _, ., - characters."
+        )
+
+    # Validate AWS region if provided
+    if aws_region is not None and not re.match(r"^[a-z]{2}(-[a-z]+-[0-9]+)?$", aws_region):
+        raise ValueError(
+            f"Invalid aws_region: {aws_region!r}. Must match AWS region format (e.g., us-east-1)."
+        )
+
+
+def _render_user_data(
+    tailscale_auth_key_ssm_parameter: str,
+    tailscale_hostname: str,
+    aws_region: str,
+) -> str:
+    """Read the cloud-init template and interpolate runtime variables.
+
+    Args:
+        tailscale_auth_key_ssm_parameter: SSM parameter the instance reads at boot.
+        tailscale_hostname: MagicDNS hostname to register.
+        aws_region: Region for SSM API calls from the instance.
+
+    Returns:
+        Rendered user-data string ready for RunInstances.
+    """
+    _validate_user_data_inputs(
+        tailscale_hostname=tailscale_hostname,
+        tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
+        aws_region=aws_region,
+    )
     template = _USER_DATA_PATH.read_text()
-    return template.replace("${TAILSCALE_AUTH_KEY}", tailscale_auth_key).replace(
-        "${TAILSCALE_HOSTNAME}", tailscale_hostname
+    return (
+        template.replace("${TAILSCALE_AUTH_KEY_SSM_PARAMETER}", tailscale_auth_key_ssm_parameter)
+        .replace("${TAILSCALE_HOSTNAME}", tailscale_hostname)
+        .replace("${AWS_REGION}", aws_region)
     )
 
 
@@ -265,10 +440,25 @@ def _render_user_data(tailscale_auth_key: str, tailscale_hostname: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def provision(cfg: InstanceConfig, tailscale_auth_key: str) -> dict[str, str]:
+def provision(
+    cfg: InstanceConfig,
+    require_existing_state_volume: bool = False,
+) -> dict[str, str]:
     """Create the edcloud instance from scratch.
 
-    Returns dict with instance_id, security_group_id, public_ip (if any).
+    The Tailscale auth key is fetched from SSM at boot time by the instance
+    itself.
+
+    Args:
+        cfg: Resolved instance configuration.
+        require_existing_state_volume: If ``True``, abort when no reusable
+            managed state volume is available.
+
+    Returns:
+        Dict with keys ``instance_id``, ``security_group_id``, ``public_ip``.
+
+    Raises:
+        RuntimeError: If an instance already exists, or provisioning fails.
     """
     ec2 = _ec2_client()
 
@@ -295,7 +485,7 @@ def provision(cfg: InstanceConfig, tailscale_auth_key: str) -> dict[str, str]:
             Description=SECURITY_GROUP_DESC,
             VpcId=vpc_id,
         )
-        sg_id = resp["GroupId"]
+        sg_id = str(resp["GroupId"])
         _apply_tags(ec2, [sg_id], cfg.tags)
 
         # Revoke the default "allow all outbound" rule? No — we need outbound
@@ -303,22 +493,63 @@ def provision(cfg: InstanceConfig, tailscale_auth_key: str) -> dict[str, str]:
         # No inbound rules: all access comes via Tailscale tunnel.
         print(f"  Created security group: {sg_id} (no inbound rules)")
 
-    # 2. Resolve AMI -----------------------------------------------------------
+    # 2. IAM instance profile -------------------------------------------------
+    profile_arn = ensure_instance_profile(cfg.tags)
+    print(f"  Instance profile: {profile_arn}")
+
+    # 3. Resolve AMI -----------------------------------------------------------
     ami_id = _resolve_ami(cfg.ami_ssm_parameter)
     print(f"  AMI: {ami_id}")
 
-    # 3. User-data script ------------------------------------------------------
-    user_data = _render_user_data(tailscale_auth_key, cfg.tailscale_hostname)
+    # 4. User-data script ------------------------------------------------------
+    aws_region = _get_aws_region()
+    user_data = _render_user_data(
+        tailscale_auth_key_ssm_parameter=cfg.tailscale_auth_key_ssm_parameter,
+        tailscale_hostname=cfg.tailscale_hostname,
+        aws_region=aws_region,
+    )
+    print(f"  Tailscale auth key will be fetched from SSM: {cfg.tailscale_auth_key_ssm_parameter}")
+
+    # 3.5 Prefer reusing existing managed state volume when available ----------
+    reused_state_volume_id = _find_orphaned_state_volume_id(ec2)
+
+    if require_existing_state_volume and not reused_state_volume_id:
+        raise RuntimeError(
+            "No reusable managed state volume found. "
+            "Refusing provision due to --require-existing-state-volume."
+        )
+
+    if reused_state_volume_id:
+        state_mapping: dict[str, Any] | None = None
+        print(f"  Reusing managed state volume: {reused_state_volume_id}")
+        state_volume_az = _state_volume_az(ec2, reused_state_volume_id)
+        subnet_id = _default_subnet_for_az(ec2, state_volume_az)
+        print(f"  Launching instance in {state_volume_az} to match reused state volume")
+    else:
+        state_mapping = {
+            "DeviceName": cfg.state_volume_device_name,
+            "Ebs": {
+                "VolumeSize": cfg.state_volume_size_gb,
+                "VolumeType": cfg.state_volume_type,
+                "DeleteOnTermination": False,
+                "Encrypted": True,
+            },
+        }
+        print("  No reusable managed state volume found; creating new state volume.")
+        subnet_id = None
 
     # 4. Launch instance -------------------------------------------------------
-    run_resp = ec2.run_instances(
-        ImageId=ami_id,
-        InstanceType=cfg.instance_type,
-        MinCount=1,
-        MaxCount=1,
-        SecurityGroupIds=[sg_id],
-        UserData=user_data,
-        BlockDeviceMappings=[
+    # IAM instance profile creation can be eventually consistent. Retry launch
+    # briefly when AWS returns transient invalid-profile errors.
+    run_kwargs: dict[str, Any] = {
+        "ImageId": ami_id,
+        "InstanceType": cfg.instance_type,
+        "MinCount": 1,
+        "MaxCount": 1,
+        "SecurityGroupIds": [sg_id],
+        "IamInstanceProfile": {"Arn": profile_arn},
+        "UserData": user_data,
+        "BlockDeviceMappings": [
             {
                 "DeviceName": "/dev/sda1",
                 "Ebs": {
@@ -328,17 +559,9 @@ def provision(cfg: InstanceConfig, tailscale_auth_key: str) -> dict[str, str]:
                     "Encrypted": True,
                 },
             },
-            {
-                "DeviceName": cfg.state_volume_device_name,
-                "Ebs": {
-                    "VolumeSize": cfg.state_volume_size_gb,
-                    "VolumeType": cfg.state_volume_type,
-                    "DeleteOnTermination": False,
-                    "Encrypted": True,
-                },
-            },
+            *([state_mapping] if state_mapping else []),
         ],
-        TagSpecifications=[
+        "TagSpecifications": [
             {
                 "ResourceType": "instance",
                 "Tags": [{"Key": k, "Value": v} for k, v in cfg.tags.items()],
@@ -349,23 +572,104 @@ def provision(cfg: InstanceConfig, tailscale_auth_key: str) -> dict[str, str]:
             },
         ],
         # No key pair — SSH access is via Tailscale + instance connect or SSM
-        MetadataOptions={
+        "MetadataOptions": {
             "HttpTokens": "required",  # IMDSv2 only
             "HttpEndpoint": "enabled",
+            "HttpPutResponseHopLimit": 1,  # Prevent containers from reaching IMDS
         },
-    )
+    }
+    if subnet_id is not None:
+        run_kwargs["SubnetId"] = subnet_id
+
+    run_resp = None
+    for attempt in range(1, 13):
+        try:
+            run_resp = ec2.run_instances(**run_kwargs)
+            break
+        except ClientError as exc:
+            msg = str(exc)
+            if (
+                "Invalid IAM Instance Profile" in msg
+                or ("InvalidParameterValue" in msg and "iamInstanceProfile" in msg)
+            ) and attempt < 12:
+                print("  IAM instance profile not yet propagated; retrying launch...")
+                time.sleep(5)
+                continue
+            raise
+
+    if run_resp is None:
+        raise RuntimeError("Failed to launch instance after IAM profile propagation retries.")
 
     instance_id = run_resp["Instances"][0]["InstanceId"]
     print(f"  Instance launched: {instance_id}")
+
+    # If reusing an existing state volume, attach it explicitly.
+    # AWS RunInstances BlockDeviceMappings does not support attaching by VolumeId.
+    if reused_state_volume_id:
+        print(f"  Attaching reused state volume {reused_state_volume_id} to {instance_id}...")
+        for _attempt in range(12):
+            try:
+                ec2.attach_volume(
+                    VolumeId=reused_state_volume_id,
+                    InstanceId=instance_id,
+                    Device=cfg.state_volume_device_name,
+                )
+                break
+            except ClientError as exc:
+                msg = str(exc)
+                if "IncorrectState" in msg or "is not 'available'" in msg:
+                    time.sleep(2)
+                    continue
+                if "VolumeInUse" in msg or "already attached" in msg:
+                    # Another concurrent provision likely attached the shared
+                    # state volume first. Clean up this duplicate instance to
+                    # avoid managed-instance tag drift.
+                    print(
+                        "  State volume is already attached elsewhere; "
+                        f"terminating duplicate instance {instance_id}."
+                    )
+                    with suppress(ClientError):
+                        ec2.terminate_instances(InstanceIds=[instance_id])
+                    raise RuntimeError(
+                        "Provision aborted: reusable state volume is already attached to "
+                        "another instance (likely concurrent provision). "
+                        "Retry once only after confirming a single managed instance exists."
+                    ) from exc
+                raise
+        else:
+            raise RuntimeError(
+                f"Failed to attach reused state volume {reused_state_volume_id} to {instance_id}."
+            )
 
     # 5. Wait for running ------------------------------------------------------
     print("  Waiting for instance to reach 'running' state...")
     waiter = ec2.get_waiter("instance_running")
     waiter.wait(InstanceIds=[instance_id])
 
+    # Refresh and ensure volume role tags are explicit (root/state)
+    inst = _find_instance(ec2)
+    if inst:
+        bdm = inst.get("BlockDeviceMappings", [])
+        root_vol_id = None
+        state_vol_id = None
+        for m in bdm:
+            dev = m.get("DeviceName")
+            vol_id = m.get("Ebs", {}).get("VolumeId")
+            if not vol_id:
+                continue
+            if dev == "/dev/sda1":
+                root_vol_id = vol_id
+            if dev == cfg.state_volume_device_name:
+                state_vol_id = vol_id
+
+        if root_vol_id:
+            _apply_tags(ec2, [root_vol_id], {VOLUME_ROLE_TAG_KEY: ROOT_VOLUME_ROLE})
+        if state_vol_id:
+            _apply_tags(ec2, [state_vol_id], {VOLUME_ROLE_TAG_KEY: STATE_VOLUME_ROLE})
+
     # Refresh instance data
     inst = _find_instance(ec2)
-    public_ip = (inst or {}).get("PublicIpAddress", "none")
+    public_ip = str((inst or {}).get("PublicIpAddress", "none"))
 
     print(f"  Instance running. Public IP: {public_ip}")
     print(f"  Tailscale hostname will be: {cfg.tailscale_hostname}")
@@ -374,14 +678,22 @@ def provision(cfg: InstanceConfig, tailscale_auth_key: str) -> dict[str, str]:
     print("  This takes 2-3 minutes. Run 'edc status' to check progress.")
 
     return {
-        "instance_id": instance_id,
-        "security_group_id": sg_id,
+        "instance_id": str(instance_id),
+        "security_group_id": str(sg_id),
         "public_ip": public_ip,
     }
 
 
 def start() -> str:
-    """Start a stopped edcloud instance. Returns instance ID."""
+    """Start a stopped edcloud instance.
+
+    Returns:
+        The instance ID.
+
+    Raises:
+        RuntimeError: If no instance exists or it isn't in ``stopped`` state.
+        TagDriftError: If orphaned managed resources are found instead.
+    """
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
     if not inst:
@@ -395,7 +707,7 @@ def start() -> str:
             )
         raise RuntimeError("No edcloud instance found. Run 'edc provision' first.")
 
-    iid = inst["InstanceId"]
+    iid = str(inst["InstanceId"])
     state = inst["State"]["Name"]
 
     if state == "running":
@@ -413,13 +725,21 @@ def start() -> str:
 
     # Refresh for new IP
     inst = _find_instance(ec2)
-    public_ip = (inst or {}).get("PublicIpAddress", "none")
+    public_ip = str((inst or {}).get("PublicIpAddress", "none"))
     print(f"Instance running. Public IP: {public_ip}")
     return iid
 
 
 def stop() -> str:
-    """Stop a running edcloud instance. Returns instance ID."""
+    """Stop a running edcloud instance.
+
+    Returns:
+        The instance ID.
+
+    Raises:
+        RuntimeError: If no instance exists or it isn't in ``running`` state.
+        TagDriftError: If orphaned managed resources are found instead.
+    """
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
     if not inst:
@@ -432,7 +752,7 @@ def stop() -> str:
             )
         raise RuntimeError("No edcloud instance found.")
 
-    iid = inst["InstanceId"]
+    iid = str(inst["InstanceId"])
     state = inst["State"]["Name"]
 
     if state == "stopped":
@@ -452,7 +772,14 @@ def stop() -> str:
 
 
 def status() -> dict[str, Any]:
-    """Return current instance status as a dict."""
+    """Return current instance status.
+
+    Returns:
+        Dict with at least ``exists: bool``.  When the instance exists the
+        dict also contains ``instance_id``, ``state``, ``instance_type``,
+        ``public_ip``, ``launch_time``, ``volumes``, and ``cost_estimate``.
+        When it does not exist, an ``orphaned_resources`` summary is included.
+    """
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
 
@@ -486,10 +813,9 @@ def status() -> dict[str, Any]:
                 )
 
     # Cost estimate
-    hours_per_day = 4
-    hourly_rate = {"t3a.medium": 0.0376, "t3a.small": 0.0188}.get(instance_type, 0.0)
-    compute_monthly = hourly_rate * hours_per_day * 30
-    storage_monthly = sum(v["size_gb"] for v in volumes) * 0.08
+    hourly_rate = HOURLY_RATES.get(instance_type, 0.0)
+    compute_monthly = hourly_rate * DEFAULT_HOURS_PER_DAY * 30
+    storage_monthly = sum(v["size_gb"] for v in volumes) * EBS_MONTHLY_RATE_PER_GB
     total_monthly = compute_monthly + storage_monthly
 
     result: dict[str, Any] = {
@@ -504,16 +830,20 @@ def status() -> dict[str, Any]:
             "compute_monthly": round(compute_monthly, 2),
             "storage_monthly": round(storage_monthly, 2),
             "total_monthly": round(total_monthly, 2),
-            "note": f"Assumes {hours_per_day}hrs/day runtime",
+            "note": f"Assumes {DEFAULT_HOURS_PER_DAY}hrs/day runtime",
         },
     }
     return result
 
 
 def destroy(force: bool = False) -> None:
-    """Terminate the edcloud instance and clean up the security group.
+    """Terminate the edcloud instance and clean up its security group and IAM.
 
-    The EBS volume survives (DeleteOnTermination=false).
+    EBS volumes survive (``DeleteOnTermination=False``).  Orphaned volumes
+    are listed at the end for manual cleanup.
+
+    Args:
+        force: Skip the interactive confirmation prompt.
     """
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
@@ -561,8 +891,12 @@ def destroy(force: bool = False) -> None:
             print(f"Could not delete security group {sg_id}: {exc}")
             print("You may need to delete it manually after ENIs are released.")
 
+    # Clean up IAM instance profile
+    print()
+    delete_instance_profile()
+
     # List orphaned volumes
-    vol_resp = ec2.describe_volumes(Filters=_managed_filter())
+    vol_resp = ec2.describe_volumes(Filters=managed_filter())
     orphaned = vol_resp.get("Volumes", [])
     if orphaned:
         print()

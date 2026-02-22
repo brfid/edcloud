@@ -1,4 +1,4 @@
-"""edcloud CLI — manage your personal cloud lab."""
+"""edcloud CLI — user-facing commands for the personal cloud lab."""
 
 from __future__ import annotations
 
@@ -7,25 +7,80 @@ import json
 import os
 import shlex
 import subprocess
+from collections.abc import Callable
 from datetime import datetime, timezone
+from typing import ParamSpec, TypeVar
 
 import boto3
 import click
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from edcloud import ec2, snapshot, tailscale
 from edcloud.aws_check import check_aws_credentials, get_region
-from edcloud.config import DEFAULT_TAILSCALE_HOSTNAME, InstanceConfig
+from edcloud.config import (
+    DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER,
+    DEFAULT_TAILSCALE_HOSTNAME,
+    InstanceConfig,
+)
 
-DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER = "/edcloud/tailscale_auth_key"
 PRECHANGE_SNAPSHOT_PREFIX = "pre-change"
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
-def require_aws_creds(func):
-    """Decorator: verify AWS credentials before running command."""
+def _resolve_ssh_target(
+    info: dict[str, object],
+    public_ip: bool,
+    user: str,
+    hostname: str,
+) -> tuple[str, list[str]]:
+    """Build an SSH target address and base command.
+
+    Args:
+        info: Instance status dict (from ``ec2.status()``).
+        public_ip: If ``True`` use the public IP; otherwise resolve via Tailscale.
+        user: Remote username.
+        hostname: Tailscale MagicDNS hostname to resolve.
+
+    Returns:
+        ``(target_ip, ssh_base_command)`` tuple.
+
+    Raises:
+        RuntimeError: If the chosen network path has no reachable address.
+    """
+    if public_ip:
+        target = str(info.get("public_ip") or "")
+        if not target:
+            raise RuntimeError("No public IP available. Remove --public-ip or assign a public IP.")
+        ssh_base = ["ssh", "-o", "StrictHostKeyChecking=accept-new", f"{user}@{target}"]
+        return target, ssh_base
+    else:
+        ts_ip = tailscale.get_tailscale_ip(hostname)
+        if not ts_ip:
+            raise RuntimeError(
+                f"Tailscale IP not found for '{hostname}'. "
+                "Check tailnet connectivity or use --public-ip."
+            )
+        ssh_base = [
+            "ssh",
+            "-o",
+            "ProxyCommand=none",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            f"{user}@{ts_ip}",
+        ]
+        return ts_ip, ssh_base
+
+
+def require_aws_creds(func: Callable[P, R]) -> Callable[P, R]:
+    """Decorator that verifies AWS credentials before running a command.
+
+    Catches ``RuntimeError`` from the wrapped command and converts it to a
+    clean ``SystemExit(1)`` with the error message on stderr.
+    """
 
     @functools.wraps(func)
-    def wrapper(*args, **kwargs):
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         valid, message = check_aws_credentials()
         if not valid:
             click.echo(f"AWS credentials error: {message}", err=True)
@@ -43,19 +98,25 @@ def require_aws_creds(func):
 
 
 def _fetch_tailscale_auth_key_from_ssm(parameter_name: str) -> str:
+    """Read a Tailscale auth key from SSM Parameter Store."""
     ssm = boto3.client("ssm")
     resp = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
     return str(resp["Parameter"]["Value"])
 
 
 def _snapshot_start_time(start_time: str) -> datetime | None:
-    if not start_time:
+    """Parse an ISO-format snapshot timestamp into a UTC-aware datetime.
+
+    Tolerates trailing ``Z`` and naive timestamps (assumed UTC).
+    Returns ``None`` on any parse failure.
+    """
+    raw = start_time.strip()
+    if not raw:
         return None
-    ts = start_time.strip()
-    if ts.endswith("Z"):
-        ts = ts[:-1] + "+00:00"
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
     try:
-        parsed = datetime.fromisoformat(ts)
+        parsed = datetime.fromisoformat(raw)
     except ValueError:
         return None
     if parsed.tzinfo is None:
@@ -64,6 +125,11 @@ def _snapshot_start_time(start_time: str) -> datetime | None:
 
 
 def _find_recent_prechange_snapshot(max_age_minutes: int) -> dict[str, object] | None:
+    """Return the freshest completed pre-change snapshot within *max_age_minutes*.
+
+    Returns:
+        Snapshot info dict, or ``None`` if nothing qualifies.
+    """
     now = datetime.now(timezone.utc)
     freshest: tuple[datetime, dict[str, object]] | None = None
     for snap_info in snapshot.list_snapshots():
@@ -81,6 +147,19 @@ def _find_recent_prechange_snapshot(max_age_minutes: int) -> dict[str, object] |
         if freshest is None or parsed > freshest[0]:
             freshest = (parsed, snap_info)
     return freshest[1] if freshest else None
+
+
+def _ensure_no_tailscale_name_conflicts(base_hostname: str = DEFAULT_TAILSCALE_HOSTNAME) -> None:
+    """Fail fast when Tailscale naming drift is detected.
+
+    Raises:
+        RuntimeError: If conflicting/suffixed edcloud records are found.
+    """
+    if not tailscale.tailscale_available():
+        return
+    conflicts = tailscale.edcloud_name_conflicts(base_hostname=base_hostname)
+    if conflicts:
+        raise RuntimeError(tailscale.format_conflict_message(conflicts))
 
 
 @click.group()
@@ -122,13 +201,43 @@ def main() -> None:
 @click.option(
     "--tailscale-auth-key",
     envvar="TAILSCALE_AUTH_KEY",
-    help="Tailscale auth key (or set TAILSCALE_AUTH_KEY env var).",
+    help="Tailscale auth key (will be stored in SSM if provided).",
 )
 @click.option(
     "--tailscale-auth-key-ssm-parameter",
-    default=None,
+    default=DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER,
     envvar="TAILSCALE_AUTH_KEY_SSM_PARAMETER",
-    help="SSM parameter name containing Tailscale auth key (SecureString supported).",
+    show_default=True,
+    help="SSM parameter name containing Tailscale auth key.",
+)
+@click.option(
+    "--cleanup",
+    is_flag=True,
+    help="Clean up old Tailscale devices and orphaned volumes before provisioning.",
+)
+@click.option(
+    "--allow-delete-state-volume",
+    is_flag=True,
+    help="Allow cleanup workflow to delete protected state volumes.",
+)
+@click.option(
+    "--require-existing-state-volume/--allow-new-state-volume",
+    default=True,
+    show_default=True,
+    help=(
+        "Require reusable managed state volume by default; "
+        "use --allow-new-state-volume to permit creating a fresh state volume."
+    ),
+)
+@click.option(
+    "--skip-snapshot",
+    is_flag=True,
+    help="Skip automatic snapshot before provision (if replacing existing instance).",
+)
+@click.option(
+    "--allow-tailscale-name-conflicts",
+    is_flag=True,
+    help="Skip fail-fast guard for duplicate/suffixed edcloud Tailscale records.",
 )
 @require_aws_creds
 def provision(
@@ -137,39 +246,96 @@ def provision(
     state_volume_size: int,
     tailscale_hostname: str,
     tailscale_auth_key: str | None,
-    tailscale_auth_key_ssm_parameter: str | None,
+    tailscale_auth_key_ssm_parameter: str,
+    cleanup: bool,
+    allow_delete_state_volume: bool,
+    require_existing_state_volume: bool,
+    skip_snapshot: bool,
+    allow_tailscale_name_conflicts: bool,
 ) -> None:
-    """Create the edcloud EC2 instance from scratch."""
-    if not tailscale_auth_key and tailscale_auth_key_ssm_parameter:
+    """Create the edcloud EC2 instance from scratch.
+
+    The Tailscale auth key is fetched from SSM by the instance at boot.
+    """
+    if not allow_tailscale_name_conflicts:
+        _ensure_no_tailscale_name_conflicts(base_hostname=tailscale_hostname)
+
+    # Pre-provision cleanup if requested
+    if cleanup:
+        from edcloud import cleanup as cleanup_module
+
+        # Auto-snapshot if existing instance (unless --skip-snapshot)
+        if not skip_snapshot:
+            click.echo("Checking for existing instance to snapshot...")
+            snap_ids = snapshot.auto_snapshot_before_destroy()
+            if snap_ids:
+                click.echo(f"✅ Created pre-provision snapshot(s): {', '.join(snap_ids)}")
+                click.echo()
+            else:
+                click.echo(
+                    "Info: no existing instance to snapshot (this is fine for first provision)"
+                )
+                click.echo()
+
+        # Run cleanup workflow
+        if not cleanup_module.run_cleanup_workflow(
+            "pre-provision",
+            skip_snapshot=True,
+            allow_delete_state=allow_delete_state_volume,
+        ):
+            raise SystemExit(0)
+
+    ssm = boto3.client("ssm")
+
+    # If raw key is provided, store it in SSM
+    if tailscale_auth_key:
+        click.echo(f"Storing Tailscale auth key in SSM: {tailscale_auth_key_ssm_parameter}")
         try:
-            tailscale_auth_key = _fetch_tailscale_auth_key_from_ssm(
-                tailscale_auth_key_ssm_parameter
+            ssm.put_parameter(
+                Name=tailscale_auth_key_ssm_parameter,
+                Value=tailscale_auth_key,
+                Type="SecureString",
+                Overwrite=True,
             )
+            click.echo("  Key stored successfully.")
         except ClientError as exc:
+            click.echo(f"Error storing key in SSM: {exc}", err=True)
+            raise SystemExit(1) from exc
+
+    # Verify SSM parameter exists
+    try:
+        ssm.get_parameter(Name=tailscale_auth_key_ssm_parameter, WithDecryption=False)
+    except ClientError as exc:
+        if "ParameterNotFound" in str(exc):
             click.echo(
-                "Error: could not read Tailscale auth key from SSM parameter "
-                f"'{tailscale_auth_key_ssm_parameter}': {exc}",
+                f"Error: Tailscale auth key not found in SSM: {tailscale_auth_key_ssm_parameter}",
+                err=True,
+            )
+            click.echo("  Set TAILSCALE_AUTH_KEY or pass --tailscale-auth-key.", err=True)
+            click.echo(
+                "  Or manually create the parameter with: "
+                "aws ssm put-parameter --name /edcloud/tailscale_auth_key "
+                "--type SecureString --value 'tskey-auth-...'",
+                err=True,
+            )
+            click.echo(
+                "  Generate a key at: https://login.tailscale.com/admin/settings/keys",
                 err=True,
             )
             raise SystemExit(1) from exc
-
-    if not tailscale_auth_key:
-        click.echo("Error: Tailscale auth key required.", err=True)
-        click.echo("  Set TAILSCALE_AUTH_KEY or pass --tailscale-auth-key.", err=True)
-        click.echo(
-            "  Or pass --tailscale-auth-key-ssm-parameter /path/to/parameter.",
-            err=True,
-        )
-        click.echo("  Generate one at: https://login.tailscale.com/admin/settings/keys", err=True)
-        raise SystemExit(1)
+        raise
 
     cfg = InstanceConfig(
         instance_type=instance_type,
         volume_size_gb=volume_size,
         state_volume_size_gb=state_volume_size,
         tailscale_hostname=tailscale_hostname,
+        tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
     )
-    result = ec2.provision(cfg, tailscale_auth_key)
+    result = ec2.provision(
+        cfg,
+        require_existing_state_volume=require_existing_state_volume,
+    )
     click.echo()
     click.echo(json.dumps(result, indent=2))
 
@@ -209,19 +375,26 @@ def load_tailscale_env_key(
 
     if shell_export:
         click.echo(f"export TAILSCALE_AUTH_KEY={shlex.quote(key)}")
+        return
 
-    if not shell_export:
-        click.echo("No output selected. Use --shell-export.", err=True)
-        raise SystemExit(1)
+    click.echo("No output selected. Use --shell-export.", err=True)
+    raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
 # up / down
 # ---------------------------------------------------------------------------
 @main.command()
+@click.option(
+    "--allow-tailscale-name-conflicts",
+    is_flag=True,
+    help="Skip fail-fast guard for duplicate/suffixed edcloud Tailscale records.",
+)
 @require_aws_creds
-def up() -> None:
+def up(allow_tailscale_name_conflicts: bool) -> None:
     """Start the edcloud instance."""
+    if not allow_tailscale_name_conflicts:
+        _ensure_no_tailscale_name_conflicts()
     ec2.start()
     ts_ip = tailscale.get_tailscale_ip(DEFAULT_TAILSCALE_HOSTNAME)
     if ts_ip:
@@ -323,12 +496,30 @@ def status() -> None:
     show_default=True,
     help="Maximum snapshot age for --require-fresh-snapshot.",
 )
+@click.option(
+    "--cleanup",
+    is_flag=True,
+    help="Clean up Tailscale devices and orphaned volumes after destroy.",
+)
+@click.option(
+    "--allow-delete-state-volume",
+    is_flag=True,
+    help="Allow cleanup workflow to delete protected state volumes.",
+)
+@click.option(
+    "--skip-snapshot",
+    is_flag=True,
+    help="Skip automatic snapshot before destroy (faster but risky).",
+)
 @require_aws_creds
 def destroy(
     force: bool,
     confirm_instance_id: str | None,
     require_fresh_snapshot: bool,
     fresh_snapshot_max_age_minutes: int,
+    cleanup: bool,
+    allow_delete_state_volume: bool,
+    skip_snapshot: bool,
 ) -> None:
     """Terminate the instance and clean up. EBS volume is preserved."""
     if fresh_snapshot_max_age_minutes <= 0:
@@ -369,7 +560,33 @@ def destroy(
                 f"Using pre-change snapshot: {recent['snapshot_id']} ({recent['start_time']})"
             )
 
+    # Auto-snapshot before destroy (default, unless --skip-snapshot)
+    if cleanup and not skip_snapshot:
+        click.echo("Creating automatic pre-destroy snapshot...")
+        try:
+            snap_ids = snapshot.auto_snapshot_before_destroy()
+            if snap_ids:
+                click.echo(f"✅ Created snapshot(s): {', '.join(snap_ids)}")
+            else:
+                click.echo("Info: no instance found to snapshot")
+        except (RuntimeError, ClientError, BotoCoreError) as e:
+            click.echo(f"⚠️  Snapshot failed: {e}", err=True)
+            if not click.confirm("Continue with destroy anyway?"):
+                click.echo("Aborted.")
+                raise SystemExit(0) from None
+
     ec2.destroy(force=force)
+
+    # Post-destroy cleanup
+    if cleanup:
+        from edcloud import cleanup as cleanup_module
+
+        click.echo()
+        cleanup_module.run_cleanup_workflow(
+            "post-destroy",
+            skip_snapshot=True,
+            allow_delete_state=allow_delete_state_volume,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -470,43 +687,54 @@ def verify_cmd(user: str, public_ip: bool, json_output: bool) -> None:
     if info.get("state") != "running":
         raise RuntimeError(f"Instance is {info.get('state')}, must be running for verification.")
 
-    target = ""
-    ssh_base: list[str] = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=12",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-    ]
-    if public_ip:
-        target = str(info.get("public_ip") or "")
-        if not target:
-            raise RuntimeError(
-                "No public IP available. Start without --public-ip or assign a public IP."
-            )
-        ssh_base.append(f"{user}@{target}")
-    else:
-        ts_ip = tailscale.get_tailscale_ip(DEFAULT_TAILSCALE_HOSTNAME)
-        if not ts_ip:
-            raise RuntimeError(
-                "Tailscale IP not found. Verify local tailnet connectivity or use --public-ip."
-            )
-        target = ts_ip
-        ssh_base.extend(["-o", "ProxyCommand=none", f"{user}@{target}"])
+    target, ssh_base = _resolve_ssh_target(info, public_ip, user, DEFAULT_TAILSCALE_HOSTNAME)
+    # Add verify-specific options
+    ssh_base.extend(["-o", "BatchMode=yes", "-o", "ConnectTimeout=12"])
 
     checks: list[tuple[str, str]] = [
-        ("cloud-init completion marker", "test -f /tmp/edcloud-ready"),
+        ("cloud-init status done", "cloud-init status --wait >/dev/null"),
         ("docker service active", "systemctl is-active --quiet docker"),
+        (
+            "docker data-root points to state volume",
+            "docker info --format '{{.DockerRootDir}}' | grep -qx /opt/edcloud/state/docker",
+        ),
         ("portainer container running", "docker ps --format '{{.Names}}' | grep -qx portainer"),
         ("compose directory exists", "test -d /opt/edcloud/compose"),
+        ("compose directory is mounted", "mountpoint -q /opt/edcloud/compose"),
+        (
+            "compose bind mount configured in fstab",
+            "grep -qE "
+            "'^/opt/edcloud/state/compose[[:space:]]+/opt/edcloud/compose[[:space:]]+"
+            "none[[:space:]]+bind' /etc/fstab",
+        ),
+        ("portainer data directory exists", "test -d /opt/edcloud/portainer-data"),
+        ("portainer data directory is mounted", "mountpoint -q /opt/edcloud/portainer-data"),
+        (
+            "portainer data bind mount configured in fstab",
+            "grep -qE "
+            "'^/opt/edcloud/state/portainer-data[[:space:]]+/opt/edcloud/portainer-data"
+            "[[:space:]]+none[[:space:]]+bind' /etc/fstab",
+        ),
         ("state directory exists", "test -d /opt/edcloud/state"),
         ("state directory is mounted", "mountpoint -q /opt/edcloud/state"),
         ("state directory writable", "test -w /opt/edcloud/state"),
         ("home directory exists", "test -d /home/ubuntu"),
         ("home directory is mounted", "mountpoint -q /home/ubuntu"),
+        (
+            "home bind mount configured in fstab",
+            "grep -qE "
+            "'^/opt/edcloud/state/home/ubuntu[[:space:]]+/home/ubuntu[[:space:]]+"
+            "none[[:space:]]+bind' /etc/fstab",
+        ),
         ("home directory writable", "test -w /home/ubuntu"),
+        ("tailscale state directory exists", "test -d /var/lib/tailscale"),
+        ("tailscale state directory is mounted", "mountpoint -q /var/lib/tailscale"),
+        (
+            "tailscale bind mount configured in fstab",
+            "grep -qE "
+            "'^/opt/edcloud/state/tailscale[[:space:]]+/var/lib/tailscale[[:space:]]+"
+            "none[[:space:]]+bind' /etc/fstab",
+        ),
         ("neovim installed", "command -v nvim >/dev/null"),
         ("byobu installed", "command -v byobu >/dev/null"),
         ("gh installed", "command -v gh >/dev/null"),
@@ -592,44 +820,62 @@ def ssh_cmd(user: str, public_ip: bool, ssh_args: tuple[str, ...]) -> None:
         click.echo(f"Error: Instance is {info['state']}, not running.", err=True)
         raise SystemExit(1)
 
-    # Choose target: Tailscale IP (default) or public IP
-    target = None
-    if public_ip:
-        target = info.get("public_ip")
-        if not target:
-            click.echo("Error: No public IP available.", err=True)
-            raise SystemExit(1)
-        click.echo(f"Connecting via public IP: {target}", err=True)
-        click.echo("Note: Security group must allow SSH (port 22) from your IP", err=True)
-        cmd = ["ssh", "-o", "StrictHostKeyChecking=accept-new", f"{user}@{target}"]
-    else:
-        ts_ip = tailscale.get_tailscale_ip(DEFAULT_TAILSCALE_HOSTNAME)
-        if ts_ip:
-            target = ts_ip
-            click.echo(f"Connecting via Tailscale: {ts_ip}", err=True)
-            click.echo(
-                "Note: May trigger Tailscale SSH browser auth if enabled on your tailnet", err=True
-            )
-            # Use ProxyCommand=none to attempt regular SSH over Tailscale network
-            # (Tailscale SSH may still intercept depending on tailnet settings)
-            cmd = [
-                "ssh",
-                "-o",
-                "ProxyCommand=none",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                f"{user}@{target}",
-            ]
-        else:
-            click.echo("Error: Tailscale IP not found. Is tailscale running?", err=True)
+    # Resolve SSH target
+    try:
+        target, cmd = _resolve_ssh_target(info, public_ip, user, DEFAULT_TAILSCALE_HOSTNAME)
+    except RuntimeError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        if not public_ip:
             click.echo("  Try: tailscale status", err=True)
             click.echo("  Or use: edc ssh --public-ip", err=True)
-            raise SystemExit(1)
+        raise SystemExit(1) from exc
+
+    # Log connection details
+    if public_ip:
+        click.echo(f"Connecting via public IP: {target}", err=True)
+        click.echo("Note: Security group must allow SSH (port 22) from your IP", err=True)
+    else:
+        click.echo(f"Connecting via Tailscale: {target}", err=True)
+        click.echo(
+            "Note: May trigger Tailscale SSH browser auth if enabled on your tailnet", err=True
+        )
 
     if ssh_args:
         cmd.extend(ssh_args)
 
     os.execvp(cmd[0], cmd)
+
+
+@main.group("tailscale")
+def tailscale_group() -> None:
+    """Tailscale reconciliation and guardrail helpers."""
+
+
+@tailscale_group.command("reconcile")
+@click.option(
+    "--dry-run/--apply",
+    default=True,
+    show_default=True,
+    help="Preview conflicts or apply manual reconciliation workflow guidance.",
+)
+def tailscale_reconcile(dry_run: bool) -> None:
+    """Show or reconcile Tailscale naming conflicts for edcloud."""
+    if not tailscale.tailscale_available():
+        click.echo("tailscale CLI not found on this operator node.", err=True)
+        raise SystemExit(1)
+
+    conflicts = tailscale.edcloud_name_conflicts()
+    if not conflicts:
+        click.echo("No Tailscale naming conflicts detected for edcloud.")
+        return
+
+    click.echo(tailscale.format_conflict_message(conflicts), err=not dry_run)
+    if dry_run:
+        raise SystemExit(1)
+
+    click.echo()
+    click.echo("Applied mode: manual reconciliation required in Tailscale admin.")
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":

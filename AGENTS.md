@@ -58,6 +58,8 @@ grep -RInE "TODO|FIXME|TBD|\[ \]" README.md SETUP.md DESIGN.md AGENTS.md edcloud
 - Preserve Tailscale-only access model (no inbound security group rules).
 - Keep baseline host config reproducible in `cloud-init/user-data.yaml`.
 - Keep snapshot and restore-drill guidance current.
+- Backward compatibility is not a default goal; prefer clean, architecturally sound
+  breaking changes unless backward compatibility is explicitly requested.
 
 ### Validation commands
 

@@ -14,9 +14,10 @@ Core assumptions:
 ## What this project is designed to prevent
 
 - Public SSH exposure
-- Public exposure of Portainer or workload ports
-- IMDSv1 usage (IMDSv2 is required)
+- Public exposure of Portainer or workload ports (Portainer binds to Tailscale interface only)
+- IMDSv1 usage (IMDSv2 is required, hop limit set to 1)
 - Avoidable idle spend (automatic idle shutdown)
+- Credentials in user-data (auth keys fetched from SSM at boot)
 
 ## What this project does not try to prevent
 
@@ -24,6 +25,7 @@ Core assumptions:
 - Malicious or vulnerable containers you choose to run
 - Physical compromise of devices in your tailnet
 - Multi-user isolation and tenant-level access control
+- Docker socket exposure in Portainer (accepted risk for single-operator convenience)
 
 ## Required operator practices
 
