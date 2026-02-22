@@ -23,10 +23,10 @@ NAME_TAG = "edcloud"
 # ---------------------------------------------------------------------------
 # EC2 defaults
 # ---------------------------------------------------------------------------
-DEFAULT_INSTANCE_TYPE = "t3a.medium"
-DEFAULT_VOLUME_SIZE_GB = 30
+DEFAULT_INSTANCE_TYPE = "t3a.small"
+DEFAULT_VOLUME_SIZE_GB = 16  # Root: OS + Docker + dev tools (~6GB used baseline)
 DEFAULT_VOLUME_TYPE = "gp3"
-DEFAULT_STATE_VOLUME_SIZE_GB = 30
+DEFAULT_STATE_VOLUME_SIZE_GB = 20  # State: home + Docker data (starts ~1GB, grows with use)
 DEFAULT_STATE_VOLUME_TYPE = "gp3"
 DEFAULT_STATE_VOLUME_DEVICE_NAME = "/dev/sdf"
 
@@ -57,8 +57,9 @@ SECURITY_GROUP_DESC = "edcloud - no public inbound; all access via Tailscale"
 # Cost estimation
 # ---------------------------------------------------------------------------
 HOURLY_RATES: dict[str, float] = {
-    "t3a.medium": 0.0376,
-    "t3a.small": 0.0188,
+    "t3a.micro": 0.0094,  # 2 vCPU, 1 GB RAM - minimal workloads only
+    "t3a.small": 0.0188,  # 2 vCPU, 2 GB RAM - default for light dev work
+    "t3a.medium": 0.0376,  # 2 vCPU, 4 GB RAM - heavier Docker workloads
 }
 EBS_MONTHLY_RATE_PER_GB = 0.08
 DEFAULT_HOURS_PER_DAY = 4

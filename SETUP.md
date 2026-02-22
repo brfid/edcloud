@@ -8,6 +8,7 @@ Open items only:
 
 - [x] Harden destructive lifecycle actions: require explicit instance-id confirmation for `edc destroy`, and add an option to require a fresh pre-change snapshot before deletion/rebuild.
 - [ ] Add a safe rebuild workflow (`snapshot -> reprovision -> verify`) as a single documented operator path.
+- [ ] Improve automatic repo loading: currently dotfiles/bin/llm-config cloning depends on gh auth during cloud-init; consider making repo list configurable and/or adding explicit clone step to provision workflow (e.g., `edc provision --sync-repos`).
 - [x] Persist user home on the state volume (`/opt/edcloud/state/home/ubuntu`) via cloud-init-managed bind mount and migration checks.
 - [x] Define default dev environment in cloud-init: `neovim` + LazyVim bootstrap, `byobu`, `gh`, and required runtime dependencies.
 - [x] Decide and codify package strategy for non-APT tooling (APT-first vs Linuxbrew) for repeatable, non-interactive provisioning.
@@ -208,6 +209,22 @@ If `TAILSCALE_AUTH_KEY_SSM_PARAMETER` is set in your operator env file:
 edc provision
 ```
 
+Common size configurations:
+
+```bash
+# Minimal (saves max money: ~$6/month total)
+edc provision --instance-type t3a.small --volume-size 12 --state-volume-size 15
+
+# Default (balanced: ~$7/month total)
+edc provision  # Uses: t3a.small, 16GB root, 20GB state
+
+# Comfortable (more headroom: ~$9/month total)
+edc provision --instance-type t3a.small --volume-size 20 --state-volume-size 30
+
+# Power user (heavier workloads: ~$12/month total)
+edc provision --instance-type t3a.medium --volume-size 30 --state-volume-size 40
+```
+
 State-volume guardrails:
 
 - Reuse existing managed state volume is now the default (fail-fast if none exists).
@@ -219,10 +236,10 @@ edc provision --allow-new-state-volume
 
 Expected resources:
 
-- 1x EC2 instance (`t3a.medium` default)
+- 1x EC2 instance (`t3a.small` default; use `--instance-type t3a.medium` for heavier workloads)
 - Security group with zero inbound rules
-- 30 GB gp3 root volume
-- 30 GB gp3 state volume mounted at `/opt/edcloud/state`
+- 16 GB gp3 root volume (expandable; use `--volume-size` to override)
+- 20 GB gp3 state volume mounted at `/opt/edcloud/state` (expandable; use `--state-volume-size` to override)
 
 Tailscale identity guardrails:
 
@@ -293,6 +310,28 @@ edc down
 ```
 
 The instance also auto-shuts down after 30 minutes of idle activity.
+
+Switching instance types (resize for heavier workloads):
+
+```bash
+# Snapshot before any destructive operation
+edc snapshot -d pre-resize-to-medium
+
+# Destroy current instance (state volume is preserved!)
+edc destroy --confirm-instance-id <instance-id>
+
+# Reprovision with larger instance type
+edc provision --instance-type t3a.medium
+
+# Verify everything works - all your data/logins/Tailscale identity persist
+edc verify
+```
+
+Your state volume is completely independent of instance type, so resizing preserves:
+- SSH keys and logins
+- Tailscale identity (same hostname/IP)
+- Docker images and containers
+- All files in `/home/ubuntu` and `/opt/edcloud/state`
 
 Destroy safety guardrails:
 
@@ -424,6 +463,33 @@ edc destroy --confirm-instance-id <instance-id>
 edc provision
 edc verify
 ```
+
+Volume size adjustment:
+
+```bash
+# Provision with custom sizes (smaller or larger)
+edc provision --volume-size 12 --state-volume-size 15
+
+# Check current usage
+edc ssh 'df -h / /opt/edcloud/state'
+
+# Expand volumes online (no rebuild needed!)
+# 1. Get volume IDs
+edc ssh 'lsblk -o NAME,SIZE,MOUNTPOINT,TYPE | grep -E "disk|part"'
+
+# 2. Modify volume size (example: expand state volume to 30GB)
+aws ec2 modify-volume --volume-id vol-xxxxxx --size 30
+
+# 3. Wait for modification to complete (~1 min)
+aws ec2 describe-volumes-modifications --volume-id vol-xxxxxx
+
+# 4. Extend filesystem to use new space
+edc ssh 'sudo resize2fs /dev/nvme1n1'  # state volume
+edc ssh 'sudo resize2fs /dev/root'     # root volume
+```
+
+**Note:** EBS volumes can only be expanded, not shrunk. To reduce size, you must create a new smaller volume and copy data (or reprovision with smaller `--volume-size` flags).
+
 ## 10. Backup and recovery standard
 
 Operating policy:
@@ -483,11 +549,18 @@ cat ~/.config/edcloud/restore-drill.tsv
 
 ## 11. Cost guardrail
 
-Typical target at 4 hours/day:
+Typical target at 4 hours/day with default settings (`t3a.small`, 16GB root, 20GB state):
 
-- Compute: about `$4.51/month`
-- Storage: about `$4.80/month`
+- Compute: about `$2.26/month` (t3a.small) or `$4.51/month` (t3a.medium)
+- Storage: about `$2.88/month` (36GB total) — was $4.80/month with 60GB
 - Snapshots: variable, target soft cap `$5/month`
+- **New monthly total: ~$7-10** (down from ~$9-14)
+
+Instance type selection:
+
+- `t3a.small` (default): 2 vCPU, 2 GB RAM - suitable for light Docker + dev work
+- `t3a.medium`: 2 vCPU, 4 GB RAM - use `--instance-type t3a.medium` for heavier workloads
+- State volume persists across instance type changes, so you can resize without data loss
 
 Use `edc status` and AWS Cost Explorer to track drift.
 
