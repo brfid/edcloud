@@ -6,6 +6,8 @@ Tag ``edcloud:managed = true`` identifies all managed resources.
 
 from __future__ import annotations
 
+import logging
+import random
 import re
 import time
 from contextlib import suppress
@@ -34,6 +36,8 @@ from edcloud.config import (
     managed_filter,
 )
 from edcloud.iam import delete_instance_profile, ensure_instance_profile
+
+log = logging.getLogger(__name__)
 
 _USER_DATA_PATH = Path(__file__).resolve().parent.parent / "cloud-init" / "user-data.yaml"
 _ACTIVE_INSTANCE_STATES = ["pending", "running", "stopping", "stopped"]
@@ -65,6 +69,33 @@ def _ec2_resource() -> Any:
 def _ssm_client() -> Any:
     """Return a low-level SSM client."""
     return boto3.client("ssm")
+
+
+def get_ec2_client() -> Any:
+    """Return a low-level EC2 client (public API)."""
+    return _ec2_client()
+
+
+def find_instance(client: Any) -> dict[str, Any] | None:
+    """Locate the managed instance (public API).
+
+    Delegates to the internal ``_find_instance`` helper.
+    """
+    return _find_instance(client)
+
+
+def fetch_tailscale_auth_key_from_ssm(parameter_name: str) -> str:
+    """Read a Tailscale auth key from SSM Parameter Store.
+
+    Args:
+        parameter_name: The SSM parameter path (SecureString supported).
+
+    Returns:
+        The decrypted parameter value.
+    """
+    ssm = _ssm_client()
+    resp = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+    return str(resp["Parameter"]["Value"])
 
 
 def _instance_state_filter() -> dict[str, Any]:
@@ -312,7 +343,7 @@ def _resolve_ami(ssm_parameter: str) -> str:
     except ClientError as exc:
         # Fallback: if SSM parameter path doesn't work, use a direct lookup
         if "ParameterNotFound" in str(exc):
-            print(f"  SSM parameter {ssm_parameter} not found, falling back to AMI search...")
+            log.warning("SSM parameter %s not found, falling back to AMI search...", ssm_parameter)
             ec2 = _ec2_client()
             resp = ec2.describe_images(
                 Owners=["099720109477"],  # Canonical's public AWS account (not a secret)
@@ -472,12 +503,21 @@ def provision(
             "Run 'edc destroy' first if you want to reprovision."
         )
 
-    print("Provisioning edcloud instance...")
+    # Pre-provision orphan check: warn if managed resources exist without an instance
+    orphaned = _managed_orphan_report(ec2)
+    if orphaned["security_groups"] or orphaned["volumes"]:
+        log.warning(
+            "Orphaned managed resources found (no active instance). "
+            "These may be reused or cleaned up during provisioning:\n%s",
+            _orphaned_resources_text(orphaned),
+        )
+
+    log.info("Provisioning edcloud instance...")
 
     # 1. Security group -------------------------------------------------------
     sg_id = _find_security_group(ec2)
     if sg_id:
-        print(f"  Security group exists: {sg_id}")
+        log.info("  Security group exists: %s", sg_id)
     else:
         vpc_id = _get_default_vpc_id(ec2)
         resp = ec2.create_security_group(
@@ -491,15 +531,15 @@ def provision(
         # Revoke the default "allow all outbound" rule? No — we need outbound
         # for apt, Docker pulls, Tailscale coordination, etc.
         # No inbound rules: all access comes via Tailscale tunnel.
-        print(f"  Created security group: {sg_id} (no inbound rules)")
+        log.info("  Created security group: %s (no inbound rules)", sg_id)
 
     # 2. IAM instance profile -------------------------------------------------
     profile_arn = ensure_instance_profile(cfg.tags)
-    print(f"  Instance profile: {profile_arn}")
+    log.info("  Instance profile: %s", profile_arn)
 
     # 3. Resolve AMI -----------------------------------------------------------
     ami_id = _resolve_ami(cfg.ami_ssm_parameter)
-    print(f"  AMI: {ami_id}")
+    log.info("  AMI: %s", ami_id)
 
     # 4. User-data script ------------------------------------------------------
     aws_region = _get_aws_region()
@@ -508,7 +548,10 @@ def provision(
         tailscale_hostname=cfg.tailscale_hostname,
         aws_region=aws_region,
     )
-    print(f"  Tailscale auth key will be fetched from SSM: {cfg.tailscale_auth_key_ssm_parameter}")
+    log.info(
+        "  Tailscale auth key will be fetched from SSM: %s",
+        cfg.tailscale_auth_key_ssm_parameter,
+    )
 
     # 3.5 Prefer reusing existing managed state volume when available ----------
     reused_state_volume_id = _find_orphaned_state_volume_id(ec2)
@@ -521,10 +564,10 @@ def provision(
 
     if reused_state_volume_id:
         state_mapping: dict[str, Any] | None = None
-        print(f"  Reusing managed state volume: {reused_state_volume_id}")
+        log.info("  Reusing managed state volume: %s", reused_state_volume_id)
         state_volume_az = _state_volume_az(ec2, reused_state_volume_id)
         subnet_id = _default_subnet_for_az(ec2, state_volume_az)
-        print(f"  Launching instance in {state_volume_az} to match reused state volume")
+        log.info("  Launching instance in %s to match reused state volume", state_volume_az)
     else:
         state_mapping = {
             "DeviceName": cfg.state_volume_device_name,
@@ -535,7 +578,7 @@ def provision(
                 "Encrypted": True,
             },
         }
-        print("  No reusable managed state volume found; creating new state volume.")
+        log.info("  No reusable managed state volume found; creating new state volume.")
         subnet_id = None
 
     # 4. Launch instance -------------------------------------------------------
@@ -592,8 +635,14 @@ def provision(
                 "Invalid IAM Instance Profile" in msg
                 or ("InvalidParameterValue" in msg and "iamInstanceProfile" in msg)
             ) and attempt < 12:
-                print("  IAM instance profile not yet propagated; retrying launch...")
-                time.sleep(5)
+                sleep_s = min(2**attempt + random.uniform(0, 1), 30)
+                log.info(
+                    "  IAM instance profile not yet propagated; "
+                    "retrying in %.1fs (attempt %d/12)...",
+                    sleep_s,
+                    attempt,
+                )
+                time.sleep(sleep_s)
                 continue
             raise
 
@@ -601,12 +650,14 @@ def provision(
         raise RuntimeError("Failed to launch instance after IAM profile propagation retries.")
 
     instance_id = run_resp["Instances"][0]["InstanceId"]
-    print(f"  Instance launched: {instance_id}")
+    log.info("  Instance launched: %s", instance_id)
 
     # If reusing an existing state volume, attach it explicitly.
     # AWS RunInstances BlockDeviceMappings does not support attaching by VolumeId.
     if reused_state_volume_id:
-        print(f"  Attaching reused state volume {reused_state_volume_id} to {instance_id}...")
+        log.info(
+            "  Attaching reused state volume %s to %s...", reused_state_volume_id, instance_id
+        )
         for _attempt in range(12):
             try:
                 ec2.attach_volume(
@@ -624,9 +675,10 @@ def provision(
                     # Another concurrent provision likely attached the shared
                     # state volume first. Clean up this duplicate instance to
                     # avoid managed-instance tag drift.
-                    print(
+                    log.warning(
                         "  State volume is already attached elsewhere; "
-                        f"terminating duplicate instance {instance_id}."
+                        "terminating duplicate instance %s.",
+                        instance_id,
                     )
                     with suppress(ClientError):
                         ec2.terminate_instances(InstanceIds=[instance_id])
@@ -642,9 +694,9 @@ def provision(
             )
 
     # 5. Wait for running ------------------------------------------------------
-    print("  Waiting for instance to reach 'running' state...")
+    log.info("  Waiting for instance to reach 'running' state...")
     waiter = ec2.get_waiter("instance_running")
-    waiter.wait(InstanceIds=[instance_id])
+    waiter.wait(InstanceIds=[instance_id], WaiterConfig={"Delay": 15, "MaxAttempts": 40})
 
     # Refresh and ensure volume role tags are explicit (root/state)
     inst = _find_instance(ec2)
@@ -671,11 +723,10 @@ def provision(
     inst = _find_instance(ec2)
     public_ip = str((inst or {}).get("PublicIpAddress", "none"))
 
-    print(f"  Instance running. Public IP: {public_ip}")
-    print(f"  Tailscale hostname will be: {cfg.tailscale_hostname}")
-    print()
-    print("  Cloud-init is installing Docker, Tailscale, and Portainer.")
-    print("  This takes 2-3 minutes. Run 'edc status' to check progress.")
+    log.info("  Instance running. Public IP: %s", public_ip)
+    log.info("  Tailscale hostname will be: %s", cfg.tailscale_hostname)
+    log.info("  Cloud-init is installing Docker, Tailscale, and Portainer.")
+    log.info("  This takes 2-3 minutes. Run 'edc status' to check progress.")
 
     return {
         "instance_id": str(instance_id),
@@ -711,22 +762,22 @@ def start() -> str:
     state = inst["State"]["Name"]
 
     if state == "running":
-        print(f"Instance {iid} is already running.")
+        log.info("Instance %s is already running.", iid)
         return iid
 
     if state != "stopped":
         raise RuntimeError(f"Instance {iid} is in state '{state}', cannot start.")
 
-    print(f"Starting instance {iid}...")
+    log.info("Starting instance %s...", iid)
     ec2.start_instances(InstanceIds=[iid])
 
     waiter = ec2.get_waiter("instance_running")
-    waiter.wait(InstanceIds=[iid])
+    waiter.wait(InstanceIds=[iid], WaiterConfig={"Delay": 15, "MaxAttempts": 40})
 
     # Refresh for new IP
     inst = _find_instance(ec2)
     public_ip = str((inst or {}).get("PublicIpAddress", "none"))
-    print(f"Instance running. Public IP: {public_ip}")
+    log.info("Instance running. Public IP: %s", public_ip)
     return iid
 
 
@@ -756,18 +807,18 @@ def stop() -> str:
     state = inst["State"]["Name"]
 
     if state == "stopped":
-        print(f"Instance {iid} is already stopped.")
+        log.info("Instance %s is already stopped.", iid)
         return iid
 
     if state != "running":
         raise RuntimeError(f"Instance {iid} is in state '{state}', cannot stop.")
 
-    print(f"Stopping instance {iid}...")
+    log.info("Stopping instance %s...", iid)
     ec2.stop_instances(InstanceIds=[iid])
 
     waiter = ec2.get_waiter("instance_stopped")
-    waiter.wait(InstanceIds=[iid])
-    print("Instance stopped. EBS volume preserved.")
+    waiter.wait(InstanceIds=[iid], WaiterConfig={"Delay": 15, "MaxAttempts": 40})
+    log.info("Instance stopped. EBS volume preserved.")
     return iid
 
 
@@ -857,27 +908,18 @@ def destroy(force: bool = False) -> None:
                 "Remediation: delete stale resources manually in AWS or reprovision "
                 "and then run `edc destroy` again."
             )
-        print("No edcloud instance found. Nothing to destroy.")
+        log.info("No edcloud instance found. Nothing to destroy.")
         return
 
     iid = inst["InstanceId"]
-    state = inst["State"]["Name"]
-
-    if not force:
-        print(f"This will TERMINATE instance {iid} ({state}).")
-        print("The EBS volume will be preserved (detached, not deleted).")
-        confirm = input("Type 'yes' to confirm: ")
-        if confirm.strip().lower() != "yes":
-            print("Aborted.")
-            return
 
     # Terminate instance
-    print(f"Terminating instance {iid}...")
+    log.info("Terminating instance %s...", iid)
     ec2.terminate_instances(InstanceIds=[iid])
 
     waiter = ec2.get_waiter("instance_terminated")
-    waiter.wait(InstanceIds=[iid])
-    print("Instance terminated.")
+    waiter.wait(InstanceIds=[iid], WaiterConfig={"Delay": 15, "MaxAttempts": 40})
+    log.info("Instance terminated.")
 
     # Clean up security group (may fail if other resources use it)
     sg_id = _find_security_group(ec2)
@@ -886,20 +928,182 @@ def destroy(force: bool = False) -> None:
             # Wait briefly for ENI detachment
             time.sleep(5)
             ec2.delete_security_group(GroupId=sg_id)
-            print(f"Deleted security group: {sg_id}")
+            log.info("Deleted security group: %s", sg_id)
         except ClientError as exc:
-            print(f"Could not delete security group {sg_id}: {exc}")
-            print("You may need to delete it manually after ENIs are released.")
+            log.warning("Could not delete security group %s: %s", sg_id, exc)
+            log.warning("You may need to delete it manually after ENIs are released.")
 
     # Clean up IAM instance profile
-    print()
     delete_instance_profile()
 
     # List orphaned volumes
     vol_resp = ec2.describe_volumes(Filters=managed_filter())
     orphaned = vol_resp.get("Volumes", [])
     if orphaned:
-        print()
-        print("Preserved EBS volumes (delete manually if not needed):")
+        log.info("Preserved EBS volumes (delete manually if not needed):")
         for v in orphaned:
-            print(f"  {v['VolumeId']}  {v['Size']}GB  {v['State']}")
+            log.info("  %s  %sGB  %s", v["VolumeId"], v["Size"], v["State"])
+
+
+def resize(
+    instance_type: str | None = None,
+    volume_size_gb: int | None = None,
+    state_volume_size_gb: int | None = None,
+) -> dict[str, Any]:
+    """Resize the edcloud instance type and/or EBS volumes in place.
+
+    Instance type change requires a stop → modify → start cycle.
+    Volume size changes (expand only) are applied online without a restart.
+
+    Args:
+        instance_type: New EC2 instance type (e.g. ``"t3a.medium"``).
+        volume_size_gb: New root volume size in GiB (must be >= current size).
+        state_volume_size_gb: New state volume size in GiB (must be >= current size).
+
+    Returns:
+        Dict summarising the changes applied.
+
+    Raises:
+        RuntimeError: If no managed instance exists or an operation fails.
+        ValueError: If no resize parameters are specified.
+    """
+    if instance_type is None and volume_size_gb is None and state_volume_size_gb is None:
+        raise ValueError(
+            "At least one of --instance-type, --volume-size, or "
+            "--state-volume-size must be specified."
+        )
+
+    ec2 = _ec2_client()
+    inst = _find_instance(ec2)
+    if not inst:
+        raise RuntimeError("No edcloud instance found. Run 'edc provision' first.")
+
+    iid = inst["InstanceId"]
+    current_state = inst["State"]["Name"]
+    result: dict[str, Any] = {"instance_id": iid}
+
+    # ------------------------------------------------------------------
+    # Volume resizes (online — no instance stop required)
+    # ------------------------------------------------------------------
+    if volume_size_gb is not None or state_volume_size_gb is not None:
+        bdm = inst.get("BlockDeviceMappings", [])
+        for mapping in bdm:
+            dev = mapping.get("DeviceName")
+            vol_id = mapping.get("Ebs", {}).get("VolumeId")
+            if not vol_id:
+                continue
+
+            vol_resp = ec2.describe_volumes(VolumeIds=[vol_id])
+            vol_info = vol_resp.get("Volumes", [{}])[0]
+            current_size = vol_info.get("Size", 0)
+            tags = {t["Key"]: t["Value"] for t in vol_info.get("Tags", [])}
+            role = tags.get(VOLUME_ROLE_TAG_KEY)
+
+            if dev == "/dev/sda1" and volume_size_gb is not None:
+                if volume_size_gb <= current_size:
+                    log.info(
+                        "  Root volume %s: requested %dGB <= current %dGB — skipping.",
+                        vol_id,
+                        volume_size_gb,
+                        current_size,
+                    )
+                else:
+                    log.info(
+                        "  Expanding root volume %s: %dGB → %dGB",
+                        vol_id,
+                        current_size,
+                        volume_size_gb,
+                    )
+                    ec2.modify_volume(VolumeId=vol_id, Size=volume_size_gb)
+                    result["root_volume_id"] = vol_id
+                    result["root_volume_new_size_gb"] = volume_size_gb
+                    log.info(
+                        "    Volume modification initiated (async). May take several minutes.\n"
+                        "    Poll: aws ec2 describe-volumes-modifications --volume-ids %s\n"
+                        "    After completion, find device with: lsblk\n"
+                        "      Root volume (partitioned): "
+                        "sudo growpart <dev> 1 && sudo resize2fs <dev>p1",
+                        vol_id,
+                    )
+
+            elif role == STATE_VOLUME_ROLE and state_volume_size_gb is not None:
+                if state_volume_size_gb <= current_size:
+                    log.info(
+                        "  State volume %s: requested %dGB <= current %dGB — skipping.",
+                        vol_id,
+                        state_volume_size_gb,
+                        current_size,
+                    )
+                else:
+                    log.info(
+                        "  Expanding state volume %s: %dGB → %dGB",
+                        vol_id,
+                        current_size,
+                        state_volume_size_gb,
+                    )
+                    ec2.modify_volume(VolumeId=vol_id, Size=state_volume_size_gb)
+                    result["state_volume_id"] = vol_id
+                    result["state_volume_new_size_gb"] = state_volume_size_gb
+                    log.info(
+                        "    Volume modification initiated (async). May take several minutes.\n"
+                        "    Poll: aws ec2 describe-volumes-modifications --volume-ids %s\n"
+                        "    After completion, find device with: lsblk\n"
+                        "      State volume (no partition): sudo resize2fs <dev>",
+                        vol_id,
+                    )
+
+    # ------------------------------------------------------------------
+    # Instance type change (requires stop → modify → start)
+    # ------------------------------------------------------------------
+    if instance_type is not None:
+        current_type = inst.get("InstanceType")
+        if instance_type == current_type:
+            log.info("  Instance type is already %s — skipping.", current_type)
+        else:
+            # Stop if running
+            stopped_here = False
+            if current_state == "running":
+                log.info("  Stopping instance %s to change type...", iid)
+                ec2.stop_instances(InstanceIds=[iid])
+                waiter = ec2.get_waiter("instance_stopped")
+                waiter.wait(InstanceIds=[iid], WaiterConfig={"Delay": 15, "MaxAttempts": 40})
+                log.info("  Instance stopped.")
+                stopped_here = True
+            elif current_state != "stopped":
+                raise RuntimeError(
+                    f"Instance {iid} is in state '{current_state}'; "
+                    "cannot change instance type unless running or stopped."
+                )
+
+            log.info("  Changing instance type: %s → %s", current_type, instance_type)
+            try:
+                ec2.modify_instance_attribute(
+                    InstanceId=iid,
+                    InstanceType={"Value": instance_type},
+                )
+            except Exception:
+                if stopped_here:
+                    log.warning(
+                        "  modify_instance_attribute failed; restarting instance %s"
+                        " before re-raising...",
+                        iid,
+                    )
+                    with suppress(ClientError):
+                        ec2.start_instances(InstanceIds=[iid])
+                raise
+            result["instance_type_old"] = str(current_type)
+            result["instance_type_new"] = instance_type
+
+            # Restart if we stopped it
+            if stopped_here:
+                log.info("  Restarting instance %s...", iid)
+                ec2.start_instances(InstanceIds=[iid])
+                waiter = ec2.get_waiter("instance_running")
+                waiter.wait(InstanceIds=[iid], WaiterConfig={"Delay": 15, "MaxAttempts": 40})
+                # Refresh for new IP
+                refreshed = _find_instance(ec2)
+                public_ip = str((refreshed or {}).get("PublicIpAddress", "none"))
+                log.info("  Instance running. Public IP: %s", public_ip)
+                result["public_ip"] = public_ip
+
+    return result

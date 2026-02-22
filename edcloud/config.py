@@ -56,6 +56,8 @@ SECURITY_GROUP_DESC = "edcloud - no public inbound; all access via Tailscale"
 # ---------------------------------------------------------------------------
 # Cost estimation
 # ---------------------------------------------------------------------------
+# Note: rates are approximate us-east-1 on-demand prices (USD/hr).
+# Verify against https://aws.amazon.com/ec2/pricing/on-demand/ for your region.
 HOURLY_RATES: dict[str, float] = {
     "t3a.micro": 0.0094,  # 2 vCPU, 1 GB RAM - minimal workloads only
     "t3a.small": 0.0188,  # 2 vCPU, 2 GB RAM - default for light dev work

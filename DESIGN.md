@@ -18,10 +18,12 @@ Goal: run x86_64 Linux workloads on AWS with low cost, low operational overhead,
 ### 1. Single instance deployment
 
 Decision:
-Use one `t3a.medium` instance for the lab.
+Use one `t3a.small` instance for the lab (default). Use `t3a.medium` for heavier workloads.
 
 Why:
 Portainer and interactive workloads fit better on one host than split `t3a.micro` nodes.
+`t3a.small` (2 vCPU, 2 GB RAM) covers light Docker and dev work at lower cost; upgrade to
+`t3a.medium` (2 vCPU, 4 GB RAM) with `--instance-type t3a.medium` when needed.
 
 Trade-off:
 Slightly higher compute cost than multi-micro layouts, but lower operational complexity.

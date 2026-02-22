@@ -29,7 +29,7 @@ edc provision --cleanup --skip-snapshot
 2. Detect offline Tailscale devices → show manual removal instructions
 3. Detect orphaned volumes → prompt for delete/keep/abort
 
-**Tailscale cleanup:** Manual (opens https://login.tailscale.com/admin/machines). Delete offline `edcloud*` devices to prevent name incrementing.
+**Tailscale cleanup:** Detection is automated (`edc tailscale reconcile` / `edc tailscale reconcile --dry-run`). Deletion requires the Tailscale admin web UI (https://login.tailscale.com/admin/machines). Delete offline `edcloud*` devices to prevent name incrementing.
 
 **Volume cleanup:**
 - Option 1: Delete all (fresh start)
@@ -50,7 +50,17 @@ edc provision --cleanup
 
 ## Cost
 
-Snapshots: ~$0.05/GB/month. 50GB = $2.50/month. Use `edc snapshot --prune` for retention management.
+Snapshots: ~$0.05/GB/month. 36GB ≈ $1.80/month (default: 16GB root + 20GB state). Use `edc snapshot --prune` for retention management.
+
+## Atomic alternative: edc reprovision
+
+Instead of the four-step manual workflow above, use `edc reprovision` for an atomic snapshot → destroy → provision cycle:
+
+```bash
+edc reprovision --confirm-instance-id i-xxx
+```
+
+This is equivalent to the recommended workflow but runs as a single command.
 
 ## Alternative: Ephemeral Tailscale keys
 

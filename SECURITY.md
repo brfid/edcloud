@@ -39,7 +39,7 @@ Core assumptions:
 
 Do not open public issues for security vulnerabilities.
 
-Report privately to the repository owner and include:
+Report privately to [@brfid](https://github.com/brfid) on GitHub and include:
 
 - A clear description
 - Reproduction steps

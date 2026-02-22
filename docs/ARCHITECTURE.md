@@ -8,7 +8,7 @@ edcloud/
 ├── ec2.py          # EC2 lifecycle via boto3
 ├── snapshot.py     # EBS snapshot ops + auto-snapshot
 ├── tailscale.py    # Device discovery, SSH helpers
-├── cleanup.py      # Cleanup orchestration (NEW)
+├── cleanup.py      # Cleanup orchestration
 ├── config.py       # Defaults, InstanceConfig dataclass
 └── aws_check.py    # Credential validation
 ```
@@ -58,7 +58,7 @@ cleanup_orphaned_volumes(mode: str) -> bool
     # Modes: "interactive", "delete", "keep"
     # Finds volumes with edcloud:managed=true, status=available
 
-run_cleanup_workflow(phase: str, skip_snapshot: bool, interactive: bool) -> bool
+run_cleanup_workflow(phase: str, skip_snapshot: bool, interactive: bool, allow_delete_state: bool) -> bool
     # Orchestrates full cleanup (Tailscale + volumes)
     # Phases: "pre-provision" or "post-destroy"
 ```
@@ -98,36 +98,10 @@ Auto-snapshot → Destroy → Tailscale cleanup prompt → Volume cleanup prompt
 Auto-snapshot (if instance exists) → Tailscale cleanup prompt → Volume cleanup → Provision
 ```
 
-## Code metrics
-
-| Metric | Before | After |
-|--------|--------|-------|
-| CLI lines | 650 | 550 |
-| Duplication | ~110 lines | 0 |
-| Modules | 6 | 7 |
-| Tests passing | 42 | 42 |
-
-## Testing gaps
-
-**Current:** Unit tests for tailscale, snapshot, ec2, config.
-
-**Missing:**
-- `cleanup.py` unit tests
-- Integration tests for --cleanup workflow
-- End-to-end provision/destroy cycles
-
-**Add:**
-```python
-# tests/test_cleanup.py
-def test_cleanup_tailscale_devices()
-def test_cleanup_orphaned_volumes_delete_mode()
-def test_run_cleanup_workflow()
-```
-
 ## Future enhancements
 
 **Tailscale API:** Programmatic device removal (requires API key mgmt). Current manual approach simpler for single-operator.
 
-**Reprovision command:** `edc reprovision` = snapshot + destroy --cleanup + provision --cleanup. Atomic operation, less flexible.
+**`edc reprovision`:** Implemented in v0.2.
 
 **Config file:** `~/.config/edcloud/config.yaml` for persistent defaults. Current env vars sufficient for now.

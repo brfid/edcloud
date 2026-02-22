@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,27 +14,129 @@ from edcloud.config import (
     get_volume_ids,
     managed_filter,
 )
-from edcloud.ec2 import _ec2_client, _find_instance
+from edcloud.ec2 import find_instance, get_ec2_client
+
+log = logging.getLogger(__name__)
 
 WEEKLY_PREFIX = "weekly-snapshot"
 MONTHLY_PREFIX = "monthly-snapshot"
+PRECHANGE_SNAPSHOT_PREFIX = "pre-change"
+_SNAPSHOT_WAIT_TIMEOUT_S = 600
+_SNAPSHOT_WAIT_POLL_S = 15
+
+
+def _snapshot_start_time(start_time: str) -> datetime | None:
+    """Parse an ISO-format snapshot timestamp into a UTC-aware datetime.
+
+    Tolerates trailing ``Z`` and naive timestamps (assumed UTC).
+    Returns ``None`` on any parse failure.
+    """
+    raw = start_time.strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def wait_for_snapshot_completion(
+    snapshot_ids: list[str],
+    timeout_s: int = _SNAPSHOT_WAIT_TIMEOUT_S,
+    poll_interval_s: int = _SNAPSHOT_WAIT_POLL_S,
+) -> None:
+    """Poll until all given snapshots reach ``completed`` state.
+
+    Args:
+        snapshot_ids: Snapshot IDs to wait on.
+        timeout_s: Maximum seconds to wait before raising.
+        poll_interval_s: Seconds between poll attempts.
+
+    Raises:
+        TimeoutError: If snapshots do not complete within *timeout_s*.
+        RuntimeError: If any snapshot enters the ``error`` state.
+    """
+    if not snapshot_ids:
+        return
+    ec2 = get_ec2_client()
+    deadline = time.monotonic() + timeout_s
+    pending = set(snapshot_ids)
+    while pending:
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"Timed out after {timeout_s}s waiting for snapshots to complete: "
+                f"{', '.join(sorted(pending))}"
+            )
+        resp = ec2.describe_snapshots(SnapshotIds=list(pending))
+        for s in resp.get("Snapshots", []):
+            sid = s["SnapshotId"]
+            state = s["State"]
+            if state == "completed":
+                pending.discard(sid)
+            elif state == "error":
+                raise RuntimeError(
+                    f"Snapshot {sid} entered error state: {s.get('StateMessage', '')}"
+                )
+        if pending:
+            time.sleep(poll_interval_s)
+
+
+def find_recent_prechange_snapshot(max_age_minutes: int) -> dict[str, object] | None:
+    """Return the freshest completed pre-change snapshot within *max_age_minutes*.
+
+    Args:
+        max_age_minutes: Maximum age of the snapshot in minutes.
+
+    Returns:
+        Snapshot info dict, or ``None`` if nothing qualifies.
+    """
+    now = datetime.now(timezone.utc)
+    freshest: tuple[datetime, dict[str, object]] | None = None
+    for snap_info in list_snapshots():
+        description = str(snap_info.get("description", "")).strip().lower()
+        if not description.startswith(PRECHANGE_SNAPSHOT_PREFIX):
+            continue
+        if snap_info.get("state") != "completed":
+            continue
+        parsed = _snapshot_start_time(str(snap_info.get("start_time", "")))
+        if not parsed:
+            continue
+        age_minutes = (now - parsed).total_seconds() / 60
+        if age_minutes < 0 or age_minutes > max_age_minutes:
+            continue
+        if freshest is None or parsed > freshest[0]:
+            freshest = (parsed, snap_info)
+    return freshest[1] if freshest else None
 
 
 def auto_snapshot_before_destroy() -> list[str]:
     """Snapshot all volumes of the current instance before a destructive op.
 
+    Waits for all snapshots to reach ``completed`` state before returning,
+    so the caller can safely proceed with destructive operations.
+
     Returns:
         List of snapshot IDs created, or empty list if no instance exists.
     """
-    ec2 = _ec2_client()
-    inst = _find_instance(ec2)
+    ec2 = get_ec2_client()
+    inst = find_instance(ec2)
     if not inst:
         # No instance to snapshot
         return []
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
     description = f"auto-pre-destroy-{ts}"
-    return create_snapshot(description)
+    snap_ids = create_snapshot(description)
+    if snap_ids:
+        log.info("Waiting for snapshot(s) to complete before proceeding...")
+        wait_for_snapshot_completion(snap_ids)
+        log.info("Snapshot(s) completed.")
+    return snap_ids
 
 
 def create_snapshot(description: str | None = None) -> list[str]:
@@ -47,8 +151,8 @@ def create_snapshot(description: str | None = None) -> list[str]:
     Raises:
         RuntimeError: If no instance or no volumes are found.
     """
-    ec2 = _ec2_client()
-    inst = _find_instance(ec2)
+    ec2 = get_ec2_client()
+    inst = find_instance(ec2)
     if not inst:
         raise RuntimeError("No edcloud instance found. Nothing to snapshot.")
 
@@ -62,7 +166,7 @@ def create_snapshot(description: str | None = None) -> list[str]:
 
     snapshot_ids = []
     for vid in vol_ids:
-        print(f"Creating snapshot of {vid}...")
+        log.info("Creating snapshot of %s...", vid)
         resp = ec2.create_snapshot(
             VolumeId=vid,
             Description=desc,
@@ -80,10 +184,9 @@ def create_snapshot(description: str | None = None) -> list[str]:
         )
         sid = resp["SnapshotId"]
         snapshot_ids.append(sid)
-        print(f"  Snapshot started: {sid}")
+        log.info("  Snapshot started: %s", sid)
 
-    print()
-    print("Snapshots are creating in the background. Use 'edc snapshot --list' to check.")
+    log.info("Snapshots are creating in the background. Use 'edc snapshot --list' to check.")
     return snapshot_ids
 
 
@@ -94,7 +197,7 @@ def list_snapshots() -> list[dict[str, Any]]:
         Dicts with keys: ``snapshot_id``, ``volume_id``, ``size_gb``,
         ``state``, ``progress``, ``start_time``, ``description``, ``name``.
     """
-    ec2 = _ec2_client()
+    ec2 = get_ec2_client()
     resp = ec2.describe_snapshots(
         Filters=managed_filter(),
         OwnerIds=["self"],
@@ -145,7 +248,7 @@ def prune_snapshots(
     if keep_weekly < 0 or keep_monthly < 0:
         raise ValueError("Retention counts must be >= 0.")
 
-    ec2 = _ec2_client()
+    ec2 = get_ec2_client()
     snapshots = list_snapshots()
 
     weekly = [s for s in snapshots if s["description"].startswith(WEEKLY_PREFIX)]
