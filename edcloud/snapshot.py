@@ -10,6 +10,9 @@ import boto3
 from edcloud.config import MANAGER_TAG_KEY, MANAGER_TAG_VALUE, NAME_TAG
 from edcloud.ec2 import _find_instance, _managed_filter
 
+WEEKLY_PREFIX = "weekly-snapshot"
+MONTHLY_PREFIX = "monthly-snapshot"
+
 
 def _ec2_client() -> Any:
     return boto3.client("ec2")
@@ -66,7 +69,7 @@ def create_snapshot(description: str | None = None) -> list[str]:
         print(f"  Snapshot started: {sid}")
 
     print()
-    print("Snapshots are creating in the background. Use 'edcloud snapshot --list' to check.")
+    print("Snapshots are creating in the background. Use 'edc snapshot --list' to check.")
     return snapshot_ids
 
 
@@ -95,3 +98,42 @@ def list_snapshots() -> list[dict[str, Any]]:
     # Most recent first
     snapshots.sort(key=lambda x: x["start_time"], reverse=True)
     return snapshots
+
+
+def prune_snapshots(
+    keep_weekly: int = 8,
+    keep_monthly: int = 3,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Prune old periodic snapshots.
+
+    Retention policy:
+    - Keep newest ``keep_weekly`` snapshots whose description starts with ``weekly-snapshot``.
+    - Keep newest ``keep_monthly`` snapshots whose description starts with ``monthly-snapshot``.
+
+    Snapshots with other descriptions (for example pre-change snapshots) are not pruned.
+    """
+    if keep_weekly < 0 or keep_monthly < 0:
+        raise ValueError("Retention counts must be >= 0.")
+
+    ec2 = _ec2_client()
+    snapshots = list_snapshots()
+
+    weekly = [s for s in snapshots if s["description"].startswith(WEEKLY_PREFIX)]
+    monthly = [s for s in snapshots if s["description"].startswith(MONTHLY_PREFIX)]
+
+    to_delete = [*weekly[keep_weekly:], *monthly[keep_monthly:]]
+
+    if not dry_run:
+        for snap in to_delete:
+            ec2.delete_snapshot(SnapshotId=snap["snapshot_id"])
+
+    return {
+        "keep_weekly": keep_weekly,
+        "keep_monthly": keep_monthly,
+        "dry_run": dry_run,
+        "weekly_total": len(weekly),
+        "monthly_total": len(monthly),
+        "delete_count": len(to_delete),
+        "to_delete": to_delete,
+    }

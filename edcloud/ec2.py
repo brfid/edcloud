@@ -16,12 +16,18 @@ from botocore.exceptions import ClientError
 from edcloud.config import (
     MANAGER_TAG_KEY,
     MANAGER_TAG_VALUE,
+    NAME_TAG,
     SECURITY_GROUP_DESC,
     SECURITY_GROUP_NAME,
     InstanceConfig,
 )
 
 _USER_DATA_PATH = Path(__file__).resolve().parent.parent / "cloud-init" / "user-data.yaml"
+_ACTIVE_INSTANCE_STATES = ["pending", "running", "stopping", "stopped"]
+
+
+class TagDriftError(RuntimeError):
+    """Tag-based discovery invariants were violated."""
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +52,87 @@ def _managed_filter() -> list[dict[str, Any]]:
     return [{"Name": f"tag:{MANAGER_TAG_KEY}", "Values": [MANAGER_TAG_VALUE]}]
 
 
+def _instance_state_filter() -> dict[str, Any]:
+    return {"Name": "instance-state-name", "Values": _ACTIVE_INSTANCE_STATES}
+
+
+def _has_managed_tag(tags: list[dict[str, str]] | None) -> bool:
+    if not tags:
+        return False
+    for tag in tags:
+        if tag.get("Key") == MANAGER_TAG_KEY and tag.get("Value") == MANAGER_TAG_VALUE:
+            return True
+    return False
+
+
+def _instance_summary(instances: list[dict[str, Any]]) -> str:
+    return ", ".join(f"{i['InstanceId']} ({i['State']['Name']})" for i in instances)
+
+
+def _list_instances(client: Any, filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    resp = client.describe_instances(Filters=[*filters, _instance_state_filter()])
+    instances: list[dict[str, Any]] = []
+    for reservation in resp.get("Reservations", []):
+        instances.extend(reservation.get("Instances", []))
+    return instances
+
+
+def _validate_instance_volume_tags(client: Any, instance: dict[str, Any]) -> None:
+    """Ensure attached volumes keep the managed tag."""
+    volume_ids = [
+        bdm.get("Ebs", {}).get("VolumeId")
+        for bdm in instance.get("BlockDeviceMappings", [])
+        if bdm.get("Ebs", {}).get("VolumeId")
+    ]
+    if not volume_ids:
+        return
+
+    resp = client.describe_volumes(VolumeIds=volume_ids)
+    untagged = [
+        v["VolumeId"] for v in resp.get("Volumes", []) if not _has_managed_tag(v.get("Tags", []))
+    ]
+    if not untagged:
+        return
+
+    ids = " ".join(untagged)
+    raise TagDriftError(
+        "Tag drift detected: attached EBS volume(s) are missing "
+        f"`{MANAGER_TAG_KEY}={MANAGER_TAG_VALUE}`: {', '.join(untagged)}\n"
+        "Remediation:\n"
+        f"  aws ec2 create-tags --resources {ids} "
+        f"--tags Key={MANAGER_TAG_KEY},Value={MANAGER_TAG_VALUE}"
+    )
+
+
+def _managed_orphan_report(client: Any) -> dict[str, list[str]]:
+    """Return orphaned managed resources outside an active managed instance."""
+    report: dict[str, list[str]] = {"security_groups": [], "volumes": []}
+
+    sg_resp = client.describe_security_groups(Filters=_managed_filter())
+    for sg in sg_resp.get("SecurityGroups", []):
+        group_name = sg.get("GroupName")
+        if group_name == SECURITY_GROUP_NAME:
+            report["security_groups"].append(sg["GroupId"])
+
+    vol_resp = client.describe_volumes(Filters=_managed_filter())
+    for volume in vol_resp.get("Volumes", []):
+        if volume.get("State") == "available":
+            report["volumes"].append(volume["VolumeId"])
+
+    return report
+
+
+def _orphaned_resources_text(report: dict[str, list[str]]) -> str:
+    lines: list[str] = []
+    security_groups = report.get("security_groups", [])
+    volumes = report.get("volumes", [])
+    if security_groups:
+        lines.append(f"  Security groups: {', '.join(security_groups)}")
+    if volumes:
+        lines.append(f"  Volumes (available): {', '.join(volumes)}")
+    return "\n".join(lines)
+
+
 def _apply_tags(client: Any, resource_ids: list[str], tags: dict[str, str]) -> None:
     """Apply tags to one or more resources."""
     tag_list = [{"Key": k, "Value": v} for k, v in tags.items()]
@@ -54,39 +141,78 @@ def _apply_tags(client: Any, resource_ids: list[str], tags: dict[str, str]) -> N
 
 def _find_instance(client: Any) -> dict[str, Any] | None:
     """Find the single edcloud-managed instance (any state except terminated)."""
-    resp = client.describe_instances(
-        Filters=[
-            *_managed_filter(),
-            {
-                "Name": "instance-state-name",
-                "Values": [
-                    "pending",
-                    "running",
-                    "stopping",
-                    "stopped",
-                ],
-            },
-        ]
-    )
-    for reservation in resp["Reservations"]:
-        for inst in reservation["Instances"]:
-            return inst  # type: ignore[no-any-return]
-    return None
+    managed_instances = _list_instances(client, _managed_filter())
+    if len(managed_instances) > 1:
+        raise TagDriftError(
+            "Tag drift detected: multiple managed instances found: "
+            f"{_instance_summary(managed_instances)}\n"
+            "Remediation: keep only one managed instance. Terminate extras or remove "
+            f"`{MANAGER_TAG_KEY}` from resources you no longer want managed."
+        )
+
+    if not managed_instances:
+        named_instances = _list_instances(client, [{"Name": "tag:Name", "Values": [NAME_TAG]}])
+        untagged_named = [i for i in named_instances if not _has_managed_tag(i.get("Tags", []))]
+        if untagged_named:
+            instance_ids = " ".join(i["InstanceId"] for i in untagged_named)
+            instance_list = ", ".join(i["InstanceId"] for i in untagged_named)
+            raise TagDriftError(
+                "Tag drift detected: instance(s) tagged `Name=edcloud` are missing "
+                f"`{MANAGER_TAG_KEY}={MANAGER_TAG_VALUE}`: {instance_list}\n"
+                "Remediation:\n"
+                f"  aws ec2 create-tags --resources {instance_ids} "
+                f"--tags Key={MANAGER_TAG_KEY},Value={MANAGER_TAG_VALUE}\n"
+                "  or terminate the stale instance(s) and run `edc provision`."
+            )
+        return None
+
+    inst = managed_instances[0]
+    _validate_instance_volume_tags(client, inst)
+    return inst
 
 
 def _find_security_group(client: Any) -> str | None:
     """Return the edcloud security group ID, or None."""
     try:
         resp = client.describe_security_groups(
-            Filters=[
-                {"Name": "group-name", "Values": [SECURITY_GROUP_NAME]},
-                *_managed_filter(),
-            ]
+            Filters=[{"Name": "group-name", "Values": [SECURITY_GROUP_NAME]}]
         )
     except ClientError:
         return None
+
     groups = resp.get("SecurityGroups", [])
-    return groups[0]["GroupId"] if groups else None
+    managed_groups = [g for g in groups if _has_managed_tag(g.get("Tags", []))]
+    unmanaged_groups = [g for g in groups if not _has_managed_tag(g.get("Tags", []))]
+
+    if len(managed_groups) > 1:
+        raise TagDriftError(
+            "Tag drift detected: multiple managed security groups named "
+            f"`{SECURITY_GROUP_NAME}` found: {', '.join(g['GroupId'] for g in managed_groups)}\n"
+            "Remediation: keep one security group and remove extras."
+        )
+
+    if managed_groups and unmanaged_groups:
+        raise TagDriftError(
+            "Tag drift detected: mixed tagged/untagged security groups share name "
+            f"`{SECURITY_GROUP_NAME}`.\n"
+            f"Managed: {', '.join(g['GroupId'] for g in managed_groups)}\n"
+            f"Untagged: {', '.join(g['GroupId'] for g in unmanaged_groups)}\n"
+            "Remediation: retag or delete the untagged duplicate group(s)."
+        )
+
+    if unmanaged_groups and not managed_groups:
+        ids = " ".join(g["GroupId"] for g in unmanaged_groups)
+        raise TagDriftError(
+            f"Tag drift detected: security group(s) named `{SECURITY_GROUP_NAME}` exist but "
+            f"missing `{MANAGER_TAG_KEY}={MANAGER_TAG_VALUE}`: "
+            f"{', '.join(g['GroupId'] for g in unmanaged_groups)}\n"
+            "Remediation:\n"
+            f"  aws ec2 create-tags --resources {ids} "
+            f"--tags Key={MANAGER_TAG_KEY},Value={MANAGER_TAG_VALUE}\n"
+            "  or delete stale security groups."
+        )
+
+    return managed_groups[0]["GroupId"] if managed_groups else None
 
 
 def _resolve_ami(ssm_parameter: str) -> str:
@@ -101,7 +227,7 @@ def _resolve_ami(ssm_parameter: str) -> str:
             print(f"  SSM parameter {ssm_parameter} not found, falling back to AMI search...")
             ec2 = _ec2_client()
             resp = ec2.describe_images(
-                Owners=["099720109477"],  # Canonical
+                Owners=["099720109477"],  # Canonical's public AWS account (not a secret)
                 Filters=[
                     {
                         "Name": "name",
@@ -153,7 +279,7 @@ def provision(cfg: InstanceConfig, tailscale_auth_key: str) -> dict[str, str]:
         state = existing["State"]["Name"]
         raise RuntimeError(
             f"An edcloud instance already exists: {iid} ({state}). "
-            "Run 'edcloud destroy' first if you want to reprovision."
+            "Run 'edc destroy' first if you want to reprovision."
         )
 
     print("Provisioning edcloud instance...")
@@ -202,6 +328,15 @@ def provision(cfg: InstanceConfig, tailscale_auth_key: str) -> dict[str, str]:
                     "Encrypted": True,
                 },
             },
+            {
+                "DeviceName": cfg.state_volume_device_name,
+                "Ebs": {
+                    "VolumeSize": cfg.state_volume_size_gb,
+                    "VolumeType": cfg.state_volume_type,
+                    "DeleteOnTermination": False,
+                    "Encrypted": True,
+                },
+            },
         ],
         TagSpecifications=[
             {
@@ -236,7 +371,7 @@ def provision(cfg: InstanceConfig, tailscale_auth_key: str) -> dict[str, str]:
     print(f"  Tailscale hostname will be: {cfg.tailscale_hostname}")
     print()
     print("  Cloud-init is installing Docker, Tailscale, and Portainer.")
-    print("  This takes 2-3 minutes. Run 'edcloud status' to check progress.")
+    print("  This takes 2-3 minutes. Run 'edc status' to check progress.")
 
     return {
         "instance_id": instance_id,
@@ -250,7 +385,15 @@ def start() -> str:
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
     if not inst:
-        raise RuntimeError("No edcloud instance found. Run 'edcloud provision' first.")
+        orphaned = _managed_orphan_report(ec2)
+        if orphaned["security_groups"] or orphaned["volumes"]:
+            raise TagDriftError(
+                "No managed edcloud instance found, but orphaned managed resources exist.\n"
+                f"{_orphaned_resources_text(orphaned)}\n"
+                "Remediation: either clean them up manually or run `edc provision` "
+                "to create a fresh managed instance."
+            )
+        raise RuntimeError("No edcloud instance found. Run 'edc provision' first.")
 
     iid = inst["InstanceId"]
     state = inst["State"]["Name"]
@@ -280,6 +423,13 @@ def stop() -> str:
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
     if not inst:
+        orphaned = _managed_orphan_report(ec2)
+        if orphaned["security_groups"] or orphaned["volumes"]:
+            raise TagDriftError(
+                "No managed edcloud instance found, but orphaned managed resources exist.\n"
+                f"{_orphaned_resources_text(orphaned)}\n"
+                "Remediation: clean up stale resources or reprovision."
+            )
         raise RuntimeError("No edcloud instance found.")
 
     iid = inst["InstanceId"]
@@ -307,7 +457,11 @@ def status() -> dict[str, Any]:
     inst = _find_instance(ec2)
 
     if not inst:
-        return {"exists": False}
+        orphaned = _managed_orphan_report(ec2)
+        return {
+            "exists": False,
+            "orphaned_resources": orphaned,
+        }
 
     iid = inst["InstanceId"]
     state = inst["State"]["Name"]
@@ -365,6 +519,14 @@ def destroy(force: bool = False) -> None:
     inst = _find_instance(ec2)
 
     if not inst:
+        orphaned = _managed_orphan_report(ec2)
+        if orphaned["security_groups"] or orphaned["volumes"]:
+            raise TagDriftError(
+                "No managed edcloud instance found, but orphaned managed resources exist.\n"
+                f"{_orphaned_resources_text(orphaned)}\n"
+                "Remediation: delete stale resources manually in AWS or reprovision "
+                "and then run `edc destroy` again."
+            )
         print("No edcloud instance found. Nothing to destroy.")
         return
 

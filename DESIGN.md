@@ -1,166 +1,192 @@
-# edcloud Design Decisions
+# edcloud design decisions
 
-Why edcloud is built the way it is — rationale and trade-offs.
+This file records why edcloud is built as a small, single-instance system.
 
 ## Context
 
-Portfolio piece demonstrating practical cloud infrastructure for running x86_64 Linux workloads (initially vintage computing experiments via SIMH) in a cost-effective, secure, and maintainable way.
+Goal: run x86_64 Linux workloads on AWS with low cost, low operational overhead, and strong default access control.
+
+## Principles
+
+- Prefer simple operating models over broad abstractions.
+- Keep state explicit and discoverable from AWS, not from local files.
+- Optimize for single-operator workflows.
+- Treat host runtime as replaceable; preserve only explicit durable state.
 
 ## Decision log
 
-### 1. Single t3a.medium vs 2x t3a.micro
+### 1. Single instance deployment
 
-**Decision**: One t3a.medium instance running all workloads.
+Decision:
+Use one `t3a.medium` instance for the lab.
 
-**Why**:
-- Two micros (1GB each) creates cross-host networking complexity (Docker overlay, shared volumes via EFS, etc.)
-- Portainer CE needs ~1.5-2GB RAM — won't run on a micro
-- Single-host Docker networking is trivial (`docker network`, shared filesystems via bind mounts)
-- Cost at 4hrs/day: 2× micro = $2.26/mo, 1× medium = $4.51/mo — the $2.25/mo savings isn't worth the operational complexity
+Why:
+Portainer and interactive workloads fit better on one host than split `t3a.micro` nodes.
 
-**Trade-off**: Less cost-efficient at 24/7 usage, but target is 4hrs/day with auto-shutdown.
+Trade-off:
+Slightly higher compute cost than multi-micro layouts, but lower operational complexity.
 
-### 2. Python + boto3 vs Terraform vs CDK
+### 2. Python CLI with boto3 (no Terraform)
 
-**Decision**: Python CLI with boto3, no Terraform.
+Decision:
+Use a Python CLI (`edc`) and boto3 directly.
 
-**Why**:
-- Infrastructure is trivial: 1 instance, 1 SG, 1 volume. Terraform's value (drift detection, state management, dependency graphs) doesn't apply.
-- Python is consistent with the rest of the codebase and allows better testing (pytest + mocks).
-- "It's the standard" isn't sufficient reason to use Terraform for a 5-resource deployment.
-- Existing CDK stack in brfid.github.io was overkill for this simpler setup.
+Why:
+The resource graph is small (instance, security group, EBS, snapshots). Terraform state and module overhead are not necessary at this scale.
 
-**Portfolio justification**: Document the *decision process* — showing judgment about when IaC is warranted. A "migration story" (CLI → Terraform when complexity grows) is a better signal than blindly using Terraform from day one.
+Trade-off:
+No Terraform drift workflow. Resource ownership is enforced with tags.
 
-**Trade-off**: No state file, so resources are tracked by AWS tags (`edcloud:managed=true`). If tags are manually removed, the CLI loses visibility.
+### 3. Portainer CE for operator UX
 
-### 3. Portainer CE vs Coolify vs plain compose
+Decision:
+Use Portainer CE as the container management UI.
 
-**Decision**: Portainer CE.
+Why:
+It provides practical day-to-day value (stack management, logs, exec) without introducing full PaaS behavior.
 
-**Why**:
-- Coolify is designed for web apps (reverse proxy, TLS, git deploys). Workloads here are interactive emulators accessed over Tailscale, not HTTPS services.
-- Portainer's web terminal (exec into containers) is genuinely useful for SIMH console access.
-- 256MB RAM footprint vs Coolify's ~1.5GB.
-- Industry recognition: hiring managers know Portainer.
+Trade-off:
+Higher footprint than plain `docker compose`, but better operator ergonomics.
 
-**Alternative considered**: Dockge (~128MB, compose-file manager with UI). Lighter but less capable — no web terminal, no image management, smaller ecosystem.
+### 4. Tailscale-only networking
 
-**Trade-off**: Portainer is more heavyweight than raw `docker compose` but provides a "platform UX" without Coolify's overhead.
+Decision:
+Expose no inbound security group ports.
 
-### 4. Tailscale-only networking (no public inbound ports)
+Why:
+Access through tailnet identity and encrypted mesh avoids public SSH and public service endpoints.
 
-**Decision**: Security group has zero inbound rules. All access via Tailscale.
+Trade-off:
+Every operator device needs Tailscale.
 
-**Why**:
-- SSH exposure to 0.0.0.0/0 is a known attack vector.
-- Tailscale MagicDNS provides stable hostnames (`edcloud`) even when public IP changes on start/stop.
-- Services (Portainer, SIMH consoles) are only reachable from your tailnet.
-- Simpler than VPN or bastion host setups.
+### 5. Storage model: root + durable state volume
 
-**Trade-off**: Requires Tailscale on all accessing devices. Not viable for public-facing services (but that's not the goal here).
+Decision:
+Use gp3 EBS volumes only:
 
-### 5. gp3 EBS only (no EFS)
+- Root volume for host runtime
+- Dedicated durable state volume mounted at `/opt/edcloud/state`
 
-**Decision**: 80GB gp3 EBS with `DeleteOnTermination=false`, weekly snapshots.
+Why:
+Single-instance workloads do not need EFS. This keeps cost and backup scope predictable.
 
-**Why**:
-- EFS is $0.30/GB/mo (standard tier) vs gp3 at $0.08/GB/mo.
-- Single instance = no need for shared storage.
-- EBS survives stop/start; snapshots provide backup/recovery.
+Trade-off:
+No shared filesystem for multi-instance scaling.
 
-**When to use EFS**: Multi-instance setups where persistent shared state is needed.
+### 6. Snapshot policy over replication
 
-**Trade-off**: No automatic replication. Rely on snapshots for backup.
+Decision:
+Protect data with periodic snapshots and restore drills.
 
-### 6. Instance self-shutdown + manual start
+Why:
+The system is a personal lab; snapshot-based recovery is sufficient and cost-aware.
 
-**Decision**: No Pi scheduler for start. Manual `edcloud up`. Instance shuts itself down after 30 minutes idle.
+Trade-off:
+Recovery depends on tested restore procedure, not instant failover.
 
-**Why**:
-- Unpredictable usage patterns — "warm and waiting at 5pm" scheduler assumes regularity.
-- Idle-shutdown (systemd timer checking Tailscale SSH + CPU load) is more flexible.
-- Manual start from anywhere via CLI is simple enough.
+### 7. Tag-based discovery (no local state file)
 
-**Alternative considered**: Pi cron job to start at scheduled time + hard-stop safety net. Adds dependency on the Pi being up and reachable.
+Decision:
+Discover managed resources by tag (`edcloud:managed=true`).
 
-**Trade-off**: Must remember to `edcloud up`. But auto-shutdown prevents runaway costs from forgetting to stop.
+Why:
+The same command surface works from any operator node without syncing local state.
 
-### 7. Tag-based resource discovery (no local state)
+Trade-off:
+Manual tag removal causes management drift and must be corrected.
 
-**Decision**: All managed resources tagged with `edcloud:managed=true`. CLI queries AWS for them.
+### 8. Manual start + automatic idle shutdown
 
-**Why**:
-- Simpler than maintaining local state files.
-- Enables multi-device usage (run CLI from laptop, Pi, etc. without syncing state).
-- No risk of state file corruption or divergence.
+Decision:
+Start manually with `edc up`; stop automatically after 30 minutes idle.
 
-**Constraint**: Don't manually remove the `edcloud:managed` tag or the CLI loses track.
+Why:
+Usage is irregular. This model reduces cost without scheduler dependencies.
 
-**Trade-off**: Slightly more AWS API calls (describe-instances on every command). Acceptable for this scale.
+Trade-off:
+The operator must start the instance when needed.
 
-### 8. Ubuntu 24.04 LTS
+### 9. Baseline encoded in cloud-init
 
-**Decision**: Latest Ubuntu LTS via SSM parameter lookup.
+Decision:
+Encode core host packages/settings in `cloud-init/user-data.yaml`.
 
-**Why**:
-- 5 years of security updates (until 2029).
-- Docker/Tailscale official repos support it.
-- Cloud-init is well-tested on Ubuntu.
+Why:
+Prevents undocumented snowflake drift and supports reproducible rebuilds.
 
-**Alternative considered**: Amazon Linux 2023. Less familiar development environment.
+Trade-off:
+Operational discipline is required: persistent host changes must be codified.
 
-### 9. Automatic security updates enabled
+### 10. Secrets via AWS SSM Parameter Store
 
-**Decision**: `unattended-upgrades` installed in cloud-init.
+Decision:
+Source runtime secrets from SSM, not repository files.
 
-**Why**:
-- Instance may sit idle for days/weeks. Want security patches applied automatically.
+Why:
+Keeps credentials out of git history and aligns with AWS-native operator tooling.
 
-**Trade-off**: Small risk of update breaking something (e.g., Docker). Mitigated by EBS snapshots before major changes.
+Trade-off:
+Requires IAM permissions and secret bootstrap workflow.
 
-### 10. No SSH key pair provisioned
+### 11. Lightweight operator nodes
 
-**Decision**: No EC2 key pair. Tailscale provides SSH (`tailscale up --ssh`).
+Decision:
+Keep control-plane dependencies lightweight enough for small ARM Linux systems.
 
-**Why**:
-- Don't need to manage/protect private keys.
-- Tailscale SSH uses your existing identity (SSO if configured).
-- Fallback: AWS SSM Session Manager (if Tailscale fails).
+Why:
+Operations should not depend on a heavyweight workstation.
 
-**Trade-off**: Must have Tailscale working to access the instance. SSM Session Manager is available as emergency access.
+Trade-off:
+Avoid adding heavy local tooling for normal workflows.
 
-### 11. Tested via pytest with mocked boto3
+### 12. Test strategy: mocked AWS unit tests
 
-**Decision**: Test suite uses `pytest-mock` to mock boto3 calls, not live AWS integration tests.
+Decision:
+Use pytest with mocked boto3 calls.
 
-**Why**:
-- Fast (no network I/O).
-- No AWS credentials needed for CI/development.
-- Deterministic (no eventual-consistency issues).
+Why:
+Fast and deterministic local feedback without live AWS dependencies.
 
-**Coverage**: Tests verify logic, not live AWS behavior. Provision/start/stop need manual validation in a real AWS environment.
+Trade-off:
+Live AWS behavior still requires manual validation.
 
-**Trade-off**: Doesn't catch AWS API changes or region-specific issues.
+### 13. Persistent `ubuntu` home on durable state volume
+
+Decision:
+Bind-mount `/home/ubuntu` to `/opt/edcloud/state/home/ubuntu` during bootstrap.
+
+Why:
+User settings and local dev state survive reprovision when reusing the state volume.
+
+Trade-off:
+Requires careful migration/mount logic in cloud-init and stronger backup discipline for user data.
+
+### 14. Package strategy: APT-first with Homebrew available
+
+Decision:
+Install baseline tools from Ubuntu APT and install Homebrew for optional package gaps.
+
+Why:
+APT keeps bootstrap predictable and fast; Homebrew remains available when newer or niche tools are needed.
+
+Trade-off:
+Two package ecosystems exist on the host, so baseline runbooks should stay APT-compatible by default.
 
 ## Non-goals
 
-Things explicitly **not** built (and why):
+- Multi-region orchestration
+- Multi-tenant access control
+- Public service hosting
+- Full production monitoring stack
+- Automated infra pipelines for large fleets
 
-- **Multi-region support**: Single-region is simpler. Add if needed.
-- **VPC creation**: Use default VPC. Custom VPC adds unnecessary complexity for one instance.
-- **IAM role creation via CLI**: Assume user has AWS credentials configured with sufficient permissions.
-- **Cloud-init status checking**: Could poll instance until `/tmp/edcloud-ready` exists, but `edcloud status` + manual check is sufficient.
-- **Blue/green deploys**: Overkill for a personal lab instance.
-- **Monitoring/alerting**: CloudWatch is available but not configured. This isn't a production service.
+## Revisit triggers
 
-## Migration path (if outgrowing this design)
+Revisit this design when any of the following become true:
 
-When complexity increases:
-- **Multiple instances**: → Terraform (manage fleet state), or AWS CDK (if Python preference remains)
-- **Custom VPC with subnets/NACLs**: → Terraform modules or CDK constructs
-- **CI/CD for infrastructure**: → GitHub Actions calling Terraform/CDK
-- **Production-grade monitoring**: → CloudWatch dashboards, SNS alerts
-- **Team access**: → IAM roles with scoped permissions, Terraform Cloud/state locking
+- You manage multiple long-lived instances.
+- You need shared state across instances.
+- You need team-owned infrastructure workflows.
+- You need auditable drift management beyond tag-based discovery.
 
-The current design is optimized for "single-user personal lab" — document the upgrade path, don't build it prematurely.
+At that point, move toward Terraform or CDK with explicit state and CI/CD.

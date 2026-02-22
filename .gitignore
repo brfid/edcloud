@@ -52,6 +52,16 @@ config.local.yaml
 .aws/credentials
 .aws/config
 
+# AWS CLI outputs (prevent accidental commits of command outputs)
+aws
+ec2
+ecs
+efs
+s3
+cloudformation
+describe-*
+list-*
+
 # Logs
 *.log
 

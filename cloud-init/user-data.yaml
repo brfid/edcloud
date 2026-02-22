@@ -1,5 +1,5 @@
 #cloud-config
-# edcloud instance bootstrap — Docker, Tailscale, Portainer, self-shutdown
+# edcloud instance bootstrap — Docker, Tailscale, Portainer, self-shutdown, state volume
 # Variables: ${TAILSCALE_AUTH_KEY}, ${TAILSCALE_HOSTNAME}
 
 package_update: true
@@ -7,12 +7,29 @@ package_upgrade: true
 
 packages:
   - apt-transport-https
+  - bash-completion
+  - byobu
   - ca-certificates
   - curl
+  - dnsutils
+  - fd-find
+  - fzf
+  - gh
   - gnupg
+  - git
+  - htop
   - lsb-release
   - jq
+  - neovim
+  - ripgrep
+  - rsync
+  - tmux
+  - tree
   - unattended-upgrades
+  - unzip
+  - vim-tiny
+  - xclip
+  - zip
 
 # --------------------------------------------------------------------------
 # Write files before runcmd
@@ -119,6 +136,78 @@ runcmd:
       -v /var/run/docker.sock:/var/run/docker.sock \
       -v portainer_data:/data \
       portainer/portainer-ce:lts
+
+  # --- Durable state volume (/opt/edcloud/state) ---
+  - |
+    ROOT_SOURCE=$(findmnt -n -o SOURCE /)
+    ROOT_PARENT=$(lsblk -no PKNAME "$ROOT_SOURCE" 2>/dev/null || true)
+    if [ -n "$ROOT_PARENT" ]; then
+      ROOT_DISK="/dev/$ROOT_PARENT"
+    else
+      ROOT_DISK="$ROOT_SOURCE"
+    fi
+
+    STATE_DEV="/dev/sdf"
+    if [ ! -b "$STATE_DEV" ]; then
+      STATE_DEV=$(lsblk -dpno NAME,TYPE | awk '$2=="disk"{print $1}' \
+        | grep -v "^${ROOT_DISK}$" | head -n1 || true)
+    fi
+
+    if [ -z "${STATE_DEV:-}" ] || [ ! -b "$STATE_DEV" ]; then
+      logger -t edcloud "State volume not found; skipping /opt/edcloud/state mount."
+    else
+      if ! blkid "$STATE_DEV" >/dev/null 2>&1; then
+        mkfs.ext4 -F "$STATE_DEV"
+      fi
+      mkdir -p /opt/edcloud/state
+      UUID=$(blkid -s UUID -o value "$STATE_DEV")
+      if ! grep -q "$UUID" /etc/fstab; then
+        echo "UUID=$UUID /opt/edcloud/state ext4 defaults,nofail 0 2" >> /etc/fstab
+      fi
+      mount -a
+
+      # Keep ubuntu home on the durable state volume.
+      mkdir -p /opt/edcloud/state/home/ubuntu
+      if [ -z "$(ls -A /opt/edcloud/state/home/ubuntu 2>/dev/null)" ]; then
+        rsync -a /home/ubuntu/ /opt/edcloud/state/home/ubuntu/
+      fi
+
+      if ! grep -qE '^/opt/edcloud/state/home/ubuntu[[:space:]]+/home/ubuntu[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
+        echo "/opt/edcloud/state/home/ubuntu /home/ubuntu none bind 0 0" >> /etc/fstab
+      fi
+      if ! mountpoint -q /home/ubuntu; then
+        mount /home/ubuntu || mount -a
+      fi
+
+      chown -R ubuntu:ubuntu /opt/edcloud/state
+      chmod 700 /home/ubuntu
+      if [ -d /home/ubuntu/.ssh ]; then
+        chmod 700 /home/ubuntu/.ssh
+      fi
+    fi
+
+  # --- Homebrew + LazyVim baseline ---
+  - |
+    export NONINTERACTIVE=1
+    if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    fi
+
+    cat >/etc/profile.d/edcloud-brew.sh <<'BREWENV'
+    if [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+      eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+    fi
+    BREWENV
+    chmod 0644 /etc/profile.d/edcloud-brew.sh
+
+    runuser -u ubuntu -- bash -lc '
+      set -euo pipefail
+      mkdir -p "$HOME/.config"
+      if [ ! -d "$HOME/.config/nvim" ]; then
+        git clone --depth=1 https://github.com/LazyVim/starter "$HOME/.config/nvim"
+        rm -rf "$HOME/.config/nvim/.git"
+      fi
+    '
 
   # --- Compose directory ---
   - mkdir -p /opt/edcloud/compose
