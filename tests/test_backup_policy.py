@@ -24,7 +24,16 @@ class TestPolicyStatus:
             ]
         }
         mock_dlm.get_lifecycle_policy.return_value = {
-            "Policy": {"PolicyDetails": {"Schedules": [{"Name": "daily-7"}]}}
+            "Policy": {
+                "PolicyDetails": {
+                    "Schedules": [
+                        {"Name": "daily"},
+                        {"Name": "weekly"},
+                        {"Name": "monthly"},
+                        {"Name": "quarterly"},
+                    ]
+                }
+            }
         }
         mock_dlm_client.return_value = mock_dlm
 
@@ -43,13 +52,28 @@ class TestEnsurePolicy:
 
         result = ensure_policy(
             execution_role_arn="arn:aws:iam::123:role/edcloud-dlm",
-            daily_keep=7,
-            weekly_keep=4,
-            monthly_keep=2,
+            daily_keep=1,
+            weekly_keep=1,
+            monthly_keep=1,
+            quarterly_keep=1,
         )
         assert result["action"] == "created"
         assert result["policy_id"] == "policy-new"
-        assert result["monthly_keep"] == 2
+        assert result["quarterly_keep"] == 1
+
+    @patch("edcloud.backup_policy._dlm_client")
+    def test_creates_includes_quarterly_schedule(self, mock_dlm_client):
+        mock_dlm = MagicMock()
+        mock_dlm.get_lifecycle_policies.return_value = {"Policies": []}
+        mock_dlm.create_lifecycle_policy.return_value = {"PolicyId": "policy-new"}
+        mock_dlm_client.return_value = mock_dlm
+
+        ensure_policy(execution_role_arn="arn:aws:iam::123:role/edcloud-dlm")
+
+        call_kwargs = mock_dlm.create_lifecycle_policy.call_args[1]
+        schedule_names = [s["Name"] for s in call_kwargs["PolicyDetails"]["Schedules"]]
+        assert "quarterly" in schedule_names
+        assert len(schedule_names) == 4
 
     @patch("edcloud.backup_policy._dlm_client")
     def test_updates_when_existing(self, mock_dlm_client):
@@ -63,9 +87,10 @@ class TestEnsurePolicy:
 
         result = ensure_policy(
             execution_role_arn="arn:aws:iam::123:role/edcloud-dlm",
-            daily_keep=7,
-            weekly_keep=4,
-            monthly_keep=2,
+            daily_keep=1,
+            weekly_keep=1,
+            monthly_keep=1,
+            quarterly_keep=1,
         )
         assert result["action"] == "updated"
         mock_dlm.update_lifecycle_policy.assert_called_once()

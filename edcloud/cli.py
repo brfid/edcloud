@@ -356,6 +356,17 @@ def provision(
         require_existing_state_volume=require_existing_state_volume,
     )
     _print_audit_summary("post-provision")
+
+    click.echo()
+    click.echo("Applying DLM backup policy...")
+    try:
+        role_arn = iam.ensure_dlm_lifecycle_role({"edcloud:managed": "true", "Name": "edcloud"})
+        backup_policy.ensure_policy(execution_role_arn=role_arn)
+        click.echo("✅ DLM backup policy active (daily/weekly/monthly/quarterly, 1 snapshot each)")
+    except Exception as exc:
+        click.echo(f"Warning: backup policy setup failed: {exc}", err=True)
+        click.echo("  Run 'edc backup-policy apply' manually to enable backups.", err=True)
+
     click.echo()
     click.echo(json.dumps(result, indent=2))
 
@@ -740,6 +751,15 @@ def status() -> None:
         click.echo(f"  Storage: ${cost.get('storage_monthly', 0):.2f}")
         click.echo(f"  Total:   ${cost.get('total_monthly', 0):.2f}")
 
+    # Backup policy
+    bp = backup_policy.policy_status()
+    click.echo()
+    if bp.get("exists"):
+        bp_state = bp.get("state", "UNKNOWN")
+        click.echo(f"Backups:   DLM policy {bp.get('policy_id')}  [{bp_state}]")
+    else:
+        click.echo("Backups:   no DLM policy — run 'edc backup-policy apply' to enable")
+
 
 # ---------------------------------------------------------------------------
 # destroy
@@ -803,6 +823,17 @@ def destroy(
     except RuntimeError as exc:
         click.echo(str(exc), err=True)
         raise SystemExit(1) from exc
+
+    # Warn if DLM backup policy is absent or disabled
+    bp = backup_policy.policy_status()
+    if not bp.get("exists") or bp.get("state") != "ENABLED":
+        bp_detail = (
+            "no DLM policy found" if not bp.get("exists") else f"policy state: {bp.get('state')}"
+        )
+        click.echo(f"Warning: backups are not active ({bp_detail}).", err=True)
+        click.echo("  The state volume has no recent automated snapshots.", err=True)
+        click.echo("  Run 'edc backup-policy apply' to enable backups.", err=True)
+        click.echo()
 
     if info.get("exists") and require_fresh_snapshot:
         recent = snapshot.find_recent_prechange_snapshot(fresh_snapshot_max_age_minutes)
@@ -1045,15 +1076,17 @@ def backup_policy_status_cmd() -> None:
 
 
 @backup_policy_group.command("apply")
-@click.option("--daily-keep", default=7, type=int, show_default=True)
-@click.option("--weekly-keep", default=4, type=int, show_default=True)
-@click.option("--monthly-keep", default=2, type=int, show_default=True)
+@click.option("--daily-keep", default=1, type=int, show_default=True)
+@click.option("--weekly-keep", default=1, type=int, show_default=True)
+@click.option("--monthly-keep", default=1, type=int, show_default=True)
+@click.option("--quarterly-keep", default=1, type=int, show_default=True)
 @click.option("--disabled", is_flag=True, help="Create/update policy in DISABLED state.")
 @require_aws_creds
 def backup_policy_apply_cmd(
     daily_keep: int,
     weekly_keep: int,
     monthly_keep: int,
+    quarterly_keep: int,
     disabled: bool,
 ) -> None:
     """Create or update the managed DLM backup policy."""
@@ -1068,6 +1101,7 @@ def backup_policy_apply_cmd(
         daily_keep=daily_keep,
         weekly_keep=weekly_keep,
         monthly_keep=monthly_keep,
+        quarterly_keep=quarterly_keep,
         enabled=not disabled,
     )
     click.echo(json.dumps(result, indent=2))

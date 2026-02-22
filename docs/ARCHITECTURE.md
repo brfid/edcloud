@@ -35,7 +35,7 @@ edcloud/
 - **Python + boto3 over Terraform:** small resource graph and tag-based ownership make stateful IaC overhead unnecessary here.
 - **Tailscale-only access:** zero inbound SG rules; access is identity-based over tailnet.
 - **Durable state volume + disposable root:** host runtime is replaceable; durable data lives under `/opt/edcloud/state`.
-- **AWS-native backup lifecycle:** DLM retention + restore drills instead of replication/failover complexity.
+- **AWS-native backup lifecycle:** DLM retention (daily/weekly/monthly/quarterly, 1 snapshot each tier) applied automatically on provision. DLM targets EBS volumes by tag and runs independently of instance state — snapshots accumulate whether the instance is up or down.
 - **SSM-backed runtime secrets:** secrets stay out of git and host bootstrap payloads.
 - **Cloud-init as baseline contract:** reproducible host/tooling baseline is codified in `cloud-init/user-data.yaml`.
 - **CLI-first operations model:** commands must remain safe/repeatable from lightweight ARM/Linux operator nodes.
@@ -71,7 +71,10 @@ edcloud/
 
 - AWS DLM policy management is implemented in `backup_policy.py`.
 - Root volume remains disposable; state volume is durable and role-tagged.
+<<<<<<< HEAD
 - Cloud-init runs `loginctl enable-linger ubuntu` so user systemd services start at boot without a login session. Personal services (e.g. `rclone-dropbox.service`) are stored in `~/.config/systemd/user/` on the state volume and therefore survive reprovision automatically. Templates for optional user services live in `templates/operator/systemd-user/`.
+- DLM backup policy is applied automatically on `edc provision`. It targets the state volume by tag and runs whether the instance is running or stopped. Retention: 1 daily (~1 day old), 1 weekly (~1 week old, Sundays), 1 monthly (~1 month old, 1st of month), 1 quarterly (~3 months old, 1st of Jan/Apr/Jul/Oct).
+- `edc status` shows current backup policy state. `edc destroy` warns if no active policy is found.
 
 ## Non-goals
 

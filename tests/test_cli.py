@@ -419,9 +419,10 @@ def test_backup_policy_apply_uses_defaults(
     assert result.exit_code == 0
     mock_ensure_policy.assert_called_once_with(
         execution_role_arn="arn:aws:iam::123:role/edcloud-dlm-lifecycle-role",
-        daily_keep=7,
-        weekly_keep=4,
-        monthly_keep=2,
+        daily_keep=1,
+        weekly_keep=1,
+        monthly_keep=1,
+        quarterly_keep=1,
         enabled=True,
     )
 
