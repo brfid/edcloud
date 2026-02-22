@@ -14,7 +14,9 @@ from edcloud.config import (
 )
 
 
-def managed_volume_filters(*, status: str | None = None, role: str | None = None) -> list[dict[str, Any]]:
+def managed_volume_filters(
+    *, status: str | None = None, role: str | None = None
+) -> list[dict[str, Any]]:
     """Build EC2 filters for managed EBS volumes."""
     filters = [*managed_filter()]
     if status:

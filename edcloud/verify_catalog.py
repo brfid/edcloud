@@ -20,7 +20,9 @@ VERIFY_CHECKS: tuple[VerifyCheck, ...] = (
         "docker data-root points to state volume",
         "docker info --format '{{.DockerRootDir}}' | grep -qx /opt/edcloud/state/docker",
     ),
-    VerifyCheck("portainer container running", "docker ps --format '{{.Names}}' | grep -qx portainer"),
+    VerifyCheck(
+        "portainer container running", "docker ps --format '{{.Names}}' | grep -qx portainer"
+    ),
     VerifyCheck("compose directory exists", "test -d /opt/edcloud/compose"),
     VerifyCheck("compose directory is mounted", "mountpoint -q /opt/edcloud/compose"),
     VerifyCheck(
@@ -30,7 +32,9 @@ VERIFY_CHECKS: tuple[VerifyCheck, ...] = (
         "none[[:space:]]+bind' /etc/fstab",
     ),
     VerifyCheck("portainer data directory exists", "test -d /opt/edcloud/portainer-data"),
-    VerifyCheck("portainer data directory is mounted", "mountpoint -q /opt/edcloud/portainer-data"),
+    VerifyCheck(
+        "portainer data directory is mounted", "mountpoint -q /opt/edcloud/portainer-data"
+    ),
     VerifyCheck(
         "portainer data bind mount configured in fstab",
         "grep -qE "

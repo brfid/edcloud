@@ -105,8 +105,7 @@ def _find_single_state_volume(ec2: Any) -> dict[str, Any]:
     if len(volumes) > 1:
         ids = ", ".join(v["VolumeId"] for v in volumes)
         raise RuntimeError(
-            "Restore drill requires a single managed state volume, "
-            f"but found multiple: {ids}"
+            f"Restore drill requires a single managed state volume, but found multiple: {ids}"
         )
     return volumes[0]
 
@@ -182,7 +181,10 @@ def run_restore_drill(
                     {"Key": "purpose", "Value": "restore-drill"},
                     {"Key": MANAGER_TAG_KEY, "Value": "false"},
                     {"Key": "edcloud:restore-drill", "Value": "true"},
-                    {"Key": "edcloud:restore-drill-source-snapshot", "Value": selected_snapshot_id},
+                    {
+                        "Key": "edcloud:restore-drill-source-snapshot",
+                        "Value": selected_snapshot_id,
+                    },
                     {"Key": "edcloud:restore-drill-source-volume", "Value": state_volume_id},
                 ],
             }

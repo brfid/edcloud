@@ -165,11 +165,7 @@ def resolve_profiles(selected: tuple[str, ...]) -> list[PermissionProfile]:
 
 def required_actions(selected: tuple[str, ...]) -> list[str]:
     """Return unique, sorted IAM actions for selected profiles."""
-    actions = {
-        action
-        for profile in resolve_profiles(selected)
-        for action in profile.actions
-    }
+    actions = {action for profile in resolve_profiles(selected) for action in profile.actions}
     return sorted(actions)
 
 

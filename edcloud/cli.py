@@ -1207,6 +1207,14 @@ def ssh_cmd(user: str, public_ip: bool, ssh_args: tuple[str, ...]) -> None:
     if ssh_args:
         cmd.extend(ssh_args)
 
+    # Remove any stale known_hosts entry so accept-new can pick up the new key
+    # after a rebuild. ssh-keygen -R is a no-op when no entry exists.
+    subprocess.run(  # nosec B603, B607
+        ["ssh-keygen", "-R", target],
+        capture_output=True,
+        check=False,
+    )
+
     os.execvp(cmd[0], cmd)  # nosec B606
 
 

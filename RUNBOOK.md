@@ -702,6 +702,21 @@ Use `edc status` and AWS Cost Explorer to track drift.
 - Validate local tailnet state: `tailscale status`
 - Validate instance and reachability: `edc status`
 
+### SSH host key mismatch after rebuild
+
+`edc ssh` fails with `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED`. This happens after a
+full destroy+provision (new state volume means new SSH host keys). It does **not** happen after
+`edc reprovision`, which preserves host keys via `/opt/edcloud/state/ssh-host-keys`.
+
+Fix (one-time, for an existing local operator):
+
+```bash
+ssh-keygen -f ~/.ssh/known_hosts -R <ip-from-error> && edc ssh
+```
+
+Future connections are handled automatically: `edc ssh` now flushes any stale `known_hosts`
+entry for the target before connecting.
+
 If Cline still asks for browser login on the instance:
 
 Preferred (automation-friendly) path:

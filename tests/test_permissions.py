@@ -36,9 +36,7 @@ def test_policy_source_arn_maps_assumed_role_to_iam_role():
 @patch("edcloud.permissions.sts_client")
 def test_verify_required_actions_reports_missing_actions(mock_sts_client, mock_iam_client):
     mock_sts = MagicMock()
-    mock_sts.get_caller_identity.return_value = {
-        "Arn": "arn:aws:iam::123456789012:user/test-user"
-    }
+    mock_sts.get_caller_identity.return_value = {"Arn": "arn:aws:iam::123456789012:user/test-user"}
     mock_sts_client.return_value = mock_sts
 
     mock_iam = MagicMock()
@@ -59,9 +57,7 @@ def test_verify_required_actions_reports_missing_actions(mock_sts_client, mock_i
 @patch("edcloud.permissions.sts_client")
 def test_verify_required_actions_reports_simulation_error(mock_sts_client, mock_iam_client):
     mock_sts = MagicMock()
-    mock_sts.get_caller_identity.return_value = {
-        "Arn": "arn:aws:iam::123456789012:user/test-user"
-    }
+    mock_sts.get_caller_identity.return_value = {"Arn": "arn:aws:iam::123456789012:user/test-user"}
     mock_sts_client.return_value = mock_sts
 
     mock_iam = MagicMock()
