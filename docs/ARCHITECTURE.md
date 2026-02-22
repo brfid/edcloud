@@ -71,6 +71,7 @@ edcloud/
 
 - AWS DLM policy management is implemented in `backup_policy.py`.
 - Root volume remains disposable; state volume is durable and role-tagged.
+- Cloud-init runs `loginctl enable-linger ubuntu` so user systemd services start at boot without a login session. Personal services (e.g. `rclone-dropbox.service`) are stored in `~/.config/systemd/user/` on the state volume and therefore survive reprovision automatically. Templates for optional user services live in `templates/operator/systemd-user/`.
 
 ## Non-goals
 

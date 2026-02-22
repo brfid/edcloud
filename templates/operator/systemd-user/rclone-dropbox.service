@@ -1,0 +1,19 @@
+[Unit]
+Description=Dropbox via rclone FUSE mount
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStartPre=/bin/mkdir -p %h/Dropbox
+ExecStart=/usr/bin/rclone mount dropbox: %h/Dropbox \
+    --vfs-cache-mode writes \
+    --vfs-cache-max-size 1G \
+    --log-level INFO \
+    --log-file /tmp/rclone-dropbox.log
+ExecStop=/bin/fusermount3 -uz %h/Dropbox
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

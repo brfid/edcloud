@@ -553,6 +553,9 @@ runcmd:
       fi
     '
 
+  # --- Enable user lingering so user systemd services (e.g. rclone-dropbox) run without a login session ---
+  - loginctl enable-linger ubuntu
+
   # --- Enable idle-shutdown timer ---
   - systemctl daemon-reload
   - systemctl enable --now edcloud-idle-shutdown.timer
