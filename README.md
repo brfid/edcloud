@@ -46,6 +46,15 @@ Console.
 - For agent/operator changes: work on task branches (`agent/<topic>-YYYYMMDD`),
   clean history before push, then merge via PR.
 
+## Public collaboration expectations
+
+- Open issues for bugs, reliability gaps, or unclear operator docs.
+- Keep changes scoped and reviewable; prefer focused PRs over broad rewrites.
+- Preserve the core guardrails: Tailscale-only access, managed-tag discovery,
+  and SSM-backed secret handling.
+- For lifecycle-risking changes, include validation notes (for example:
+  `pre-commit run --all-files`, `pytest -q`).
+
 **Core design:**
 - Tailscale-only access (zero inbound rules)
 - Tag-based resource discovery (no state files)
