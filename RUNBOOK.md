@@ -156,7 +156,7 @@ aws ssm put-parameter \
   --name /edcloud/tailscale_auth_key \
   --type SecureString \
   --overwrite \
-  --value 'tskey-auth-...'
+  --value '<TAILSCALE_AUTH_KEY>'
 ```
 
 Use SSM-based provisioning (recommended):

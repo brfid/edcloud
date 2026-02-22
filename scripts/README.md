@@ -14,7 +14,7 @@ Stores GitHub + Tailscale tokens in AWS SSM Parameter Store.
 
 ```bash
 edc setup-ssm-tokens
-edc setup-ssm-tokens --github-token ghp_xxx --tailscale-auth-key tskey-auth-xxx --no-prompt
+edc setup-ssm-tokens --github-token <GITHUB_TOKEN> --tailscale-auth-key <TAILSCALE_AUTH_KEY> --no-prompt
 ```
 
 ## `edc sync-cline-auth`

@@ -63,7 +63,7 @@ pip install -e '.[dev]'
 
 # Store Tailscale key in SSM
 aws ssm put-parameter --name /edcloud/tailscale_auth_key \
-  --type SecureString --value 'tskey-auth-...'
+  --type SecureString --value '<TAILSCALE_AUTH_KEY>'
 
 # Provision
 edc provision
