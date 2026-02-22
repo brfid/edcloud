@@ -5,19 +5,18 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import boto3
 import click
 from botocore.exceptions import BotoCoreError, ClientError
 
 from edcloud import tailscale
+from edcloud.aws_clients import ec2_client as _ec2_client
 from edcloud.config import (
-    MANAGER_TAG_KEY,
-    MANAGER_TAG_VALUE,
     ROOT_VOLUME_ROLE,
     STATE_VOLUME_ROLE,
     VOLUME_ROLE_TAG_KEY,
     tag_value,
 )
+from edcloud.resource_queries import list_managed_volumes
 
 
 def _is_state_volume(vol: Mapping[str, Any]) -> bool:
@@ -66,14 +65,8 @@ def cleanup_orphaned_volumes(mode: str = "interactive", allow_delete_state: bool
     Returns:
         ``True`` if cleanup completed, ``False`` if the user aborted.
     """
-    ec2_client = boto3.client("ec2")
-    resp = ec2_client.describe_volumes(
-        Filters=[
-            {"Name": f"tag:{MANAGER_TAG_KEY}", "Values": [MANAGER_TAG_VALUE]},
-            {"Name": "status", "Values": ["available"]},
-        ]
-    )
-    orphaned_volumes = resp.get("Volumes", [])
+    ec2_client = _ec2_client()
+    orphaned_volumes = list_managed_volumes(ec2_client, status="available")
 
     if not orphaned_volumes:
         click.echo("✅ No orphaned volumes found.")

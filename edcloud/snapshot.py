@@ -11,6 +11,8 @@ from edcloud.config import (
     MANAGER_TAG_KEY,
     MANAGER_TAG_VALUE,
     NAME_TAG,
+    STATE_VOLUME_ROLE,
+    VOLUME_ROLE_TAG_KEY,
     get_volume_ids,
     managed_filter,
 )
@@ -18,11 +20,10 @@ from edcloud.ec2 import find_instance, get_ec2_client
 
 log = logging.getLogger(__name__)
 
-WEEKLY_PREFIX = "weekly-snapshot"
-MONTHLY_PREFIX = "monthly-snapshot"
 PRECHANGE_SNAPSHOT_PREFIX = "pre-change"
 _SNAPSHOT_WAIT_TIMEOUT_S = 600
 _SNAPSHOT_WAIT_POLL_S = 15
+_RESTORE_DRILL_TEMP_NAME = "restore-drill-temp"
 
 
 def _snapshot_start_time(start_time: str) -> datetime | None:
@@ -84,6 +85,149 @@ def wait_for_snapshot_completion(
                 )
         if pending:
             time.sleep(poll_interval_s)
+
+
+def _find_single_state_volume(ec2: Any) -> dict[str, Any]:
+    """Return the single managed state volume.
+
+    Raises:
+        RuntimeError: If zero or multiple managed state volumes are found.
+    """
+    resp = ec2.describe_volumes(
+        Filters=[
+            {"Name": f"tag:{MANAGER_TAG_KEY}", "Values": [MANAGER_TAG_VALUE]},
+            {"Name": f"tag:{VOLUME_ROLE_TAG_KEY}", "Values": [STATE_VOLUME_ROLE]},
+        ]
+    )
+    volumes = list(resp.get("Volumes", []))
+    if not volumes:
+        raise RuntimeError("No managed state volume found for restore drill.")
+    if len(volumes) > 1:
+        ids = ", ".join(v["VolumeId"] for v in volumes)
+        raise RuntimeError(
+            "Restore drill requires a single managed state volume, "
+            f"but found multiple: {ids}"
+        )
+    return volumes[0]
+
+
+def _latest_completed_snapshot_for_volume(ec2: Any, volume_id: str) -> dict[str, Any]:
+    """Return the most recent completed snapshot for *volume_id*."""
+    resp = ec2.describe_snapshots(
+        OwnerIds=["self"],
+        Filters=[
+            {"Name": "volume-id", "Values": [volume_id]},
+            {"Name": "status", "Values": ["completed"]},
+        ],
+    )
+    snapshots = list(resp.get("Snapshots", []))
+    if not snapshots:
+        raise RuntimeError(f"No completed snapshots found for state volume {volume_id}.")
+    snapshots.sort(key=lambda s: s.get("StartTime", ""), reverse=True)
+    return snapshots[0]
+
+
+def _validated_snapshot_for_volume(ec2: Any, snapshot_id: str, volume_id: str) -> dict[str, Any]:
+    """Validate and return a specific snapshot for *volume_id*."""
+    resp = ec2.describe_snapshots(SnapshotIds=[snapshot_id], OwnerIds=["self"])
+    snapshots = list(resp.get("Snapshots", []))
+    if not snapshots:
+        raise RuntimeError(f"Snapshot not found: {snapshot_id}")
+    snap = snapshots[0]
+    snap_volume_id = str(snap.get("VolumeId", ""))
+    if snap_volume_id != volume_id:
+        raise RuntimeError(
+            f"Snapshot {snapshot_id} is for volume {snap_volume_id}, expected {volume_id}."
+        )
+    if snap.get("State") != "completed":
+        raise RuntimeError(
+            f"Snapshot {snapshot_id} is in state {snap.get('State')}; must be completed."
+        )
+    return snap
+
+
+def run_restore_drill(
+    snapshot_id: str | None = None,
+    instance_id: str | None = None,
+    device_name: str = "/dev/sdg",
+    keep_temporary_volume: bool = False,
+) -> dict[str, Any]:
+    """Run a non-destructive EBS restore drill.
+
+    Creates a temporary volume from a state-volume snapshot. Optionally attaches
+    it to a running instance, then detaches/deletes it unless explicitly kept.
+    """
+    ec2 = get_ec2_client()
+    state_volume = _find_single_state_volume(ec2)
+    state_volume_id = str(state_volume["VolumeId"])
+    az = str(state_volume["AvailabilityZone"])
+
+    snapshot = (
+        _validated_snapshot_for_volume(ec2, snapshot_id, state_volume_id)
+        if snapshot_id
+        else _latest_completed_snapshot_for_volume(ec2, state_volume_id)
+    )
+    selected_snapshot_id = str(snapshot["SnapshotId"])
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    created = ec2.create_volume(
+        SnapshotId=selected_snapshot_id,
+        AvailabilityZone=az,
+        VolumeType="gp3",
+        TagSpecifications=[
+            {
+                "ResourceType": "volume",
+                "Tags": [
+                    {"Key": "Name", "Value": f"{_RESTORE_DRILL_TEMP_NAME}-{ts}"},
+                    {"Key": "purpose", "Value": "restore-drill"},
+                    {"Key": MANAGER_TAG_KEY, "Value": "false"},
+                    {"Key": "edcloud:restore-drill", "Value": "true"},
+                    {"Key": "edcloud:restore-drill-source-snapshot", "Value": selected_snapshot_id},
+                    {"Key": "edcloud:restore-drill-source-volume", "Value": state_volume_id},
+                ],
+            }
+        ],
+    )
+    temp_volume_id = str(created["VolumeId"])
+
+    attached = False
+    cleanup_errors: list[str] = []
+    try:
+        ec2.get_waiter("volume_available").wait(VolumeIds=[temp_volume_id])
+        if instance_id:
+            ec2.attach_volume(VolumeId=temp_volume_id, InstanceId=instance_id, Device=device_name)
+            ec2.get_waiter("volume_in_use").wait(VolumeIds=[temp_volume_id])
+            attached = True
+    finally:
+        if not keep_temporary_volume:
+            if instance_id and attached:
+                try:
+                    ec2.detach_volume(VolumeId=temp_volume_id)
+                    ec2.get_waiter("volume_available").wait(VolumeIds=[temp_volume_id])
+                except Exception as exc:  # best-effort cleanup
+                    cleanup_errors.append(f"detach failed for {temp_volume_id}: {exc}")
+            try:
+                ec2.delete_volume(VolumeId=temp_volume_id)
+            except Exception as exc:  # best-effort cleanup
+                cleanup_errors.append(f"delete failed for {temp_volume_id}: {exc}")
+
+    if cleanup_errors:
+        detail = " | ".join(cleanup_errors)
+        raise RuntimeError(
+            "Restore drill encountered cleanup errors. "
+            f"Temporary volume {temp_volume_id} may need manual cleanup: {detail}"
+        )
+
+    return {
+        "success": True,
+        "state_volume_id": state_volume_id,
+        "snapshot_id": selected_snapshot_id,
+        "temporary_volume_id": temp_volume_id,
+        "attached_to_instance": bool(instance_id),
+        "instance_id": instance_id,
+        "device_name": device_name if instance_id else None,
+        "temporary_volume_kept": keep_temporary_volume,
+    }
 
 
 def find_recent_prechange_snapshot(max_age_minutes: int) -> dict[str, object] | None:
@@ -157,9 +301,21 @@ def create_snapshot(description: str | None = None) -> list[str]:
         raise RuntimeError("No edcloud instance found. Nothing to snapshot.")
 
     iid = inst["InstanceId"]
-    vol_ids = get_volume_ids(inst)
-    if not vol_ids:
+    all_vol_ids = get_volume_ids(inst)
+    if not all_vol_ids:
         raise RuntimeError(f"No EBS volumes found on instance {iid}.")
+
+    # Only snapshot state volumes — root is disposable and rebuilt by cloud-init.
+    vol_resp = ec2.describe_volumes(VolumeIds=all_vol_ids)
+    vol_ids = [
+        v["VolumeId"]
+        for v in vol_resp.get("Volumes", [])
+        if {t["Key"]: t["Value"] for t in v.get("Tags", [])}.get(VOLUME_ROLE_TAG_KEY)
+        == STATE_VOLUME_ROLE
+    ]
+    if not vol_ids:
+        log.warning("No state-tagged volumes found; snapshotting all volumes as fallback.")
+        vol_ids = all_vol_ids
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M")
     desc = description or f"edcloud snapshot {ts}"
@@ -223,49 +379,40 @@ def list_snapshots() -> list[dict[str, Any]]:
 
 
 def prune_snapshots(
-    keep_weekly: int = 8,
-    keep_monthly: int = 3,
+    keep_last: int = 3,
     dry_run: bool = True,
 ) -> dict[str, Any]:
-    """Prune old periodic snapshots per a retention policy.
+    """Delete all but the most recent *keep_last* snapshots.
 
-    Retention:
-        * Keep newest *keep_weekly* snapshots prefixed ``weekly-snapshot``.
-        * Keep newest *keep_monthly* snapshots prefixed ``monthly-snapshot``.
-        * Snapshots with other descriptions (e.g. ``pre-change``) are never pruned.
+    Snapshots are ordered newest-first; the oldest beyond *keep_last* are
+    removed.  All snapshots are eligible regardless of description prefix.
 
     Args:
-        keep_weekly: Number of weekly snapshots to retain.
-        keep_monthly: Number of monthly snapshots to retain.
+        keep_last: Number of most-recent snapshots to retain.
         dry_run: Preview deletions without applying when ``True``.
 
     Returns:
         Summary dict with counts and the list of snapshots to delete.
 
     Raises:
-        ValueError: If retention counts are negative.
+        ValueError: If *keep_last* is negative.
     """
-    if keep_weekly < 0 or keep_monthly < 0:
-        raise ValueError("Retention counts must be >= 0.")
+    if keep_last < 0:
+        raise ValueError("keep_last must be >= 0.")
 
     ec2 = get_ec2_client()
-    snapshots = list_snapshots()
+    snapshots = list_snapshots()  # newest first
 
-    weekly = [s for s in snapshots if s["description"].startswith(WEEKLY_PREFIX)]
-    monthly = [s for s in snapshots if s["description"].startswith(MONTHLY_PREFIX)]
-
-    to_delete = [*weekly[keep_weekly:], *monthly[keep_monthly:]]
+    to_delete = snapshots[keep_last:]
 
     if not dry_run:
         for snap in to_delete:
             ec2.delete_snapshot(SnapshotId=snap["snapshot_id"])
 
     return {
-        "keep_weekly": keep_weekly,
-        "keep_monthly": keep_monthly,
+        "keep_last": keep_last,
         "dry_run": dry_run,
-        "weekly_total": len(weekly),
-        "monthly_total": len(monthly),
+        "total": len(snapshots),
         "delete_count": len(to_delete),
         "to_delete": to_delete,
     }

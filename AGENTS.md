@@ -13,28 +13,46 @@ Priorities:
 ## Start-here order
 
 1. `README.md`
-2. `SECURITY.md`
-3. `DESIGN.md`
-4. `SETUP.md`
-5. `edcloud/` package code
+2. `CHANGELOG.md` (`[Unreleased]` first)
+3. `SECURITY.md`
+4. `RUNBOOK.md`
+5. `docs/ARCHITECTURE.md`
+6. `edcloud/` package code
 
 ## Source of truth
 
+- Current mutable status / active queue: `CHANGELOG.md` under `[Unreleased]`
 - AWS resources: tag-based discovery via `edcloud:managed=true`
 - Runtime secrets: AWS SSM Parameter Store
 - Config defaults: `edcloud/config.py`
 - Bootstrap baseline: `cloud-init/user-data.yaml`
 - Tests: `tests/`
-- Operator runbook and backup policy: `SETUP.md`
+- Operator runbook and backup policy: `RUNBOOK.md`
+
+## Changelog memory model
+
+Use `CHANGELOG.md` as agent working memory.
+
+- `## [Unreleased]` must keep these subcategories in order:
+  1. `Current State`
+  2. `Active Priorities`
+  3. `In Progress`
+  4. `Blocked`
+  5. `Decisions Needed`
+  6. `Recently Completed`
+- Keep every subcategory present; if empty, use `- None.`.
+- Dated entries (`## [YYYY-MM-DD]`) should use standard Keep a Changelog categories.
 
 ## Task source
 
-Primary TODO list: `SETUP.md` under `Active priorities`.
+Primary TODO list: `CHANGELOG.md` under `[Unreleased]` → `Active Priorities`.
+
+Secondary procedural backlog: `RUNBOOK.md` checklists.
 
 Optional TODO scan:
 
 ```bash
-grep -RInE "TODO|FIXME|TBD|\[ \]" README.md SETUP.md DESIGN.md AGENTS.md edcloud tests cloud-init compose
+grep -RInE "TODO|FIXME|TBD|\[ \]" README.md CHANGELOG.md RUNBOOK.md AGENTS.md docs/ARCHITECTURE.md edcloud tests cloud-init compose
 ```
 
 ## Constraints
@@ -48,7 +66,7 @@ grep -RInE "TODO|FIXME|TBD|\[ \]" README.md SETUP.md DESIGN.md AGENTS.md edcloud
 ### Documentation policy
 
 - Do not create new markdown files unless explicitly requested.
-- Update existing docs instead (`README.md`, `SECURITY.md`, `DESIGN.md`, `SETUP.md`, `AGENTS.md`).
+- Update existing docs instead (`README.md`, `CHANGELOG.md`, `SECURITY.md`, `RUNBOOK.md`, `docs/ARCHITECTURE.md`, `AGENTS.md`).
 - Use CommonMark-compatible formatting.
 
 ### Operational guardrails

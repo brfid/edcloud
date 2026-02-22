@@ -1,26 +1,32 @@
-# Scripts
+# Script migrations
 
-## setup-ssm-tokens.sh
+The repository intentionally moved non-trivial operational shell scripts to
+Python CLI commands for maintainability and portfolio consistency.
+
+## Replacements
+
+- `scripts/setup-ssm-tokens.sh` → `edc setup-ssm-tokens`
+- `scripts/sync-cline-auth-to-ec2.sh` → `edc sync-cline-auth`
+
+## `edc setup-ssm-tokens`
 
 Stores GitHub + Tailscale tokens in AWS SSM Parameter Store.
 
-**Usage:**
 ```bash
-./scripts/setup-ssm-tokens.sh
+edc setup-ssm-tokens
+edc setup-ssm-tokens --github-token ghp_xxx --tailscale-auth-key tskey-auth-xxx --no-prompt
 ```
 
-**Actions:**
-1. Extracts GitHub token from `gh auth token`
-2. Prompts for Tailscale auth key
-3. Stores both as SecureString in SSM:
-   - `/edcloud/github_token`
-   - `/edcloud/tailscale_auth_key`
+## `edc sync-cline-auth`
 
-**Prerequisites:** AWS CLI, `gh` authenticated, Tailscale key from https://login.tailscale.com/admin/settings/keys
+Syncs Cline ChatGPT Subscription OAuth auth from a browser-capable source
+machine to a headless remote host (for example, edcloud EC2), with safe backup
+before overwrite.
 
-**Verification:**
 ```bash
-aws ssm describe-parameters --filters "Key=Name,Values=/edcloud/"
+edc sync-cline-auth --remote ubuntu@edcloud
+edc sync-cline-auth               # syncs secrets + globalState by default
+edc sync-cline-auth --secrets-only
+edc sync-cline-auth --remote-diagnostics
+edc sync-cline-auth --dry-run
 ```
-
-**Cost:** Free (standard parameters, AWS-managed KMS).

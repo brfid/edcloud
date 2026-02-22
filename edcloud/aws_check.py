@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
+
+from edcloud.aws_clients import aws_region, sts_client
 
 
 def check_aws_credentials() -> tuple[bool, str]:
@@ -13,7 +14,7 @@ def check_aws_credentials() -> tuple[bool, str]:
         ``(is_valid, human_message)`` tuple.
     """
     try:
-        sts = boto3.client("sts")
+        sts = sts_client()
         identity = sts.get_caller_identity()
         account = identity.get("Account", "unknown")
         user_arn = identity.get("Arn", "unknown")
@@ -32,7 +33,6 @@ def check_aws_credentials() -> tuple[bool, str]:
 def get_region() -> str | None:
     """Return the configured AWS region, or ``None`` if unavailable."""
     try:
-        session = boto3.session.Session()
-        return session.region_name
+        return aws_region()
     except BotoCoreError:
         return None

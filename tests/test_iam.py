@@ -3,7 +3,12 @@
 from unittest.mock import MagicMock, patch
 
 from edcloud.config import INSTANCE_PROFILE_NAME, INSTANCE_ROLE_NAME, MANAGER_TAG_KEY
-from edcloud.iam import delete_instance_profile, ensure_instance_profile, find_instance_profile
+from edcloud.iam import (
+    delete_instance_profile,
+    ensure_dlm_lifecycle_role,
+    ensure_instance_profile,
+    find_instance_profile,
+)
 
 
 class TestFindInstanceProfile:
@@ -187,3 +192,48 @@ class TestPolicyContent:
         assert stmt["Effect"] == "Allow"
         assert stmt["Principal"]["Service"] == "ec2.amazonaws.com"
         assert stmt["Action"] == "sts:AssumeRole"
+
+    def test_dlm_trust_policy_structure(self):
+        from edcloud.iam import _dlm_trust_policy
+
+        policy = _dlm_trust_policy()
+
+        assert policy["Version"] == "2012-10-17"
+        assert len(policy["Statement"]) == 1
+        stmt = policy["Statement"][0]
+        assert stmt["Effect"] == "Allow"
+        assert stmt["Principal"]["Service"] == "dlm.amazonaws.com"
+        assert stmt["Action"] == "sts:AssumeRole"
+
+
+class TestEnsureDlmLifecycleRole:
+    @patch("edcloud.iam._iam_client")
+    def test_creates_role_when_missing(self, mock_iam_client):
+        from botocore.exceptions import ClientError
+
+        mock_client = MagicMock()
+        mock_client.get_role.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchEntity"}}, "GetRole"
+        )
+        mock_client.create_role.return_value = {
+            "Role": {"Arn": "arn:aws:iam::123:role/edcloud-dlm-lifecycle-role"}
+        }
+        mock_iam_client.return_value = mock_client
+
+        role_arn = ensure_dlm_lifecycle_role({MANAGER_TAG_KEY: "true", "Name": "edcloud"})
+        assert role_arn == "arn:aws:iam::123:role/edcloud-dlm-lifecycle-role"
+        mock_client.create_role.assert_called_once()
+        mock_client.attach_role_policy.assert_called_once()
+
+    @patch("edcloud.iam._iam_client")
+    def test_reuses_existing_role(self, mock_iam_client):
+        mock_client = MagicMock()
+        mock_client.get_role.return_value = {
+            "Role": {"Arn": "arn:aws:iam::123:role/edcloud-dlm-lifecycle-role"}
+        }
+        mock_iam_client.return_value = mock_client
+
+        role_arn = ensure_dlm_lifecycle_role({MANAGER_TAG_KEY: "true"})
+        assert role_arn == "arn:aws:iam::123:role/edcloud-dlm-lifecycle-role"
+        mock_client.create_role.assert_not_called()
+        mock_client.attach_role_policy.assert_called_once()

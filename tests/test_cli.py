@@ -8,7 +8,7 @@ from click.testing import CliRunner
 from edcloud.cli import main
 
 
-@patch("edcloud.cli.boto3.client")
+@patch("edcloud.cli.ssm_client")
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
 @patch("edcloud.cli.get_region", return_value="us-east-1")
@@ -18,11 +18,11 @@ def test_provision_reads_tailscale_key_from_ssm(
     _mock_region,
     _mock_conflicts,
     mock_provision,
-    mock_boto3_client,
+    mock_ssm_client,
 ):
     ssm = MagicMock()
     ssm.get_parameter.return_value = {"Parameter": {"Value": "tailscale-test-key"}}
-    mock_boto3_client.return_value = ssm
+    mock_ssm_client.return_value = ssm
     mock_provision.return_value = {
         "instance_id": "i-abc123",
         "security_group_id": "sg-abc123",
@@ -47,7 +47,7 @@ def test_provision_reads_tailscale_key_from_ssm(
     assert call_kwargs["WithDecryption"] is False
 
 
-@patch("edcloud.cli.boto3.client")
+@patch("edcloud.cli.ssm_client")
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
 @patch("edcloud.cli.get_region", return_value="us-east-1")
@@ -57,11 +57,11 @@ def test_provision_reads_tailscale_key_from_ssm_envvar(
     _mock_region,
     _mock_conflicts,
     mock_provision,
-    mock_boto3_client,
+    mock_ssm_client,
 ):
     ssm = MagicMock()
     ssm.get_parameter.return_value = {"Parameter": {"Value": "exists"}}
-    mock_boto3_client.return_value = ssm
+    mock_ssm_client.return_value = ssm
     mock_provision.return_value = {
         "instance_id": "i-abc123",
         "security_group_id": "sg-abc123",
@@ -84,7 +84,7 @@ def test_provision_reads_tailscale_key_from_ssm_envvar(
     assert call_kwargs["WithDecryption"] is False
 
 
-@patch("edcloud.cli.boto3.client")
+@patch("edcloud.cli.ssm_client")
 @patch("edcloud.cli.tailscale.tailscale_available", return_value=False)
 @patch("edcloud.cli.get_region", return_value="us-east-1")
 @patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
@@ -92,7 +92,7 @@ def test_provision_requires_tailscale_key(
     _mock_creds,
     _mock_region,
     _mock_tailscale_available,
-    mock_boto3_client,
+    mock_ssm_client,
 ):
     from botocore.exceptions import ClientError
 
@@ -101,7 +101,7 @@ def test_provision_requires_tailscale_key(
         {"Error": {"Code": "ParameterNotFound"}},
         "GetParameter",
     )
-    mock_boto3_client.return_value = ssm
+    mock_ssm_client.return_value = ssm
     runner = CliRunner()
     result = runner.invoke(main, ["provision"])
 
@@ -257,6 +257,190 @@ def test_snapshot_rejects_conflicting_modes(_mock_creds, _mock_region):
     assert "use either --list or --prune" in result.output
 
 
+@patch("edcloud.cli.snapshot.list_snapshots")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_snapshot_cost_reports_over_cap_warning(
+    _mock_creds,
+    _mock_region,
+    mock_list_snapshots,
+):
+    mock_list_snapshots.return_value = [
+        {"snapshot_id": "snap-1", "state": "completed", "size_gb": 30},
+        {"snapshot_id": "snap-2", "state": "completed", "size_gb": 20},
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["snapshot-cost"])
+    assert result.exit_code == 0
+    assert '"over_soft_cap": true' in result.output
+    assert "exceeds soft cap" in result.output
+
+
+@patch("edcloud.cli.snapshot.list_snapshots")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_snapshot_cost_fail_on_cap_returns_nonzero(
+    _mock_creds,
+    _mock_region,
+    mock_list_snapshots,
+):
+    mock_list_snapshots.return_value = [
+        {"snapshot_id": "snap-1", "state": "completed", "size_gb": 50},
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["snapshot-cost", "--fail-on-cap"])
+    assert result.exit_code == 1
+
+
+@patch("edcloud.cli.snapshot.list_snapshots")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_snapshot_cost_rejects_invalid_inputs(
+    _mock_creds,
+    _mock_region,
+    mock_list_snapshots,
+):
+    mock_list_snapshots.return_value = []
+    runner = CliRunner()
+    result = runner.invoke(main, ["snapshot-cost", "--soft-cap-usd", "0"])
+    assert result.exit_code == 1
+    assert "soft-cap-usd must be > 0" in result.output
+
+
+@patch("edcloud.cli.snapshot.run_restore_drill")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_restore_drill_runs_with_defaults(
+    _mock_creds,
+    _mock_region,
+    mock_restore_drill,
+):
+    mock_restore_drill.return_value = {
+        "success": True,
+        "snapshot_id": "snap-abc",
+        "temporary_volume_id": "vol-temp",
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["restore-drill"])
+
+    assert result.exit_code == 0
+    mock_restore_drill.assert_called_once_with(
+        snapshot_id=None,
+        instance_id=None,
+        device_name="/dev/sdg",
+        keep_temporary_volume=False,
+    )
+
+
+@patch("edcloud.cli.ec2.status")
+@patch("edcloud.cli.snapshot.run_restore_drill")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_restore_drill_attach_managed_instance_uses_running_instance(
+    _mock_creds,
+    _mock_region,
+    mock_restore_drill,
+    mock_status,
+):
+    mock_status.return_value = {
+        "exists": True,
+        "state": "running",
+        "instance_id": "i-abc123",
+    }
+    mock_restore_drill.return_value = {
+        "success": True,
+        "snapshot_id": "snap-abc",
+        "temporary_volume_id": "vol-temp",
+        "instance_id": "i-abc123",
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["restore-drill", "--attach-managed-instance"])
+
+    assert result.exit_code == 0
+    mock_restore_drill.assert_called_once_with(
+        snapshot_id=None,
+        instance_id="i-abc123",
+        device_name="/dev/sdg",
+        keep_temporary_volume=False,
+    )
+
+
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_restore_drill_rejects_conflicting_instance_flags(_mock_creds, _mock_region):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["restore-drill", "--instance-id", "i-abc123", "--attach-managed-instance"],
+    )
+
+    assert result.exit_code == 1
+    assert "use either --instance-id or --attach-managed-instance" in result.output
+
+
+@patch("edcloud.cli.backup_policy.policy_status")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_backup_policy_status_outputs_json(
+    _mock_creds,
+    _mock_region,
+    mock_status,
+):
+    mock_status.return_value = {
+        "exists": True,
+        "policy_id": "policy-123",
+        "state": "ENABLED",
+    }
+    runner = CliRunner()
+    result = runner.invoke(main, ["backup-policy", "status"])
+    assert result.exit_code == 0
+    assert "policy-123" in result.output
+
+
+@patch("edcloud.cli.backup_policy.ensure_policy")
+@patch("edcloud.cli.iam.ensure_dlm_lifecycle_role")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_backup_policy_apply_uses_defaults(
+    _mock_creds,
+    _mock_region,
+    mock_ensure_role,
+    mock_ensure_policy,
+):
+    mock_ensure_role.return_value = "arn:aws:iam::123:role/edcloud-dlm-lifecycle-role"
+    mock_ensure_policy.return_value = {
+        "action": "created",
+        "policy_id": "policy-123",
+    }
+    runner = CliRunner()
+    result = runner.invoke(main, ["backup-policy", "apply"])
+    assert result.exit_code == 0
+    mock_ensure_policy.assert_called_once_with(
+        execution_role_arn="arn:aws:iam::123:role/edcloud-dlm-lifecycle-role",
+        daily_keep=7,
+        weekly_keep=4,
+        monthly_keep=2,
+        enabled=True,
+    )
+
+
+@patch("edcloud.cli.backup_policy.disable_policy")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_backup_policy_disable(
+    _mock_creds,
+    _mock_region,
+    mock_disable,
+):
+    mock_disable.return_value = {"exists": True, "state": "DISABLED"}
+    runner = CliRunner()
+    result = runner.invoke(main, ["backup-policy", "disable"])
+    assert result.exit_code == 0
+    assert "DISABLED" in result.output
+
+
 @patch("edcloud.cli.subprocess.run")
 @patch("edcloud.cli.ec2.status")
 @patch("edcloud.cli.get_region", return_value="us-east-1")
@@ -300,46 +484,211 @@ def test_verify_fails_when_remote_checks_fail(
     assert "Overall: FAIL" in result.output
 
 
-@patch("edcloud.cli.boto3.client")
+@patch("edcloud.cli._fetch_tailscale_auth_key_from_ssm", return_value="tailscale-test-key")
 @patch("edcloud.cli.get_region", return_value="us-east-1")
 @patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
 def test_load_tailscale_env_key_shell_export(
     _mock_creds,
     _mock_region,
-    mock_boto3_client,
+    _mock_fetch,
 ):
-    ssm = MagicMock()
-    ssm.get_parameter.return_value = {"Parameter": {"Value": "tailscale-test-key"}}
-    mock_boto3_client.return_value = ssm
-
     runner = CliRunner()
     result = runner.invoke(main, ["load-tailscale-env-key"])
 
     assert result.exit_code == 0
     assert "export TAILSCALE_AUTH_KEY=tailscale-test-key" in result.output
-    ssm.get_parameter.assert_called_once_with(
-        Name="/edcloud/tailscale_auth_key",
-        WithDecryption=True,
-    )
 
 
-@patch("edcloud.cli.boto3.client")
+@patch("edcloud.cli._fetch_tailscale_auth_key_from_ssm", return_value="tailscale-test-key")
 @patch("edcloud.cli.get_region", return_value="us-east-1")
 @patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
 def test_load_tailscale_env_key_requires_output_mode(
     _mock_creds,
     _mock_region,
-    mock_boto3_client,
+    _mock_fetch,
 ):
-    ssm = MagicMock()
-    ssm.get_parameter.return_value = {"Parameter": {"Value": "tailscale-test-key"}}
-    mock_boto3_client.return_value = ssm
-
     runner = CliRunner()
     result = runner.invoke(main, ["load-tailscale-env-key", "--no-shell-export"])
 
     assert result.exit_code == 1
     assert "No output selected" in result.output
+
+
+@patch("edcloud.cli.ssm_client")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_setup_ssm_tokens_stores_tokens(_mock_creds, _mock_region, mock_ssm_client):
+    ssm = MagicMock()
+    ssm.describe_parameters.return_value = {
+        "Parameters": [
+            {"Name": "/edcloud/github_token"},
+            {"Name": "/edcloud/tailscale_auth_key"},
+        ]
+    }
+    mock_ssm_client.return_value = ssm
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "setup-ssm-tokens",
+            "--github-token",
+            "ghp-test",
+            "--tailscale-auth-key",
+            "tskey-auth-test",
+            "--no-prompt",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert ssm.put_parameter.call_count == 2
+    put_calls = [call.kwargs["Name"] for call in ssm.put_parameter.call_args_list]
+    assert "/edcloud/github_token" in put_calls
+    assert "/edcloud/tailscale_auth_key" in put_calls
+
+
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_setup_ssm_tokens_rejects_nonstandard_tailscale_key_without_prompt(
+    _mock_creds, _mock_region
+):
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "setup-ssm-tokens",
+            "--tailscale-auth-key",
+            "bad-key",
+            "--no-prompt",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Refusing to store non-standard Tailscale key" in result.output
+
+
+def test_sync_cline_auth_dry_run_success(tmp_path):
+    secrets_file = tmp_path / "secrets.json"
+    secrets_file.write_text(
+        '{"openai-codex-oauth-credentials": {"token": "abc"}}',
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "sync-cline-auth",
+            "--source-secrets",
+            str(secrets_file),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Would backup and sync files" in result.output
+
+
+def test_sync_cline_auth_missing_expected_key_fails(tmp_path):
+    secrets_file = tmp_path / "secrets.json"
+    secrets_file.write_text('{"other": true}', encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["sync-cline-auth", "--source-secrets", str(secrets_file), "--dry-run"],
+    )
+
+    assert result.exit_code == 1
+    assert "Missing expected key in secrets.json" in result.output
+
+
+@patch("edcloud.cli._run_checked")
+def test_sync_cline_auth_runs_ssh_scp_flow(mock_run_checked, tmp_path):
+    secrets_file = tmp_path / "secrets.json"
+    global_state_file = tmp_path / "globalState.json"
+    secrets_file.write_text(
+        '{"openai-codex-oauth-credentials": {"token": "abc"}}',
+        encoding="utf-8",
+    )
+    global_state_file.write_text('{"x": 1}', encoding="utf-8")
+
+    mock_run_checked.return_value = MagicMock(stdout="")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "sync-cline-auth",
+            "--remote",
+            "ubuntu@edcloud",
+            "--source-secrets",
+            str(secrets_file),
+            "--include-global-state",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert mock_run_checked.call_count == 5
+
+
+def test_sync_cline_auth_missing_global_state_warns_and_continues_dry_run(tmp_path):
+    secrets_file = tmp_path / "secrets.json"
+    secrets_file.write_text(
+        '{"openai-codex-oauth-credentials": {"token": "abc"}}',
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "sync-cline-auth",
+            "--source-secrets",
+            str(secrets_file),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Warning: globalState.json not found" in result.output
+    assert "Would backup and sync files" in result.output
+
+
+@patch("edcloud.cli._run_checked")
+def test_sync_cline_auth_remote_diagnostics_runs_before_sync(mock_run_checked, tmp_path):
+    secrets_file = tmp_path / "secrets.json"
+    secrets_file.write_text(
+        '{"openai-codex-oauth-credentials": {"token": "abc"}}',
+        encoding="utf-8",
+    )
+
+    mock_run_checked.side_effect = [
+        MagicMock(stdout="remote diagnostics:\n  user: ubuntu\n"),
+        MagicMock(stdout=""),
+        MagicMock(stdout=""),
+        MagicMock(stdout=""),
+        MagicMock(stdout=""),
+    ]
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "sync-cline-auth",
+            "--source-secrets",
+            str(secrets_file),
+            "--remote-diagnostics",
+            "--secrets-only",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "remote diagnostics:" in result.output
+    assert mock_run_checked.call_count == 5
+    first_cmd = mock_run_checked.call_args_list[0].args[0]
+    assert first_cmd[0] == "ssh"
+    assert "whoami" in first_cmd[-1]
 
 
 @patch("edcloud.cli.ec2.destroy")
@@ -376,7 +725,17 @@ def test_destroy_with_matching_confirm_id_calls_destroy(
     mock_status.return_value = {"exists": True, "instance_id": "i-abc123"}
 
     runner = CliRunner()
-    result = runner.invoke(main, ["destroy", "--force", "--confirm-instance-id", "i-abc123"])
+    result = runner.invoke(
+        main,
+        [
+            "destroy",
+            "--force",
+            "--confirm-instance-id",
+            "i-abc123",
+            "--skip-snapshot",
+            "--skip-cleanup",
+        ],
+    )
 
     assert result.exit_code == 0
     mock_destroy.assert_called_once_with(force=True)
@@ -445,6 +804,8 @@ def test_destroy_require_fresh_snapshot_passes_with_recent_snapshot(
             "--confirm-instance-id",
             "i-abc123",
             "--require-fresh-snapshot",
+            "--skip-snapshot",
+            "--skip-cleanup",
         ],
     )
 
@@ -548,7 +909,6 @@ def test_destroy_cleanup_passes_allow_delete_state_volume(
             "--force",
             "--confirm-instance-id",
             "i-abc123",
-            "--cleanup",
             "--skip-snapshot",
             "--allow-delete-state-volume",
         ],
@@ -608,6 +968,7 @@ def test_tailscale_check_logs_warning_when_cli_not_found(
 # ---------------------------------------------------------------------------
 
 
+@patch("edcloud.cleanup.cleanup_orphaned_volumes", return_value=True)
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.ec2.destroy")
 @patch("edcloud.cli.ec2.status")
@@ -625,6 +986,7 @@ def test_reprovision_snapshots_destroys_and_provisions(
     mock_status,
     mock_destroy,
     mock_provision,
+    _mock_vol_cleanup,
 ):
     """reprovision: snapshot → destroy → provision in order."""
     mock_snapshot.return_value = ["snap-abc"]
@@ -651,8 +1013,10 @@ def test_reprovision_snapshots_destroys_and_provisions(
     mock_snapshot.assert_called_once()
     mock_destroy.assert_called_once_with(force=True)
     mock_provision.assert_called_once()
+    assert "Next step: run 'edc verify' to confirm rebuild health." in result.output
 
 
+@patch("edcloud.cleanup.cleanup_orphaned_volumes", return_value=True)
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.ec2.destroy")
 @patch("edcloud.cli.ec2.status")
@@ -670,6 +1034,7 @@ def test_reprovision_skip_snapshot_skips_snapshot(
     mock_status,
     mock_destroy,
     mock_provision,
+    _mock_vol_cleanup,
 ):
     """reprovision --skip-snapshot does not call snapshot."""
     mock_status.return_value = {"exists": True, "instance_id": "i-abc123"}
@@ -697,6 +1062,7 @@ def test_reprovision_skip_snapshot_skips_snapshot(
     mock_provision.assert_called_once()
 
 
+@patch("edcloud.cleanup.cleanup_orphaned_volumes", return_value=True)
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.ec2.destroy")
 @patch("edcloud.cli.ec2.status")
@@ -714,6 +1080,7 @@ def test_reprovision_surfaces_snapshot_ids_on_provision_failure(
     mock_status,
     mock_destroy,
     mock_provision,
+    _mock_vol_cleanup,
 ):
     """On provision failure after destroy, snapshot IDs are shown prominently."""
     mock_snapshot.return_value = ["snap-abc123"]
@@ -734,6 +1101,42 @@ def test_reprovision_surfaces_snapshot_ids_on_provision_failure(
 
     assert result.exit_code == 1
     assert "snap-abc123" in result.output
+
+
+@patch("edcloud.cli.run_reprovision_flow")
+@patch("edcloud.cli.ec2.status")
+@patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
+@patch("edcloud.cli.tailscale.tailscale_available", return_value=True)
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_reprovision_delegates_to_lifecycle_flow(
+    _mock_creds,
+    _mock_region,
+    _mock_available,
+    _mock_conflicts,
+    mock_status,
+    mock_flow,
+):
+    mock_status.return_value = {"exists": True, "instance_id": "i-abc123"}
+    mock_flow.return_value = (
+        ["snap-abc123"],
+        {"instance_id": "i-new", "security_group_id": "sg-new", "public_ip": "1.2.3.4"},
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "reprovision",
+            "--confirm-instance-id",
+            "i-abc123",
+            "--tailscale-auth-key-ssm-parameter",
+            "/edcloud/tailscale_auth_key",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert mock_flow.called
 
 
 @patch("edcloud.cli.ec2.destroy")
@@ -806,3 +1209,61 @@ def test_resize_instance_type_calls_ec2_resize(_mock_creds, _mock_region, mock_r
         volume_size_gb=None,
         state_volume_size_gb=None,
     )
+
+
+@patch("edcloud.cli.permissions.required_actions", return_value=["ec2:DescribeInstances"])
+@patch("edcloud.cli.permissions.verify_required_actions")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_permissions_verify_success(
+    _mock_creds,
+    _mock_region,
+    mock_verify,
+    _mock_required,
+):
+    mock_verify.return_value = MagicMock(
+        ok=True,
+        principal_arn="arn:aws:iam::123:user/test",
+        policy_source_arn="arn:aws:iam::123:user/test",
+        missing_actions=(),
+        detail="All required actions are allowed for selected profile(s).",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["permissions", "verify", "--profile", "core"])
+
+    assert result.exit_code == 0
+    assert "All required actions are allowed" in result.output
+
+
+@patch("edcloud.cli.permissions.required_actions", return_value=["iam:PassRole"])
+@patch("edcloud.cli.permissions.verify_required_actions")
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_permissions_verify_failure_lists_missing_actions(
+    _mock_creds,
+    _mock_region,
+    mock_verify,
+    _mock_required,
+):
+    mock_verify.return_value = MagicMock(
+        ok=False,
+        principal_arn="arn:aws:iam::123:user/test",
+        policy_source_arn="arn:aws:iam::123:user/test",
+        missing_actions=("iam:PassRole",),
+        detail="Missing required actions for selected edcloud command profile(s).",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["permissions", "verify", "--profile", "provision"])
+
+    assert result.exit_code == 1
+    assert "Missing actions" in result.output
+    assert "iam:PassRole" in result.output
+
+
+def test_permissions_policy_outputs_policy_json():
+    runner = CliRunner()
+    result = runner.invoke(main, ["permissions", "policy", "--profile", "core"])
+    assert result.exit_code == 0
+    assert '"Version": "2012-10-17"' in result.output

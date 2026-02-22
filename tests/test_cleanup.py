@@ -19,7 +19,7 @@ def _vol(volume_id: str, role: str | None) -> dict:
     }
 
 
-@patch("edcloud.cleanup.boto3.client")
+@patch("edcloud.cleanup._ec2_client")
 def test_cleanup_delete_mode_protects_state_and_unknown_by_default(mock_boto_client):
     ec2_client = MagicMock()
     ec2_client.describe_volumes.return_value = {
@@ -37,7 +37,7 @@ def test_cleanup_delete_mode_protects_state_and_unknown_by_default(mock_boto_cli
     ec2_client.delete_volume.assert_called_once_with(VolumeId="vol-root")
 
 
-@patch("edcloud.cleanup.boto3.client")
+@patch("edcloud.cleanup._ec2_client")
 def test_cleanup_delete_mode_deletes_all_when_override_enabled(mock_boto_client):
     ec2_client = MagicMock()
     ec2_client.describe_volumes.return_value = {
@@ -56,7 +56,7 @@ def test_cleanup_delete_mode_deletes_all_when_override_enabled(mock_boto_client)
     assert deleted == ["vol-root", "vol-state", "vol-unknown"]
 
 
-@patch("edcloud.cleanup.boto3.client")
+@patch("edcloud.cleanup._ec2_client")
 def test_cleanup_keep_mode_never_deletes(mock_boto_client):
     ec2_client = MagicMock()
     ec2_client.describe_volumes.return_value = {

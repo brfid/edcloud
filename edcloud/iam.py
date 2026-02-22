@@ -11,10 +11,12 @@ import json
 import logging
 from typing import Any
 
-import boto3
 from botocore.exceptions import ClientError
 
+from edcloud.aws_clients import iam_client as _shared_iam_client
+from edcloud.aws_clients import sts_client as _shared_sts_client
 from edcloud.config import (
+    DLM_LIFECYCLE_ROLE_NAME,
     INSTANCE_PROFILE_NAME,
     INSTANCE_ROLE_NAME,
 )
@@ -23,12 +25,12 @@ log = logging.getLogger(__name__)
 
 
 def _iam_client() -> Any:
-    return boto3.client("iam")
+    return _shared_iam_client()
 
 
 def _ssm_resource_arn() -> str:
     """Build the SSM parameter ARN pattern for ``/edcloud/*``."""
-    sts = boto3.client("sts")
+    sts = _shared_sts_client()
     account_id = sts.get_caller_identity()["Account"]
     return f"arn:aws:ssm:*:{account_id}:parameter/edcloud/*"
 
@@ -59,6 +61,59 @@ def _ssm_read_policy() -> dict[str, Any]:
             }
         ],
     }
+
+
+def _dlm_trust_policy() -> dict[str, Any]:
+    """Return trust policy for AWS DLM service role."""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "dlm.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+
+
+def ensure_dlm_lifecycle_role(tags: dict[str, str]) -> str:
+    """Ensure the IAM role used by AWS DLM exists and has required policy.
+
+    Args:
+        tags: AWS tags to apply when creating the role.
+
+    Returns:
+        IAM role ARN for DLM execution.
+    """
+    iam = _iam_client()
+    managed_policy_arn = "arn:aws:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
+    try:
+        resp = iam.get_role(RoleName=DLM_LIFECYCLE_ROLE_NAME)
+        role_arn = str(resp["Role"]["Arn"])
+        log.info("  DLM role exists: %s", DLM_LIFECYCLE_ROLE_NAME)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "NoSuchEntity":
+            raise
+        resp = iam.create_role(
+            RoleName=DLM_LIFECYCLE_ROLE_NAME,
+            AssumeRolePolicyDocument=json.dumps(_dlm_trust_policy()),
+            Description="edcloud DLM lifecycle role",
+            Tags=[{"Key": k, "Value": v} for k, v in tags.items()],
+        )
+        role_arn = str(resp["Role"]["Arn"])
+        log.info("  Created DLM role: %s", DLM_LIFECYCLE_ROLE_NAME)
+
+    try:
+        iam.attach_role_policy(
+            RoleName=DLM_LIFECYCLE_ROLE_NAME,
+            PolicyArn=managed_policy_arn,
+        )
+    except ClientError as exc:
+        log.warning("  Could not attach DLM managed policy: %s", exc)
+        raise
+
+    return role_arn
 
 
 def find_instance_profile() -> str | None:

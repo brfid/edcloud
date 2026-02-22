@@ -14,10 +14,12 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-import boto3
 from botocore.exceptions import ClientError
 
 from edcloud.aws_check import get_region
+from edcloud.aws_clients import ec2_client as _shared_ec2_client
+from edcloud.aws_clients import ec2_resource as _shared_ec2_resource
+from edcloud.aws_clients import ssm_client as _shared_ssm_client
 from edcloud.config import (
     DEFAULT_HOURS_PER_DAY,
     EBS_MONTHLY_RATE_PER_GB,
@@ -35,12 +37,13 @@ from edcloud.config import (
     has_managed_tag,
     managed_filter,
 )
+from edcloud.discovery import list_instances
 from edcloud.iam import delete_instance_profile, ensure_instance_profile
+from edcloud.resource_queries import list_managed_volumes
 
 log = logging.getLogger(__name__)
 
 _USER_DATA_PATH = Path(__file__).resolve().parent.parent / "cloud-init" / "user-data.yaml"
-_ACTIVE_INSTANCE_STATES = ["pending", "running", "stopping", "stopped"]
 
 
 class TagDriftError(RuntimeError):
@@ -58,17 +61,17 @@ class TagDriftError(RuntimeError):
 
 def _ec2_client() -> Any:
     """Return a low-level EC2 client."""
-    return boto3.client("ec2")
+    return _shared_ec2_client()
 
 
 def _ec2_resource() -> Any:
     """Return a high-level EC2 resource."""
-    return boto3.resource("ec2")
+    return _shared_ec2_resource()
 
 
 def _ssm_client() -> Any:
     """Return a low-level SSM client."""
-    return boto3.client("ssm")
+    return _shared_ssm_client()
 
 
 def get_ec2_client() -> Any:
@@ -98,11 +101,6 @@ def fetch_tailscale_auth_key_from_ssm(parameter_name: str) -> str:
     return str(resp["Parameter"]["Value"])
 
 
-def _instance_state_filter() -> dict[str, Any]:
-    """Filter clause limiting results to non-terminated instance states."""
-    return {"Name": "instance-state-name", "Values": _ACTIVE_INSTANCE_STATES}
-
-
 def _instance_summary(instances: list[dict[str, Any]]) -> str:
     """Format a compact ``id (state)`` summary for one or more instances."""
     return ", ".join(f"{i['InstanceId']} ({i['State']['Name']})" for i in instances)
@@ -110,11 +108,7 @@ def _instance_summary(instances: list[dict[str, Any]]) -> str:
 
 def _list_instances(client: Any, filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Describe instances matching *filters*, excluding terminated ones."""
-    resp = client.describe_instances(Filters=[*filters, _instance_state_filter()])
-    instances: list[dict[str, Any]] = []
-    for reservation in resp.get("Reservations", []):
-        instances.extend(reservation.get("Instances", []))
-    return instances
+    return list_instances(client, filters)
 
 
 def _validate_instance_volume_tags(client: Any, instance: dict[str, Any]) -> None:
@@ -158,8 +152,7 @@ def _managed_orphan_report(client: Any) -> dict[str, list[str]]:
         if group_name == SECURITY_GROUP_NAME:
             report["security_groups"].append(sg["GroupId"])
 
-    vol_resp = client.describe_volumes(Filters=managed_filter())
-    for volume in vol_resp.get("Volumes", []):
+    for volume in list_managed_volumes(client):
         if volume.get("State") == "available":
             report["volumes"].append(volume["VolumeId"])
 
@@ -598,7 +591,7 @@ def provision(
                 "Ebs": {
                     "VolumeSize": cfg.volume_size_gb,
                     "VolumeType": cfg.volume_type,
-                    "DeleteOnTermination": False,
+                    "DeleteOnTermination": True,
                     "Encrypted": True,
                 },
             },
@@ -863,6 +856,15 @@ def status() -> dict[str, Any]:
                     }
                 )
 
+    # Orphaned managed volumes (available, not attached to this instance)
+    orphaned_vol_resp = ec2.describe_volumes(
+        Filters=[
+            {"Name": f"tag:{MANAGER_TAG_KEY}", "Values": [MANAGER_TAG_VALUE]},
+            {"Name": "status", "Values": ["available"]},
+        ]
+    )
+    orphaned_volumes = [v["VolumeId"] for v in orphaned_vol_resp.get("Volumes", [])]
+
     # Cost estimate
     hourly_rate = HOURLY_RATES.get(instance_type, 0.0)
     compute_monthly = hourly_rate * DEFAULT_HOURS_PER_DAY * 30
@@ -877,6 +879,7 @@ def status() -> dict[str, Any]:
         "public_ip": public_ip,
         "launch_time": str(launch_time) if launch_time else None,
         "volumes": volumes,
+        "orphaned_volumes": orphaned_volumes,
         "cost_estimate": {
             "compute_monthly": round(compute_monthly, 2),
             "storage_monthly": round(storage_monthly, 2),
@@ -890,8 +893,9 @@ def status() -> dict[str, Any]:
 def destroy(force: bool = False) -> None:
     """Terminate the edcloud instance and clean up its security group and IAM.
 
-    EBS volumes survive (``DeleteOnTermination=False``).  Orphaned volumes
-    are listed at the end for manual cleanup.
+    The root EBS volume is deleted automatically on termination
+    (``DeleteOnTermination=True``).  The state volume survives and is
+    reattached on the next provision.
 
     Args:
         force: Skip the interactive confirmation prompt.
@@ -936,13 +940,21 @@ def destroy(force: bool = False) -> None:
     # Clean up IAM instance profile
     delete_instance_profile()
 
-    # List orphaned volumes
-    vol_resp = ec2.describe_volumes(Filters=managed_filter())
-    orphaned = vol_resp.get("Volumes", [])
-    if orphaned:
-        log.info("Preserved EBS volumes (delete manually if not needed):")
-        for v in orphaned:
-            log.info("  %s  %sGB  %s", v["VolumeId"], v["Size"], v["State"])
+    # Report surviving managed volumes (state volume is expected; others are not)
+    surviving = list_managed_volumes(ec2)
+    for v in surviving:
+        from edcloud.config import tag_value
+
+        role = tag_value(v.get("Tags", []), VOLUME_ROLE_TAG_KEY) or "unknown"
+        if role == STATE_VOLUME_ROLE:
+            log.info("State volume preserved: %s  %sGB", v["VolumeId"], v["Size"])
+        else:
+            log.warning(
+                "Unexpected orphaned volume: %s  %sGB  role=%s (delete manually or run cleanup)",
+                v["VolumeId"],
+                v["Size"],
+                role,
+            )
 
 
 def resize(
