@@ -37,6 +37,15 @@ Console.
 - Recurring lifecycle workflows (provision, verify, snapshot, reprovision,
   cleanup) should stay CLI-driven for repeatability and safety guardrails.
 
+## Repository workflow
+
+- `main` is protected and should be updated via pull request only.
+- Merge policy is squash-only (merge commits and rebase merges disabled).
+- Linear history is required on `main`.
+- Force-push and branch deletion are disabled on `main`.
+- For agent/operator changes: work on task branches (`agent/<topic>-YYYYMMDD`),
+  clean history before push, then merge via PR.
+
 **Core design:**
 - Tailscale-only access (zero inbound rules)
 - Tag-based resource discovery (no state files)

@@ -57,6 +57,31 @@ grep -RInE "TODO|FIXME|TBD|\[ \]" README.md CHANGELOG.md RUNBOOK.md AGENTS.md do
 
 ## Constraints
 
+### Git discipline (LLM + operator)
+
+- Never commit directly to `main`.
+- Create one task branch per change: `agent/<topic>-YYYYMMDD`.
+- Local WIP commits are allowed, but do not push noisy history (`wip`, `fix typo`,
+  machine-specific checkpoints).
+- Before pushing, clean branch history:
+  - Prefer `git commit --fixup <sha>` during iteration.
+  - Then run `git rebase -i --autosquash origin/main`.
+- Keep `main` linear and reviewable:
+  - Prefer PR + squash merge.
+  - Do not merge with merge commits into `main`.
+- Assume GitHub enforces `main` protections:
+  - pull-request-only updates to `main` (no direct pushes),
+  - linear history required,
+  - squash merge enabled,
+  - merge commits and rebase merges disabled,
+  - force-push/delete disabled for `main`.
+- If branch protection rejects a direct push, switch to task-branch + PR workflow
+  rather than retrying direct writes to `main`.
+- History rewrite safety rules:
+  - Do not rebase/rewrite shared published branches.
+  - For intentional rewrite windows, create a backup tag/branch + bundle first,
+    then push with `--force-with-lease`.
+
 ### Python environment
 
 - Use repo-local `.venv/` for Python commands.
