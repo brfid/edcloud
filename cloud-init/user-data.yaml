@@ -1,0 +1,563 @@
+#cloud-config
+# edcloud instance bootstrap
+# Variables: ${TAILSCALE_AUTH_KEY_SSM_PARAMETER}, ${TAILSCALE_HOSTNAME}, ${AWS_REGION}
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - apt-transport-https
+  - bash-completion
+  - build-essential
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+  - software-properties-common
+  - unattended-upgrades
+  - wget
+
+  - git
+  - gh
+  - make
+  - cmake
+  - pkg-config
+
+  - byobu
+  - tmux
+  - screen
+  - neomutt
+  - vim-tiny
+  - neovim
+  - tree
+  - htop
+  - btop
+  - ncdu
+
+  - fd-find
+  - fzf
+  - ripgrep
+  - silversearcher-ag
+  - jq
+  - yq
+
+  - dnsutils
+  - net-tools
+  - iputils-ping
+  - traceroute
+  - nmap
+  - tcpdump
+  - netcat-openbsd
+
+  - unzip
+  - zip
+  - p7zip-full
+  - tar
+  - gzip
+  - bzip2
+  - xz-utils
+
+  - rsync
+  - rclone
+  - strace
+  - lsof
+  - sysstat
+  - xclip
+
+  - python3
+  - python3-pip
+  - python3-venv
+  - python3-dev
+  - python3-setuptools
+  - python3-wheel
+  - python3-pytest
+  - python3-ipython
+  - pipx
+  - python-is-python3
+
+  - sqlite3
+  - postgresql-client
+  - redis-tools
+  - certbot
+
+write_files:
+  - path: /etc/profile.d/edcloud-shell-defaults.sh
+    permissions: "0644"
+    content: |
+      # edcloud baseline aliases
+      alias ll='ls -alF --color=auto'
+      alias la='ls -A --color=auto'
+      alias l='ls -CF --color=auto'
+
+  - path: /usr/local/bin/edcloud-idle-shutdown
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      IDLE_MINUTES=30
+      STATE_FILE="/tmp/edcloud-idle-since"
+
+      TS_CONNECTIONS=$(tailscale status --json 2>/dev/null \
+        | jq '[.Peer // {} | to_entries[] | select(.value.Active == true)] | length' 2>/dev/null || echo "0")
+
+      LOAD=$(awk '{print $2}' /proc/loadavg)
+      IDLE=$(awk "BEGIN {print ($LOAD < 0.15) ? 1 : 0}")
+
+      if [ "$TS_CONNECTIONS" -gt 0 ] || [ "$IDLE" -eq 0 ]; then
+          rm -f "$STATE_FILE"
+          exit 0
+      fi
+
+      if [ ! -f "$STATE_FILE" ]; then
+          date +%s > "$STATE_FILE"
+          exit 0
+      fi
+
+      IDLE_SINCE=$(cat "$STATE_FILE")
+      NOW=$(date +%s)
+      ELAPSED=$(( (NOW - IDLE_SINCE) / 60 ))
+
+      if [ "$ELAPSED" -ge "$IDLE_MINUTES" ]; then
+          logger -t edcloud "Idle for ${ELAPSED}m, shutting down."
+          /usr/bin/systemctl poweroff
+      fi
+
+  - path: /etc/systemd/system/edcloud-idle-shutdown.service
+    content: |
+      [Unit]
+      Description=edcloud idle shutdown check
+      After=network-online.target tailscaled.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/edcloud-idle-shutdown
+
+  - path: /etc/systemd/system/edcloud-idle-shutdown.timer
+    content: |
+      [Unit]
+      Description=Check for idle edcloud instance every 5 minutes
+
+      [Timer]
+      OnBootSec=10min
+      OnUnitActiveSec=5min
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
+  - path: /opt/edcloud/.env
+    content: |
+      EDCLOUD_MANAGED=true
+
+runcmd:
+  # --- State volume: early mount (home bind before other runcmd steps) ---
+  - |
+    ROOT_SOURCE=$(findmnt -n -o SOURCE /)
+    ROOT_PARENT=$(lsblk -no PKNAME "$ROOT_SOURCE" 2>/dev/null || true)
+    if [ -n "$ROOT_PARENT" ]; then
+      ROOT_DISK="/dev/$ROOT_PARENT"
+    else
+      ROOT_DISK="$ROOT_SOURCE"
+    fi
+
+    STATE_DEV="/dev/sdf"
+    if [ ! -b "$STATE_DEV" ]; then
+      STATE_DEV=$(lsblk -dpno NAME,TYPE | awk '$2=="disk"{print $1}' \
+        | grep -v "^${ROOT_DISK}$" | head -n1 || true)
+    fi
+
+    if [ -z "${STATE_DEV:-}" ] || [ ! -b "$STATE_DEV" ]; then
+      logger -t edcloud "State volume not found; skipping early mount."
+      exit 0
+    fi
+
+    if ! blkid "$STATE_DEV" >/dev/null 2>&1; then
+      mkfs.ext4 -F "$STATE_DEV"
+    fi
+    mkdir -p /opt/edcloud/state
+    UUID=$(blkid -s UUID -o value "$STATE_DEV")
+    if ! grep -q "$UUID" /etc/fstab; then
+      echo "UUID=$UUID /opt/edcloud/state ext4 defaults,nofail 0 2" >> /etc/fstab
+    fi
+    mount -a
+
+    # Keep ubuntu home on the durable state volume.
+    mkdir -p /opt/edcloud/state/home/ubuntu
+    if [ -z "$(ls -A /opt/edcloud/state/home/ubuntu 2>/dev/null)" ]; then
+      rsync -a /home/ubuntu/ /opt/edcloud/state/home/ubuntu/
+    fi
+
+    if ! grep -qE '^/opt/edcloud/state/home/ubuntu[[:space:]]+/home/ubuntu[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
+      echo "/opt/edcloud/state/home/ubuntu /home/ubuntu none bind 0 0" >> /etc/fstab
+    fi
+    if ! mountpoint -q /home/ubuntu; then
+      mount /home/ubuntu || mount -a
+    fi
+
+    chown -R ubuntu:ubuntu /opt/edcloud/state
+    chmod 700 /home/ubuntu
+    if [ -d /home/ubuntu/.ssh ]; then
+      chmod 700 /home/ubuntu/.ssh
+    fi
+
+  # --- Swap baseline (4GiB file on root volume) ---
+  - |
+    SWAP_FILE="/swapfile"
+    SWAP_SIZE_MIB=4096
+    SWAPPINESS=10
+
+    if [ ! -f "$SWAP_FILE" ]; then
+      if ! fallocate -l "${SWAP_SIZE_MIB}M" "$SWAP_FILE"; then
+        dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$SWAP_SIZE_MIB" status=none
+      fi
+    fi
+
+    chmod 600 "$SWAP_FILE"
+    if ! blkid "$SWAP_FILE" 2>/dev/null | grep -q 'TYPE="swap"'; then
+      mkswap "$SWAP_FILE"
+    fi
+
+    if ! grep -qE '^/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]+sw[[:space:]]+0[[:space:]]+0$' /etc/fstab; then
+      sed -i '\|^/swapfile[[:space:]]\+none[[:space:]]\+swap[[:space:]]|d' /etc/fstab
+      echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    fi
+
+    if ! swapon --show=NAME --noheadings | awk '{print $1}' | grep -qx "$SWAP_FILE"; then
+      swapon "$SWAP_FILE"
+    fi
+
+    printf 'vm.swappiness=%s\n' "$SWAPPINESS" > /etc/sysctl.d/99-edcloud-swap.conf
+    sysctl -q -p /etc/sysctl.d/99-edcloud-swap.conf || true
+
+  # --- Docker (official repo) ---
+  - |
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+      https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+      > /etc/apt/sources.list.d/docker.list
+    apt-get update -qq
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    systemctl enable docker
+    usermod -aG docker ubuntu
+
+  # --- Tailscale ---
+  - |
+    set -eu
+    TS_AUTH_KEY_FILE="/run/edcloud-tailscale-auth.key"
+    curl -fsSL https://tailscale.com/install.sh | sh
+    if ! command -v aws >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq
+      if ! apt-get install -y -qq awscli; then
+        apt-get install -y -qq python3-pip
+        python3 -m pip install --break-system-packages --upgrade awscli
+      fi
+    fi
+    AWS_BIN=$(command -v aws)
+    export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE
+
+    TS_AUTH_KEY=""
+    for attempt in $(seq 1 72); do
+      if TS_AUTH_KEY=$("$AWS_BIN" ssm get-parameter \
+        --name "${TAILSCALE_AUTH_KEY_SSM_PARAMETER}" \
+        --with-decryption --query 'Parameter.Value' \
+        --output text --region "${AWS_REGION}" 2>/tmp/edcloud-ssm.err); then
+        break
+      fi
+      sleep 5
+    done
+
+    "$AWS_BIN" sts get-caller-identity --output json >/tmp/edcloud-sts.json 2>/tmp/edcloud-sts.err || true
+    if [ -n "$TS_AUTH_KEY" ]; then
+      umask 077
+      printf '%s' "$TS_AUTH_KEY" > "$TS_AUTH_KEY_FILE"
+      timeout 45s tailscale up --auth-key="$TS_AUTH_KEY" --hostname="${TAILSCALE_HOSTNAME}" --ssh \
+        >/tmp/edcloud-tailscale-up.out 2>/tmp/edcloud-tailscale-up.err || true
+      cat /tmp/edcloud-tailscale-up.err >&2 || true
+    else
+      cat /tmp/edcloud-ssm.err >&2 || true
+      logger -t edcloud "No Tailscale auth key retrieved from SSM; continuing bootstrap."
+    fi
+    unset TS_AUTH_KEY
+
+  # --- State volume: service-level bind mounts (Tailscale, Docker, Portainer) ---
+  - |
+    if ! mountpoint -q /opt/edcloud/state 2>/dev/null; then
+      logger -t edcloud "State volume not mounted; skipping service bind mounts."
+      exit 0
+    fi
+
+    mkdir -p /opt/edcloud/state/tailscale
+    if [ -z "$(ls -A /opt/edcloud/state/tailscale 2>/dev/null)" ] && [ -d /var/lib/tailscale ]; then
+      rsync -a /var/lib/tailscale/ /opt/edcloud/state/tailscale/
+    fi
+
+    if ! grep -qE '^/opt/edcloud/state/tailscale[[:space:]]+/var/lib/tailscale[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
+      echo "/opt/edcloud/state/tailscale /var/lib/tailscale none bind 0 0" >> /etc/fstab
+    fi
+    mkdir -p /var/lib/tailscale
+    if ! mountpoint -q /var/lib/tailscale; then
+      mount /var/lib/tailscale || mount -a
+    fi
+
+    mkdir -p /opt/edcloud/state/ssh-host-keys
+    if [ -z "$(ls -A /opt/edcloud/state/ssh-host-keys 2>/dev/null)" ]; then
+      cp /etc/ssh/ssh_host_* /opt/edcloud/state/ssh-host-keys/ 2>/dev/null || true
+    else
+      if compgen -G "/opt/edcloud/state/ssh-host-keys/ssh_host_*" >/dev/null; then
+        cp /opt/edcloud/state/ssh-host-keys/ssh_host_* /etc/ssh/
+      fi
+    fi
+    chmod 600 /etc/ssh/ssh_host_*_key 2>/dev/null || true
+    chmod 644 /etc/ssh/ssh_host_*_key.pub 2>/dev/null || true
+    chmod 600 /opt/edcloud/state/ssh-host-keys/ssh_host_*_key 2>/dev/null || true
+    chmod 644 /opt/edcloud/state/ssh-host-keys/ssh_host_*_key.pub 2>/dev/null || true
+    chown root:root /etc/ssh/ssh_host_* /opt/edcloud/state/ssh-host-keys/ssh_host_* 2>/dev/null || true
+    systemctl restart ssh || true
+
+    systemctl restart tailscaled || true
+    TS_REUP_OK=0
+    if [ -s /run/edcloud-tailscale-auth.key ]; then
+      if timeout 45s tailscale up \
+        --auth-key="$(cat /run/edcloud-tailscale-auth.key)" --hostname="${TAILSCALE_HOSTNAME}" --ssh \
+        >/tmp/edcloud-tailscale-reup.out 2>/tmp/edcloud-tailscale-reup.err; then
+        TS_REUP_OK=1
+      fi
+      rm -f /run/edcloud-tailscale-auth.key || true
+    fi
+    if [ "$TS_REUP_OK" -ne 1 ]; then
+      timeout 45s tailscale up --hostname="${TAILSCALE_HOSTNAME}" --ssh \
+        >/tmp/edcloud-tailscale-reup.out 2>/tmp/edcloud-tailscale-reup.err || true
+    fi
+    cat /tmp/edcloud-tailscale-reup.err >&2 || true
+    tailscale status --json >/tmp/edcloud-tailscale-status.json 2>/tmp/edcloud-tailscale-status.err || true
+    cat /tmp/edcloud-tailscale-status.err >&2 || true
+
+    mkdir -p /opt/edcloud/state/compose
+    mkdir -p /opt/edcloud/compose
+    if [ -z "$(ls -A /opt/edcloud/state/compose 2>/dev/null)" ] && [ -n "$(ls -A /opt/edcloud/compose 2>/dev/null)" ]; then
+      rsync -a /opt/edcloud/compose/ /opt/edcloud/state/compose/
+    fi
+
+    if ! grep -qE '^/opt/edcloud/state/compose[[:space:]]+/opt/edcloud/compose[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
+      echo "/opt/edcloud/state/compose /opt/edcloud/compose none bind 0 0" >> /etc/fstab
+    fi
+    if ! mountpoint -q /opt/edcloud/compose; then
+      mount /opt/edcloud/compose || mount -a
+    fi
+
+    mkdir -p /opt/edcloud/state/portainer-data
+    mkdir -p /opt/edcloud/portainer-data
+    if [ -z "$(ls -A /opt/edcloud/state/portainer-data 2>/dev/null)" ] && [ -n "$(ls -A /opt/edcloud/portainer-data 2>/dev/null)" ]; then
+      rsync -a /opt/edcloud/portainer-data/ /opt/edcloud/state/portainer-data/
+    fi
+
+    if ! grep -qE '^/opt/edcloud/state/portainer-data[[:space:]]+/opt/edcloud/portainer-data[[:space:]]+none[[:space:]]+bind' /etc/fstab; then
+      echo "/opt/edcloud/state/portainer-data /opt/edcloud/portainer-data none bind 0 0" >> /etc/fstab
+    fi
+    if ! mountpoint -q /opt/edcloud/portainer-data; then
+      mount /opt/edcloud/portainer-data || mount -a
+    fi
+
+    mkdir -p /opt/edcloud/state/docker
+    if [ -z "$(ls -A /opt/edcloud/state/docker 2>/dev/null)" ] && [ -n "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
+      rsync -a /var/lib/docker/ /opt/edcloud/state/docker/
+    fi
+
+    printf '%s\n' \
+      '{' \
+      '  "data-root": "/opt/edcloud/state/docker"' \
+      '}' > /etc/docker/daemon.json
+
+    systemctl daemon-reload
+    systemctl restart docker
+
+  # --- Portainer CE ---
+  - |
+    TS_IP=""
+    if ! TS_IP=$(tailscale ip -4 2>/tmp/edcloud-tailscale-ip.err); then
+      cat /tmp/edcloud-tailscale-ip.err >&2 || true
+      logger -t edcloud "Tailscale IP unavailable during bootstrap; skipping Portainer startup for now."
+      exit 0
+    fi
+    if [ -z "$TS_IP" ]; then
+      logger -t edcloud "Empty Tailscale IP during bootstrap; skipping Portainer startup for now."
+      exit 0
+    fi
+
+    if docker ps -a --format '{{.Names}}' | grep -qx portainer; then
+      docker rm -f portainer || true
+    fi
+
+    docker run -d \
+      --name portainer \
+      --restart=always \
+      -p "${TS_IP}:9443:9443" \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -v /opt/edcloud/portainer-data:/data \
+      portainer/portainer-ce:lts || true
+
+  # --- Homebrew + LazyVim baseline ---
+  - |
+    NVIM_VERSION="v0.11.3"
+    NVIM_TARBALL_URL="https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz"
+    curl -fsSL "$NVIM_TARBALL_URL" -o /tmp/nvim-linux-x86_64.tar.gz
+    rm -rf /opt/nvim-linux-x86_64
+    tar -C /opt -xzf /tmp/nvim-linux-x86_64.tar.gz
+    chmod -R a+rX /opt/nvim-linux-x86_64
+    ln -sfn /opt/nvim-linux-x86_64/bin/nvim /usr/local/bin/nvim
+
+    export NONINTERACTIVE=1
+    if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+      if ! runuser -u ubuntu -- /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+        logger -t edcloud "Homebrew install failed; continuing bootstrap without brew."
+      fi
+    fi
+
+    cat >/etc/profile.d/edcloud-brew.sh <<'BREWENV'
+    if [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+      eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+    fi
+    BREWENV
+    chmod 0644 /etc/profile.d/edcloud-brew.sh
+
+    runuser -u ubuntu -- bash -lc '
+      set -euo pipefail
+      export HOME="${HOME:-/home/ubuntu}"
+      mkdir -p "$HOME/.config"
+      if [ ! -d "$HOME/.config/nvim" ]; then
+        git clone --depth=1 https://github.com/LazyVim/starter "$HOME/.config/nvim"
+        rm -rf "$HOME/.config/nvim/.git"
+      fi
+    '
+
+  # --- Node.js LTS (via NodeSource) ---
+  - |
+    umask 022
+    curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+    apt-get install -y nodejs
+    npm install -g npm@11.9.0 @openai/codex@0.98.0 cline@2.2.2 @google/gemini-cli @anthropic-ai/claude-code
+
+    find /etc/apt/sources.list.d -maxdepth 1 -type f \
+      \( -name '*.list' -o -name '*.sources' \) \
+      -exec chown root:root {} \; \
+      -exec chmod 0644 {} \;
+
+    if [ -d /usr/lib/node_modules ]; then
+      find /usr/lib/node_modules -mindepth 1 -maxdepth 1 -type d \
+        -exec chown -R root:root {} \; \
+        -exec chmod -R a+rX {} \;
+    fi
+
+  # --- Python developer tooling (pipx-managed, persistent on state volume) ---
+  - |
+    runuser -u ubuntu -- bash -lc '
+      set -euo pipefail
+      pipx ensurepath
+      pipx install --force ruff
+      pipx install --force mypy
+    '
+
+  # --- GitHub CLI authentication (from SSM if available) ---
+  - |
+    runuser -u ubuntu -- bash -lc '
+      set -euo pipefail
+      if command -v aws &>/dev/null && command -v gh &>/dev/null; then
+        # Try to get GitHub token from SSM (requires IAM role with SSM read permission)
+        GITHUB_TOKEN=$(aws ssm get-parameter \
+          --name /edcloud/github_token \
+          --with-decryption \
+          --query "Parameter.Value" \
+          --output text 2>/dev/null || echo "")
+
+        if [ -n "$GITHUB_TOKEN" ]; then
+          # Configure gh CLI with token
+          echo "$GITHUB_TOKEN" | gh auth login --with-token
+          gh auth setup-git
+          echo "✅ GitHub CLI authenticated from SSM"
+        fi
+      fi
+    '
+
+  # --- Pull non-secret personal repos (dotfiles/bin/llm-config) ---
+  - |
+    runuser -u ubuntu -- bash -lc '
+      set -euo pipefail
+
+      if ! command -v gh &>/dev/null; then
+        exit 0
+      fi
+
+      if ! gh auth status &>/dev/null; then
+        echo "ℹ️ gh not authenticated; skipping dotfiles/bin/llm-config sync"
+        exit 0
+      fi
+
+      GH_USER=$(gh api user --jq .login 2>/dev/null || true)
+      if [ -z "$GH_USER" ]; then
+        echo "ℹ️ could not resolve GitHub username; skipping repo sync"
+        exit 0
+      fi
+
+      mkdir -p "$HOME/src" "$HOME/.local/bin"
+
+      sync_repo() {
+        local name="$1"
+        local repo_url="https://github.com/${GH_USER}/${name}.git"
+        local target="$HOME/src/${name}"
+
+        if [ -d "$target/.git" ]; then
+          git -C "$target" pull --ff-only || true
+        else
+          git clone "$repo_url" "$target" || true
+        fi
+      }
+
+      sync_repo dotfiles
+      sync_repo bin
+      sync_repo llm-config
+
+      # Link bashrc from dotfiles (includes git-prompt PS1)
+      if [ -x "$HOME/src/dotfiles/install.sh" ]; then
+        "$HOME/src/dotfiles/install.sh" || true
+      fi
+
+      if [ -d "$HOME/src/bin" ]; then
+        find "$HOME/src/bin" -maxdepth 1 -type f -perm -u+x -exec ln -sfn {} "$HOME/.local/bin/" \;
+      fi
+    '
+
+  # --- Ensure ubuntu always has baseline aliases, even with custom dotfiles ---
+  - |
+    runuser -u ubuntu -- bash -lc '
+      set -euo pipefail
+      mkdir -p "$HOME"
+
+      printf "%s\n" \
+        "alias ll=\"ls -alF --color=auto\"" \
+        "alias la=\"ls -A --color=auto\"" \
+        "alias l=\"ls -CF --color=auto\"" \
+        > "$HOME/.bash_aliases"
+
+      if ! grep -q "\.bash_aliases" "$HOME/.bashrc" 2>/dev/null; then
+        printf "%s\n" \
+          "if [ -f ~/.bash_aliases ]; then" \
+          "    . ~/.bash_aliases" \
+          "fi" \
+          >> "$HOME/.bashrc"
+      fi
+    '
+
+  # --- Enable idle-shutdown timer ---
+  - systemctl daemon-reload
+  - systemctl enable --now edcloud-idle-shutdown.timer
+
+  # --- Signal completion ---
+  - echo "edcloud bootstrap complete $(date -Iseconds)" > /tmp/edcloud-ready
+
+final_message: "edcloud instance ready after $UPTIME seconds."

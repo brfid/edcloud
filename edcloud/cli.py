@@ -1,0 +1,1519 @@
+"""edcloud CLI — user-facing commands for the personal cloud lab."""
+
+from __future__ import annotations
+
+import functools
+import json
+import logging
+import os
+import shlex
+import shutil
+import subprocess  # nosec B404
+from collections.abc import Callable
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import ParamSpec, TypeVar
+
+import click
+from botocore.exceptions import BotoCoreError, ClientError
+
+from edcloud import backup_policy, ec2, iam, ops_health, permissions, snapshot, tailscale
+from edcloud.aws_check import check_aws_credentials, get_region
+from edcloud.aws_clients import ssm_client
+from edcloud.config import (
+    DEFAULT_SSH_USER,
+    DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER,
+    DEFAULT_TAILSCALE_HOSTNAME,
+    InstanceConfig,
+)
+from edcloud.lifecycle import (
+    maybe_run_cleanup,
+    require_confirmed_instance_id,
+    run_optional_auto_snapshot,
+    run_reprovision_flow,
+)
+from edcloud.resource_audit import audit_resources
+from edcloud.verify_catalog import VERIFY_CHECKS
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def _resolve_ssh_target(
+    info: dict[str, object],
+    public_ip: bool,
+    user: str,
+    hostname: str,
+) -> tuple[str, list[str]]:
+    """Build an SSH target address and base command.
+
+    Args:
+        info: Instance status dict (from ``ec2.status()``).
+        public_ip: If ``True`` use the public IP; otherwise resolve via Tailscale.
+        user: Remote username.
+        hostname: Tailscale MagicDNS hostname to resolve.
+
+    Returns:
+        ``(target_ip, ssh_base_command)`` tuple.
+
+    Raises:
+        RuntimeError: If the chosen network path has no reachable address.
+    """
+    if public_ip:
+        target = str(info.get("public_ip") or "")
+        if not target:
+            raise RuntimeError("No public IP available. Remove --public-ip or assign a public IP.")
+        ssh_base = ["ssh", "-o", "StrictHostKeyChecking=accept-new", f"{user}@{target}"]
+        return target, ssh_base
+    else:
+        ts_ip = tailscale.get_tailscale_ip(hostname)
+        if not ts_ip:
+            raise RuntimeError(
+                f"Tailscale IP not found for '{hostname}'. "
+                "Check tailnet connectivity or use --public-ip."
+            )
+        ssh_base = [
+            "ssh",
+            "-o",
+            "ProxyCommand=none",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            f"{user}@{ts_ip}",
+        ]
+        return ts_ip, ssh_base
+
+
+def require_aws_creds(func: Callable[P, R]) -> Callable[P, R]:
+    """Decorator that verifies AWS credentials before running a command.
+
+    Catches ``RuntimeError`` from the wrapped command and converts it to a
+    clean ``SystemExit(1)`` with the error message on stderr.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        valid, message = check_aws_credentials()
+        if not valid:
+            click.echo(f"AWS credentials error: {message}", err=True)
+            raise SystemExit(1)
+        region = get_region()
+        if not region:
+            click.echo("Warning: No AWS region configured. Using default.", err=True)
+        try:
+            return func(*args, **kwargs)
+        except RuntimeError as exc:
+            click.echo(str(exc), err=True)
+            raise SystemExit(1) from exc
+
+    return wrapper
+
+
+def _fetch_tailscale_auth_key_from_ssm(parameter_name: str) -> str:
+    """Read a Tailscale auth key from SSM Parameter Store."""
+    return ec2.fetch_tailscale_auth_key_from_ssm(parameter_name)
+
+
+def _run_checked(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess command and raise RuntimeError on failure."""
+    proc = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "unknown error"
+        raise RuntimeError(f"Command failed: {' '.join(shlex.quote(p) for p in cmd)}\n{detail}")
+    return proc
+
+
+def _ensure_no_tailscale_name_conflicts(base_hostname: str = DEFAULT_TAILSCALE_HOSTNAME) -> None:
+    """Fail fast when Tailscale naming drift is detected.
+
+    Raises:
+        RuntimeError: If conflicting/suffixed edcloud records are found.
+    """
+    if not tailscale.tailscale_available():
+        click.echo(
+            "Warning: tailscale CLI not found on PATH; name conflict check skipped.",
+            err=True,
+        )
+        return
+    conflicts = tailscale.edcloud_name_conflicts(base_hostname=base_hostname)
+    if conflicts:
+        raise RuntimeError(tailscale.format_conflict_message(conflicts))
+
+
+def _print_audit_summary(phase: str) -> None:
+    """Run and print a concise resource-audit summary (warn-only)."""
+    try:
+        report = audit_resources()
+    except Exception as exc:
+        click.echo(f"Resource audit ({phase}): skipped ({exc})")
+        click.echo()
+        return
+    findings = report.findings
+    click.echo(f"Resource audit ({phase}):")
+    if findings:
+        click.echo(f"  Findings: {len(findings)} unanticipated resource(s)")
+        for finding in findings[:10]:
+            cost_suffix = (
+                f" (~${finding.estimated_monthly_cost:.2f}/mo)"
+                if finding.estimated_monthly_cost
+                else ""
+            )
+            click.echo(
+                f"  - [{finding.category}] {finding.resource_id}: {finding.message}{cost_suffix}"
+            )
+        if len(findings) > 10:
+            click.echo(f"  ... and {len(findings) - 10} more")
+    else:
+        click.echo("  Findings: none")
+
+    click.echo(
+        "  Cost summary: "
+        f"baseline=${report.cost.baseline_monthly:.2f}/mo, "
+        f"unanticipated=${report.cost.unanticipated_monthly:.2f}/mo, "
+        f"total=${report.cost.total_monthly:.2f}/mo"
+    )
+    click.echo(f"  Note: {report.cost.note}")
+    click.echo()
+
+
+@click.group()
+@click.version_option(package_name="edcloud")
+def main() -> None:
+    """Manage your personal cloud lab on AWS."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.getLogger("edcloud").addHandler(handler)
+    logging.getLogger("edcloud").setLevel(logging.INFO)
+
+
+# ---------------------------------------------------------------------------
+# provision
+# ---------------------------------------------------------------------------
+@main.command()
+@click.option(
+    "--instance-type",
+    default=InstanceConfig.instance_type,
+    show_default=True,
+    help="EC2 instance type.",
+)
+@click.option(
+    "--volume-size",
+    default=InstanceConfig.volume_size_gb,
+    type=int,
+    show_default=True,
+    help="Root EBS volume size in GB.",
+)
+@click.option(
+    "--state-volume-size",
+    default=InstanceConfig.state_volume_size_gb,
+    type=int,
+    show_default=True,
+    help="Persistent state EBS volume size in GB (mounted at /opt/edcloud/state).",
+)
+@click.option(
+    "--tailscale-hostname",
+    default=DEFAULT_TAILSCALE_HOSTNAME,
+    show_default=True,
+    help="Tailscale MagicDNS hostname.",
+)
+@click.option(
+    "--tailscale-auth-key",
+    envvar="TAILSCALE_AUTH_KEY",
+    help="Tailscale auth key (will be stored in SSM if provided).",
+)
+@click.option(
+    "--tailscale-auth-key-ssm-parameter",
+    default=DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER,
+    envvar="TAILSCALE_AUTH_KEY_SSM_PARAMETER",
+    show_default=True,
+    help="SSM parameter name containing Tailscale auth key.",
+)
+@click.option(
+    "--cleanup",
+    is_flag=True,
+    help="Clean up old Tailscale devices and orphaned volumes before provisioning.",
+)
+@click.option(
+    "--allow-delete-state-volume",
+    is_flag=True,
+    help="Allow cleanup workflow to delete protected state volumes.",
+)
+@click.option(
+    "--require-existing-state-volume/--allow-new-state-volume",
+    default=True,
+    show_default=True,
+    help=(
+        "Require reusable managed state volume by default; "
+        "use --allow-new-state-volume to permit creating a fresh state volume."
+    ),
+)
+@click.option(
+    "--skip-snapshot",
+    is_flag=True,
+    help="Skip automatic snapshot before provision (if replacing existing instance).",
+)
+@click.option(
+    "--allow-tailscale-name-conflicts",
+    is_flag=True,
+    help="Skip fail-fast guard for duplicate/suffixed edcloud Tailscale records.",
+)
+@require_aws_creds
+def provision(
+    instance_type: str,
+    volume_size: int,
+    state_volume_size: int,
+    tailscale_hostname: str,
+    tailscale_auth_key: str | None,
+    tailscale_auth_key_ssm_parameter: str,
+    cleanup: bool,
+    allow_delete_state_volume: bool,
+    require_existing_state_volume: bool,
+    skip_snapshot: bool,
+    allow_tailscale_name_conflicts: bool,
+) -> None:
+    """Create the edcloud EC2 instance from scratch.
+
+    The Tailscale auth key is fetched from SSM by the instance at boot.
+    """
+    if not allow_tailscale_name_conflicts:
+        _ensure_no_tailscale_name_conflicts(base_hostname=tailscale_hostname)
+
+    _print_audit_summary("pre-provision")
+
+    # Pre-provision cleanup if requested
+    if cleanup:
+        from edcloud import cleanup as cleanup_module
+
+        # Auto-snapshot if existing instance (unless --skip-snapshot)
+        if not skip_snapshot:
+            click.echo("Checking for existing instance to snapshot...")
+            snap_ids = snapshot.auto_snapshot_before_destroy()
+            if snap_ids:
+                click.echo(f"✅ Created pre-provision snapshot(s): {', '.join(snap_ids)}")
+                click.echo()
+            else:
+                click.echo(
+                    "Info: no existing instance to snapshot (this is fine for first provision)"
+                )
+                click.echo()
+
+        # Run cleanup workflow
+        if not cleanup_module.run_cleanup_workflow(
+            "pre-provision",
+            skip_snapshot=True,
+            allow_delete_state=allow_delete_state_volume,
+        ):
+            raise SystemExit(0)
+
+    ssm = ssm_client()
+
+    # If raw key is provided, store it in SSM
+    if tailscale_auth_key:
+        click.echo(f"Storing Tailscale auth key in SSM: {tailscale_auth_key_ssm_parameter}")
+        try:
+            ssm.put_parameter(
+                Name=tailscale_auth_key_ssm_parameter,
+                Value=tailscale_auth_key,
+                Type="SecureString",
+                Overwrite=True,
+            )
+            click.echo("  Key stored successfully.")
+        except ClientError as exc:
+            click.echo(f"Error storing key in SSM: {exc}", err=True)
+            raise SystemExit(1) from exc
+
+    # Verify SSM parameter exists
+    try:
+        ssm.get_parameter(Name=tailscale_auth_key_ssm_parameter, WithDecryption=False)
+    except ClientError as exc:
+        if "ParameterNotFound" in str(exc):
+            click.echo(
+                f"Error: Tailscale auth key not found in SSM: {tailscale_auth_key_ssm_parameter}",
+                err=True,
+            )
+            click.echo("  Set TAILSCALE_AUTH_KEY or pass --tailscale-auth-key.", err=True)
+            click.echo(
+                "  Or manually create the parameter with: "
+                "aws ssm put-parameter --name /edcloud/tailscale_auth_key "
+                "--type SecureString --value 'tskey-auth-...'",
+                err=True,
+            )
+            click.echo(
+                "  Generate a key at: https://login.tailscale.com/admin/settings/keys",
+                err=True,
+            )
+            raise SystemExit(1) from exc
+        raise
+
+    cfg = InstanceConfig(
+        instance_type=instance_type,
+        volume_size_gb=volume_size,
+        state_volume_size_gb=state_volume_size,
+        tailscale_hostname=tailscale_hostname,
+        tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
+    )
+    result = ec2.provision(
+        cfg,
+        require_existing_state_volume=require_existing_state_volume,
+    )
+    _print_audit_summary("post-provision")
+    click.echo()
+    click.echo(json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# secrets helpers
+# ---------------------------------------------------------------------------
+@main.command("load-tailscale-env-key")
+@click.option(
+    "--tailscale-auth-key-ssm-parameter",
+    default=DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER,
+    envvar="TAILSCALE_AUTH_KEY_SSM_PARAMETER",
+    show_default=True,
+    help="SSM parameter to read (SecureString supported).",
+)
+@click.option(
+    "--shell-export/--no-shell-export",
+    default=True,
+    show_default=True,
+    help='Print export command for eval: eval "$(edc load-tailscale-env-key)"',
+)
+@require_aws_creds
+def load_tailscale_env_key(
+    tailscale_auth_key_ssm_parameter: str,
+    shell_export: bool,
+) -> None:
+    """Load TAILSCALE_AUTH_KEY from SSM for local operator usage."""
+    try:
+        key = _fetch_tailscale_auth_key_from_ssm(tailscale_auth_key_ssm_parameter)
+    except ClientError as exc:
+        click.echo(
+            "Error: could not read Tailscale auth key from SSM parameter "
+            f"'{tailscale_auth_key_ssm_parameter}': {exc}",
+            err=True,
+        )
+        raise SystemExit(1) from exc
+
+    if shell_export:
+        click.echo(f"export TAILSCALE_AUTH_KEY={shlex.quote(key)}")
+        return
+
+    click.echo("No output selected. Use --shell-export.", err=True)
+    raise SystemExit(1)
+
+
+@main.command("setup-ssm-tokens")
+@click.option(
+    "--github-token",
+    default=None,
+    envvar="GITHUB_TOKEN",
+    help="GitHub token to store in SSM (default: auto-read from gh CLI when available).",
+)
+@click.option(
+    "--tailscale-auth-key",
+    default=None,
+    envvar="TAILSCALE_AUTH_KEY",
+    help="Tailscale auth key to store in SSM.",
+)
+@click.option(
+    "--prompt/--no-prompt",
+    default=True,
+    show_default=True,
+    help="Prompt interactively for a missing Tailscale auth key.",
+)
+@require_aws_creds
+def setup_ssm_tokens(
+    github_token: str | None,
+    tailscale_auth_key: str | None,
+    prompt: bool,
+) -> None:
+    """Store GitHub and Tailscale auth tokens in SSM Parameter Store."""
+    ssm = ssm_client()
+
+    if not github_token and shutil.which("gh"):
+        try:
+            _run_checked(["gh", "auth", "status"])
+            github_token = _run_checked(["gh", "auth", "token"]).stdout.strip()
+            if github_token:
+                click.echo("Using GitHub token from gh auth token")
+        except RuntimeError:
+            click.echo(
+                "GitHub token not detected from gh; skipping unless --github-token is provided."
+            )
+
+    if github_token:
+        ssm.put_parameter(
+            Name="/edcloud/github_token",
+            Description="GitHub personal access token for edcloud instance",
+            Type="SecureString",
+            Value=github_token,
+            Overwrite=True,
+        )
+        click.echo("Stored /edcloud/github_token")
+
+    if not tailscale_auth_key and prompt:
+        tailscale_auth_key = click.prompt(
+            "Paste your Tailscale auth key (starts with tskey-auth-, leave blank to skip)",
+            default="",
+            show_default=False,
+        ).strip()
+        tailscale_auth_key = tailscale_auth_key or None
+
+    if (
+        tailscale_auth_key
+        and not tailscale_auth_key.startswith("tskey-auth-")
+        and (
+            not prompt
+            or not click.confirm(
+                "Key does not start with tskey-auth-. Continue anyway?",
+                default=False,
+            )
+        )
+    ):
+        raise RuntimeError("Refusing to store non-standard Tailscale key.")
+
+    if tailscale_auth_key:
+        ssm.put_parameter(
+            Name="/edcloud/tailscale_auth_key",
+            Description="Tailscale auth key for edcloud instance provisioning",
+            Type="SecureString",
+            Value=tailscale_auth_key,
+            Overwrite=True,
+        )
+        click.echo("Stored /edcloud/tailscale_auth_key")
+
+    response = ssm.describe_parameters(
+        ParameterFilters=[
+            {"Key": "Name", "Option": "BeginsWith", "Values": ["/edcloud/"]},
+        ]
+    )
+    names = sorted(p["Name"] for p in response.get("Parameters", []))
+    click.echo("\nCurrent /edcloud/ parameters:")
+    for name in names:
+        click.echo(f"- {name}")
+
+
+@main.command("sync-cline-auth")
+@click.option("--remote", default="ubuntu@edcloud", show_default=True, help="Remote SSH target.")
+@click.option(
+    "--ssh-opt",
+    "ssh_opts",
+    multiple=True,
+    help="Repeatable SSH/SCP option (example: --ssh-opt -i --ssh-opt /path/key).",
+)
+@click.option(
+    "--source-secrets",
+    default="~/.cline/data/secrets.json",
+    show_default=True,
+    help="Local source secrets.json path.",
+)
+@click.option(
+    "--remote-config-dir",
+    default=".cline/data",
+    show_default=True,
+    help="Remote Cline config directory under $HOME.",
+)
+@click.option(
+    "--include-global-state/--secrets-only",
+    default=True,
+    show_default=True,
+    help="Sync globalState.json alongside secrets.json (recommended for session reuse).",
+)
+@click.option(
+    "--remote-diagnostics",
+    is_flag=True,
+    help="Run remote whoami/path/cline diagnostics before syncing.",
+)
+@click.option("--dry-run", is_flag=True, help="Print actions without changing remote state.")
+def sync_cline_auth(
+    remote: str,
+    ssh_opts: tuple[str, ...],
+    source_secrets: str,
+    remote_config_dir: str,
+    include_global_state: bool,
+    remote_diagnostics: bool,
+    dry_run: bool,
+) -> None:
+    """Sync Cline OAuth files from local machine to a remote host with backup semantics."""
+    source_secrets_path = Path(source_secrets).expanduser().resolve()
+    if not source_secrets_path.exists():
+        raise click.ClickException(f"Source secrets file not found: {source_secrets_path}")
+
+    with source_secrets_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if "openai-codex-oauth-credentials" not in payload:
+        raise click.ClickException(
+            "Missing expected key in secrets.json: openai-codex-oauth-credentials"
+        )
+
+    source_global_state = source_secrets_path.with_name("globalState.json")
+    if include_global_state and not source_global_state.exists():
+        click.echo(
+            "Warning: globalState.json not found next to secrets.json; "
+            "continuing with secrets-only sync.",
+            err=True,
+        )
+        include_global_state = False
+
+    click.echo(f"Remote target: {remote}")
+    click.echo(f"Source secrets: {source_secrets_path}")
+    if include_global_state:
+        click.echo(f"Source globalState: {source_global_state}")
+
+    if remote_diagnostics:
+        diagnostics_script = (
+            "set -euo pipefail; "
+            'echo "remote diagnostics:"; '
+            'echo "  user: $(whoami)"; '
+            'echo "  home: $HOME"; '
+            f'echo "  config_dir: $HOME/{remote_config_dir}"; '
+            "if command -v cline >/dev/null 2>&1; then "
+            'echo "  cline_path: $(command -v cline)"; '
+            'echo "  cline_version: $(cline --version 2>/dev/null || echo unknown)"; '
+            'else echo "  cline_path: missing"; fi'
+        )
+        diagnostics = _run_checked(["ssh", *ssh_opts, remote, diagnostics_script])
+        out = diagnostics.stdout.strip()
+        if out:
+            click.echo(out)
+
+    if dry_run:
+        click.echo(f"[dry-run] Would backup and sync files under ~/{remote_config_dir}/")
+        return
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    remote_backup_dir = f"{remote_config_dir}/backups"
+    remote_secrets = f"{remote_config_dir}/secrets.json"
+    remote_global_state = f"{remote_config_dir}/globalState.json"
+
+    backup_script = (
+        "set -euo pipefail; "
+        f'mkdir -p "$HOME/{remote_config_dir}" "$HOME/{remote_backup_dir}"; '
+        f'if [[ -f "$HOME/{remote_secrets}" ]]; then cp "$HOME/{remote_secrets}" '
+        f'"$HOME/{remote_backup_dir}/secrets.json.{ts}"; fi; '
+        f'if [[ {1 if include_global_state else 0} -eq 1 && -f "$HOME/{remote_global_state}" ]]; '
+        f'then cp "$HOME/{remote_global_state}" '
+        f'"$HOME/{remote_backup_dir}/globalState.json.{ts}"; fi'
+    )
+    _run_checked(["ssh", *ssh_opts, remote, backup_script])
+
+    _run_checked(
+        [
+            "scp",
+            *ssh_opts,
+            str(source_secrets_path),
+            f"{remote}:~/{remote_config_dir}/secrets.json.new",
+        ]
+    )
+    if include_global_state:
+        _run_checked(
+            [
+                "scp",
+                *ssh_opts,
+                str(source_global_state),
+                f"{remote}:~/{remote_config_dir}/globalState.json.new",
+            ]
+        )
+
+    install_script = (
+        "set -euo pipefail; "
+        f'mv "$HOME/{remote_config_dir}/secrets.json.new" "$HOME/{remote_secrets}"; '
+        f'chmod 600 "$HOME/{remote_secrets}"; '
+        f"if [[ {1 if include_global_state else 0} -eq 1 ]]; "
+        f'then mv "$HOME/{remote_config_dir}/globalState.json.new" '
+        f'"$HOME/{remote_global_state}"; chmod 600 "$HOME/{remote_global_state}"; fi'
+    )
+    _run_checked(["ssh", *ssh_opts, remote, install_script])
+
+    verify_script = (
+        "set -euo pipefail; "
+        f'test -s "$HOME/{remote_secrets}"; '
+        f"grep -q 'openai-codex-oauth-credentials' \"$HOME/{remote_secrets}\"; "
+        f"stat -c 'remote file: %n owner=%U:%G mode=%a size=%s' \"$HOME/{remote_secrets}\"; "
+        f"if [[ {1 if include_global_state else 0} -eq 1 ]]; then "
+        f'test -s "$HOME/{remote_global_state}"; '
+        f"stat -c 'remote file: %n owner=%U:%G mode=%a size=%s' \"$HOME/{remote_global_state}\"; "
+        "fi"
+    )
+    _run_checked(["ssh", *ssh_opts, remote, verify_script])
+
+    click.echo("Cline auth sync complete.")
+
+
+# ---------------------------------------------------------------------------
+# up / down
+# ---------------------------------------------------------------------------
+@main.command()
+@click.option(
+    "--allow-tailscale-name-conflicts",
+    is_flag=True,
+    help="Skip fail-fast guard for duplicate/suffixed edcloud Tailscale records.",
+)
+@require_aws_creds
+def up(allow_tailscale_name_conflicts: bool) -> None:
+    """Start the edcloud instance."""
+    if not allow_tailscale_name_conflicts:
+        _ensure_no_tailscale_name_conflicts()
+    ec2.start()
+    ts_ip = tailscale.get_tailscale_ip(DEFAULT_TAILSCALE_HOSTNAME)
+    if ts_ip:
+        click.echo(f"Tailscale IP: {ts_ip}")
+    else:
+        click.echo(
+            f"Tailscale peer '{DEFAULT_TAILSCALE_HOSTNAME}' not yet visible. "
+            "It may take a minute after boot."
+        )
+
+
+@main.command()
+@require_aws_creds
+def down() -> None:
+    """Stop the edcloud instance."""
+    ec2.stop()
+
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+@main.command()
+@require_aws_creds
+def status() -> None:
+    """Show instance state, IPs, and cost estimate."""
+    info = ec2.status()
+
+    if not info.get("exists"):
+        click.echo("No edcloud instance found. Run 'edc provision' to create one.")
+        orphaned = info.get("orphaned_resources", {})
+        security_groups = orphaned.get("security_groups", [])
+        volumes = orphaned.get("volumes", [])
+        if security_groups or volumes:
+            click.echo()
+            click.echo("Detected orphaned managed resources:")
+            if security_groups:
+                click.echo(f"  Security groups: {', '.join(security_groups)}")
+            if volumes:
+                click.echo(f"  Volumes (available): {', '.join(volumes)}")
+            click.echo(
+                "Remediation: clean up stale resources or reprovision and reattach data as needed."
+            )
+        return
+
+    click.echo(f"Instance:  {info['instance_id']}")
+    click.echo(f"State:     {info['state']}")
+    click.echo(f"Type:      {info['instance_type']}")
+
+    if info.get("public_ip"):
+        click.echo(f"Public IP: {info['public_ip']}")
+
+    # Tailscale
+    ts_ip = tailscale.get_tailscale_ip(DEFAULT_TAILSCALE_HOSTNAME)
+    if ts_ip:
+        click.echo(f"Tailscale: {ts_ip} ({DEFAULT_TAILSCALE_HOSTNAME})")
+        reachable = tailscale.is_reachable(DEFAULT_TAILSCALE_HOSTNAME)
+        click.echo(f"Reachable: {'yes' if reachable else 'no'}")
+    else:
+        click.echo("Tailscale: not visible on tailnet")
+
+    if info.get("launch_time"):
+        click.echo(f"Launched:  {info['launch_time']}")
+
+    # Volumes
+    for vol in info.get("volumes", []):
+        click.echo(
+            f"Volume:    {vol['volume_id']}  {vol['size_gb']}GB {vol['type']}  ({vol['state']})"
+        )
+
+    # Orphaned volume warning
+    orphaned = info.get("orphaned_volumes", [])
+    if orphaned:
+        click.echo()
+        click.echo(f"Warning: {len(orphaned)} orphaned managed volume(s) accruing cost:")
+        for vol_id in orphaned:
+            click.echo(f"  {vol_id}")
+        click.echo("  Delete manually: aws ec2 delete-volume --volume-id <id>")
+
+    # Cost
+    cost = info.get("cost_estimate", {})
+    if cost:
+        click.echo()
+        click.echo(f"Estimated monthly cost ({cost.get('note', '')}):")
+        click.echo(f"  Compute: ${cost.get('compute_monthly', 0):.2f}")
+        click.echo(f"  Storage: ${cost.get('storage_monthly', 0):.2f}")
+        click.echo(f"  Total:   ${cost.get('total_monthly', 0):.2f}")
+
+
+# ---------------------------------------------------------------------------
+# destroy
+# ---------------------------------------------------------------------------
+@main.command()
+@click.option("--force", is_flag=True, help="Skip confirmation prompt.")
+@click.option(
+    "--confirm-instance-id",
+    default=None,
+    help="Required safety confirmation. Must match current managed instance ID.",
+)
+@click.option(
+    "--require-fresh-snapshot",
+    is_flag=True,
+    help="Require a recent pre-change snapshot before destroy.",
+)
+@click.option(
+    "--fresh-snapshot-max-age-minutes",
+    default=120,
+    type=int,
+    show_default=True,
+    help="Maximum snapshot age for --require-fresh-snapshot.",
+)
+@click.option(
+    "--skip-cleanup",
+    is_flag=True,
+    help="Skip Tailscale device and orphaned volume cleanup after destroy.",
+)
+@click.option(
+    "--allow-delete-state-volume",
+    is_flag=True,
+    help="Allow cleanup workflow to delete protected state volumes.",
+)
+@click.option(
+    "--skip-snapshot",
+    is_flag=True,
+    help="Skip automatic snapshot before destroy (faster but risky).",
+)
+@require_aws_creds
+def destroy(
+    force: bool,
+    confirm_instance_id: str | None,
+    require_fresh_snapshot: bool,
+    fresh_snapshot_max_age_minutes: int,
+    skip_cleanup: bool,
+    allow_delete_state_volume: bool,
+    skip_snapshot: bool,
+) -> None:
+    """Terminate the instance and clean up. State volume is preserved."""
+    if fresh_snapshot_max_age_minutes <= 0:
+        click.echo("Error: --fresh-snapshot-max-age-minutes must be > 0.", err=True)
+        raise SystemExit(1)
+
+    info = ec2.status()
+    try:
+        require_confirmed_instance_id(
+            info,
+            confirm_instance_id,
+            command_name="destroy",
+        )
+    except RuntimeError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(1) from exc
+
+    if info.get("exists") and require_fresh_snapshot:
+        recent = snapshot.find_recent_prechange_snapshot(fresh_snapshot_max_age_minutes)
+        if not recent:
+            click.echo(
+                "Error: no fresh pre-change snapshot found for this guardrail.",
+                err=True,
+            )
+            click.echo(
+                "  Create one: edc snapshot -d pre-change-<reason>",
+                err=True,
+            )
+            click.echo(
+                "  Then rerun destroy with --require-fresh-snapshot.",
+                err=True,
+            )
+            raise SystemExit(1)
+        click.echo(f"Using pre-change snapshot: {recent['snapshot_id']} ({recent['start_time']})")
+
+    run_optional_auto_snapshot(
+        skip_snapshot=skip_snapshot,
+        auto_snapshot=snapshot.auto_snapshot_before_destroy,
+        echo=click.echo,
+        echo_err=lambda msg: click.echo(msg, err=True),
+        confirm_continue=lambda msg: click.confirm(msg),
+        operation_label="destroy",
+        continue_prompt="Continue with destroy anyway?",
+    )
+
+    ec2.destroy(force=force)
+
+    def _run_post_destroy_cleanup() -> None:
+        from edcloud import cleanup as cleanup_module
+
+        click.echo()
+        cleanup_module.run_cleanup_workflow(
+            "post-destroy",
+            skip_snapshot=True,
+            allow_delete_state=allow_delete_state_volume,
+        )
+
+    maybe_run_cleanup(skip_cleanup=skip_cleanup, run_cleanup=_run_post_destroy_cleanup)
+
+
+# ---------------------------------------------------------------------------
+# snapshot
+# ---------------------------------------------------------------------------
+@main.command("snapshot")
+@click.option("--list", "list_", is_flag=True, help="List existing snapshots.")
+@click.option("--description", "-d", default=None, help="Snapshot description.")
+@click.option("--prune", is_flag=True, help="Delete all but the most recent snapshots.")
+@click.option(
+    "--keep",
+    default=3,
+    type=int,
+    show_default=True,
+    help="Number of most-recent snapshots to retain when pruning.",
+)
+@click.option(
+    "--dry-run/--apply",
+    default=True,
+    show_default=True,
+    help="Preview prune deletions or apply them.",
+)
+@require_aws_creds
+def snapshot_cmd(
+    list_: bool,
+    description: str | None,
+    prune: bool,
+    keep: int,
+    dry_run: bool,
+) -> None:
+    """Create or list EBS snapshots."""
+    modes_selected = int(list_) + int(prune)
+    if modes_selected > 1:
+        click.echo("Error: use either --list or --prune (not both).", err=True)
+        raise SystemExit(1)
+    if (list_ or prune) and description is not None:
+        click.echo("Error: --description is only valid when creating snapshots.", err=True)
+        raise SystemExit(1)
+
+    if list_:
+        snaps = snapshot.list_snapshots()
+        if not snaps:
+            click.echo("No edcloud snapshots found.")
+            return
+        click.echo(f"{'ID':<25} {'Size':>5} {'State':<12} {'Started':<20} {'Description'}")
+        click.echo("-" * 90)
+        for s in snaps:
+            click.echo(
+                f"{s['snapshot_id']:<25} {s['size_gb']:>4}GB {s['state']:<12} "
+                f"{s['start_time'][:19]:<20} {s['description']}"
+            )
+    elif prune:
+        result = snapshot.prune_snapshots(keep_last=keep, dry_run=dry_run)
+        if result["delete_count"] == 0:
+            click.echo(f"Nothing to prune — {result['total']} snapshot(s), keep={keep}.")
+            return
+        click.echo(
+            f"{'Would delete' if dry_run else 'Deleting'} {result['delete_count']} of "
+            f"{result['total']} snapshot(s) (keeping {keep} most recent):"
+        )
+        for snap in result["to_delete"]:
+            click.echo(f"  {snap['snapshot_id']}  {snap['description']}")
+        if dry_run:
+            click.echo("Re-run with --apply to delete these snapshots.")
+    else:
+        snapshot.create_snapshot(description)
+
+
+@main.command("snapshot-cost")
+@click.option(
+    "--soft-cap-usd",
+    default=2.0,
+    type=float,
+    show_default=True,
+    help="Soft monthly spend cap for completed snapshots.",
+)
+@click.option(
+    "--gb-month-rate",
+    default=0.05,
+    type=float,
+    show_default=True,
+    help="Estimated USD per GB-month for snapshot storage.",
+)
+@click.option(
+    "--fail-on-cap",
+    is_flag=True,
+    help="Exit non-zero when estimated spend exceeds soft cap.",
+)
+@require_aws_creds
+def snapshot_cost_cmd(soft_cap_usd: float, gb_month_rate: float, fail_on_cap: bool) -> None:
+    """Estimate monthly snapshot spend and compare against a soft cap."""
+    if soft_cap_usd <= 0:
+        click.echo("Error: --soft-cap-usd must be > 0.", err=True)
+        raise SystemExit(1)
+    if gb_month_rate <= 0:
+        click.echo("Error: --gb-month-rate must be > 0.", err=True)
+        raise SystemExit(1)
+
+    report = ops_health.estimate_snapshot_monthly_cost(
+        snapshot.list_snapshots(),
+        gb_month_rate=gb_month_rate,
+        soft_cap_usd=soft_cap_usd,
+    )
+    click.echo(json.dumps(report, indent=2))
+
+    if report["over_soft_cap"]:
+        click.echo(
+            "Warning: estimated snapshot spend exceeds soft cap. "
+            "Consider pruning ad-hoc snapshots or adjusting DLM retention.",
+            err=True,
+        )
+        if fail_on_cap:
+            raise SystemExit(1)
+
+
+@main.command("restore-drill")
+@click.option(
+    "--snapshot-id",
+    default=None,
+    help="Specific completed snapshot ID for the state volume (default: latest completed).",
+)
+@click.option(
+    "--instance-id",
+    default=None,
+    help="Instance ID to temporarily attach restored volume to.",
+)
+@click.option(
+    "--attach-managed-instance",
+    is_flag=True,
+    help="Attach temporary restored volume to the managed running edcloud instance.",
+)
+@click.option(
+    "--device-name",
+    default="/dev/sdg",
+    show_default=True,
+    help="Linux device name used when attaching temporary drill volume.",
+)
+@click.option(
+    "--keep-temporary-volume",
+    is_flag=True,
+    help="Keep temporary restored volume for manual inspection (no auto-delete).",
+)
+@require_aws_creds
+def restore_drill_cmd(
+    snapshot_id: str | None,
+    instance_id: str | None,
+    attach_managed_instance: bool,
+    device_name: str,
+    keep_temporary_volume: bool,
+) -> None:
+    """Run a non-destructive snapshot restore drill using a temporary EBS volume."""
+    if instance_id and attach_managed_instance:
+        click.echo(
+            "Error: use either --instance-id or --attach-managed-instance (not both).",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    target_instance_id = instance_id
+    if attach_managed_instance:
+        info = ec2.status()
+        if not info.get("exists"):
+            click.echo(
+                "Error: no managed instance exists to attach restore-drill volume.", err=True
+            )
+            raise SystemExit(1)
+        if info.get("state") != "running":
+            click.echo(
+                f"Error: managed instance is {info.get('state')}; must be running to attach.",
+                err=True,
+            )
+            raise SystemExit(1)
+        target_instance_id = str(info["instance_id"])
+
+    result = snapshot.run_restore_drill(
+        snapshot_id=snapshot_id,
+        instance_id=target_instance_id,
+        device_name=device_name,
+        keep_temporary_volume=keep_temporary_volume,
+    )
+    click.echo(json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# backup-policy (AWS DLM)
+# ---------------------------------------------------------------------------
+@main.group("backup-policy")
+def backup_policy_group() -> None:
+    """Manage AWS-native DLM snapshot lifecycle policy."""
+
+
+@backup_policy_group.command("status")
+@require_aws_creds
+def backup_policy_status_cmd() -> None:
+    """Show current DLM backup policy status."""
+    status = backup_policy.policy_status()
+    click.echo(json.dumps(status, indent=2))
+
+
+@backup_policy_group.command("apply")
+@click.option("--daily-keep", default=7, type=int, show_default=True)
+@click.option("--weekly-keep", default=4, type=int, show_default=True)
+@click.option("--monthly-keep", default=2, type=int, show_default=True)
+@click.option("--disabled", is_flag=True, help="Create/update policy in DISABLED state.")
+@require_aws_creds
+def backup_policy_apply_cmd(
+    daily_keep: int,
+    weekly_keep: int,
+    monthly_keep: int,
+    disabled: bool,
+) -> None:
+    """Create or update the managed DLM backup policy."""
+    role_arn = iam.ensure_dlm_lifecycle_role(
+        {
+            "edcloud:managed": "true",
+            "Name": "edcloud",
+        }
+    )
+    result = backup_policy.ensure_policy(
+        execution_role_arn=role_arn,
+        daily_keep=daily_keep,
+        weekly_keep=weekly_keep,
+        monthly_keep=monthly_keep,
+        enabled=not disabled,
+    )
+    click.echo(json.dumps(result, indent=2))
+
+
+@backup_policy_group.command("disable")
+@require_aws_creds
+def backup_policy_disable_cmd() -> None:
+    """Disable the managed DLM backup policy."""
+    result = backup_policy.disable_policy()
+    click.echo(json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# verify
+# ---------------------------------------------------------------------------
+@main.command("verify")
+@click.option("--user", default=DEFAULT_SSH_USER, show_default=True, help="SSH user.")
+@click.option(
+    "--public-ip",
+    is_flag=True,
+    help="Use public IP for checks instead of Tailscale.",
+)
+@click.option("--json-output", is_flag=True, help="Emit verification results as JSON.")
+@require_aws_creds
+def verify_cmd(user: str, public_ip: bool, json_output: bool) -> None:
+    """Run fresh-reprovision verification checks."""
+    info = ec2.status()
+    if not info.get("exists"):
+        raise RuntimeError("No edcloud instance found. Run 'edc provision' first.")
+    if info.get("state") != "running":
+        raise RuntimeError(f"Instance is {info.get('state')}, must be running for verification.")
+
+    target, ssh_base = _resolve_ssh_target(info, public_ip, user, DEFAULT_TAILSCALE_HOSTNAME)
+    # Add verify-specific options
+    ssh_base.extend(["-o", "BatchMode=yes", "-o", "ConnectTimeout=12"])
+
+    results: list[dict[str, str | bool]] = []
+    for check in VERIFY_CHECKS:
+        remote = f"bash -lc {shlex.quote(check.remote_cmd)}"
+        cmd = [*ssh_base, remote]
+        try:
+            proc = subprocess.run(  # nosec B603
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            results.append({"check": check.name, "ok": False, "detail": str(exc)})
+            continue
+
+        detail = proc.stderr.strip() or proc.stdout.strip()
+        results.append({"check": check.name, "ok": proc.returncode == 0, "detail": detail})
+
+    success = all(bool(r["ok"]) for r in results)
+
+    if json_output:
+        click.echo(
+            json.dumps(
+                {
+                    "target": target,
+                    "public_ip_mode": public_ip,
+                    "success": success,
+                    "checks": results,
+                },
+                indent=2,
+            )
+        )
+    else:
+        click.echo(f"Verification target: {target}")
+        for result in results:
+            status = "PASS" if result["ok"] else "FAIL"
+            line = f"{status:<4} {result['check']}"
+            if not result["ok"] and result["detail"]:
+                line += f" ({result['detail']})"
+            click.echo(line)
+        click.echo(f"Overall: {'PASS' if success else 'FAIL'}")
+
+    if not success:
+        raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# ssh
+# ---------------------------------------------------------------------------
+@main.command("ssh", context_settings={"ignore_unknown_options": True})
+@click.option("--user", default=DEFAULT_SSH_USER, show_default=True, help="SSH user.")
+@click.option(
+    "--public-ip",
+    is_flag=True,
+    help="Use public IP instead of Tailscale (requires security group rule).",
+)
+@click.argument("ssh_args", nargs=-1, type=click.UNPROCESSED)
+@require_aws_creds
+def ssh_cmd(user: str, public_ip: bool, ssh_args: tuple[str, ...]) -> None:
+    """SSH into the instance.
+
+    Pass additional arguments to execute remote commands:
+      edc ssh 'docker ps'
+      edc ssh ls -la /opt
+
+    Default: Uses Tailscale network. No exposed ports required.
+
+    Note: If Tailscale SSH is enabled on your tailnet, it may require browser authentication.
+    Use --public-ip for direct SSH (requires security group rule: port 22 from your IP).
+    """
+    # Get instance info
+    info = ec2.status()
+    if not info.get("exists"):
+        click.echo("Error: No edcloud instance found.", err=True)
+        raise SystemExit(1)
+    if info["state"] != "running":
+        click.echo(f"Error: Instance is {info['state']}, not running.", err=True)
+        raise SystemExit(1)
+
+    # Resolve SSH target
+    try:
+        target, cmd = _resolve_ssh_target(info, public_ip, user, DEFAULT_TAILSCALE_HOSTNAME)
+    except RuntimeError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        if not public_ip:
+            click.echo("  Try: tailscale status", err=True)
+            click.echo("  Or use: edc ssh --public-ip", err=True)
+        raise SystemExit(1) from exc
+
+    # Log connection details
+    if public_ip:
+        click.echo(f"Connecting via public IP: {target}", err=True)
+        click.echo("Note: Security group must allow SSH (port 22) from your IP", err=True)
+    else:
+        click.echo(f"Connecting via Tailscale: {target}", err=True)
+        click.echo(
+            "Note: May trigger Tailscale SSH browser auth if enabled on your tailnet", err=True
+        )
+
+    if ssh_args:
+        cmd.extend(ssh_args)
+
+    os.execvp(cmd[0], cmd)  # nosec B606
+
+
+@main.group("tailscale")
+def tailscale_group() -> None:
+    """Tailscale reconciliation and guardrail helpers."""
+
+
+@tailscale_group.command("reconcile")
+@click.option(
+    "--dry-run/--apply",
+    default=True,
+    show_default=True,
+    help="Preview conflicts or apply manual reconciliation workflow guidance.",
+)
+def tailscale_reconcile(dry_run: bool) -> None:
+    """Show or reconcile Tailscale naming conflicts for edcloud."""
+    if not tailscale.tailscale_available():
+        click.echo("tailscale CLI not found on this operator node.", err=True)
+        raise SystemExit(1)
+
+    conflicts = tailscale.edcloud_name_conflicts()
+    if not conflicts:
+        click.echo("No Tailscale naming conflicts detected for edcloud.")
+        return
+
+    click.echo(tailscale.format_conflict_message(conflicts), err=not dry_run)
+    if dry_run:
+        raise SystemExit(1)
+
+    click.echo()
+    click.echo("Applied mode: manual reconciliation required in Tailscale admin.")
+    raise SystemExit(1)
+
+
+@main.group("permissions")
+def permissions_group() -> None:
+    """Inspect and verify AWS permissions required by edcloud."""
+
+
+def _permission_profile_choice() -> click.Choice:
+    return click.Choice(["all", *permissions.available_profiles()])
+
+
+@permissions_group.command("show")
+@click.option(
+    "--profile",
+    "profiles",
+    multiple=True,
+    type=_permission_profile_choice(),
+    help="Permission profile(s) to show. Repeatable. Defaults to all profiles.",
+)
+@click.option("--json-output", is_flag=True, help="Emit profile details as JSON.")
+def permissions_show_cmd(profiles: tuple[str, ...], json_output: bool) -> None:
+    """Show required IAM actions by profile."""
+    if json_output:
+        click.echo(permissions.profiles_json(profiles))
+        return
+
+    for profile in permissions.resolve_profiles(profiles):
+        click.echo(f"[{profile.name}] {profile.description}")
+        for action in profile.actions:
+            click.echo(f"  - {action}")
+        click.echo()
+
+
+@permissions_group.command("policy")
+@click.option(
+    "--profile",
+    "profiles",
+    multiple=True,
+    type=_permission_profile_choice(),
+    help="Permission profile(s) to include in generated policy. Defaults to all profiles.",
+)
+def permissions_policy_cmd(profiles: tuple[str, ...]) -> None:
+    """Generate an operator IAM policy document for selected profiles."""
+    click.echo(json.dumps(permissions.policy_document(profiles), indent=2))
+
+
+@permissions_group.command("verify")
+@click.option(
+    "--profile",
+    "profiles",
+    multiple=True,
+    type=_permission_profile_choice(),
+    help="Permission profile(s) to verify. Defaults to all profiles.",
+)
+@click.option("--json-output", is_flag=True, help="Emit verification result as JSON.")
+@require_aws_creds
+def permissions_verify_cmd(profiles: tuple[str, ...], json_output: bool) -> None:
+    """Verify selected permissions for the current AWS principal."""
+    required = permissions.required_actions(profiles)
+    result = permissions.verify_required_actions(required)
+
+    if json_output:
+        click.echo(
+            json.dumps(
+                {
+                    "ok": result.ok,
+                    "principal_arn": result.principal_arn,
+                    "policy_source_arn": result.policy_source_arn,
+                    "missing_actions": list(result.missing_actions),
+                    "required_action_count": len(required),
+                    "detail": result.detail,
+                },
+                indent=2,
+            )
+        )
+    else:
+        click.echo(f"Principal: {result.principal_arn}")
+        click.echo(f"Policy source: {result.policy_source_arn}")
+        click.echo(f"Required actions: {len(required)}")
+        click.echo(result.detail)
+        if result.missing_actions:
+            click.echo("Missing actions:")
+            for action in result.missing_actions:
+                click.echo(f"  - {action}")
+
+    if not result.ok:
+        raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# reprovision
+# ---------------------------------------------------------------------------
+@main.command("reprovision")
+@click.option(
+    "--instance-type",
+    default=InstanceConfig.instance_type,
+    show_default=True,
+    help="EC2 instance type.",
+)
+@click.option(
+    "--volume-size",
+    default=InstanceConfig.volume_size_gb,
+    type=int,
+    show_default=True,
+    help="Root EBS volume size in GB.",
+)
+@click.option(
+    "--state-volume-size",
+    default=InstanceConfig.state_volume_size_gb,
+    type=int,
+    show_default=True,
+    help="Persistent state EBS volume size in GB.",
+)
+@click.option(
+    "--tailscale-hostname",
+    default=DEFAULT_TAILSCALE_HOSTNAME,
+    show_default=True,
+    help="Tailscale MagicDNS hostname.",
+)
+@click.option(
+    "--tailscale-auth-key-ssm-parameter",
+    default=DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER,
+    envvar="TAILSCALE_AUTH_KEY_SSM_PARAMETER",
+    show_default=True,
+    help="SSM parameter name containing Tailscale auth key.",
+)
+@click.option(
+    "--skip-snapshot",
+    is_flag=True,
+    help="Skip automatic pre-reprovision snapshot (faster but risky).",
+)
+@click.option(
+    "--confirm-instance-id",
+    default=None,
+    help="Required safety confirmation. Must match current managed instance ID.",
+)
+@click.option(
+    "--allow-tailscale-name-conflicts",
+    is_flag=True,
+    help="Skip fail-fast guard for duplicate/suffixed edcloud Tailscale records.",
+)
+@require_aws_creds
+def reprovision(
+    instance_type: str,
+    volume_size: int,
+    state_volume_size: int,
+    tailscale_hostname: str,
+    tailscale_auth_key_ssm_parameter: str,
+    skip_snapshot: bool,
+    confirm_instance_id: str | None,
+    allow_tailscale_name_conflicts: bool,
+) -> None:
+    """Atomically snapshot → destroy → provision.
+
+    Takes a pre-reprovision snapshot (unless --skip-snapshot), destroys the
+    current instance, then provisions a fresh one. If provisioning fails after
+    destroy, the snapshot IDs are printed prominently so you can restore
+    manually.
+
+    Note: provisioning always requires an existing state volume. If the state
+    volume was deleted, use 'edc provision --allow-new-state-volume' directly.
+    """
+    if not allow_tailscale_name_conflicts:
+        _ensure_no_tailscale_name_conflicts(base_hostname=tailscale_hostname)
+
+    # Pre-flight: get current instance state once; use it for confirmation and destroy.
+    info = ec2.status()
+    try:
+        require_confirmed_instance_id(
+            info,
+            confirm_instance_id,
+            command_name="reprovision",
+        )
+    except RuntimeError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(1) from exc
+
+    cfg = InstanceConfig(
+        instance_type=instance_type,
+        volume_size_gb=volume_size,
+        state_volume_size_gb=state_volume_size,
+        tailscale_hostname=tailscale_hostname,
+        tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
+    )
+    from edcloud import cleanup as cleanup_module
+
+    snap_ids: list[str] = []
+    try:
+        snap_ids, result = run_reprovision_flow(
+            info=info,
+            skip_snapshot=skip_snapshot,
+            auto_snapshot=snapshot.auto_snapshot_before_destroy,
+            destroy_instance=lambda: ec2.destroy(force=True),
+            cleanup_orphaned_volumes=lambda: cleanup_module.cleanup_orphaned_volumes(
+                mode="delete", allow_delete_state=False
+            ),
+            provision_replacement=lambda: ec2.provision(cfg, require_existing_state_volume=True),
+            echo=click.echo,
+            echo_err=lambda msg: click.echo(msg, err=True),
+            confirm_continue=lambda msg: click.confirm(msg),
+        )
+    except (RuntimeError, ec2.TagDriftError, ClientError, BotoCoreError) as exc:
+        click.echo(f"❌ Provisioning failed: {exc}", err=True)
+        if snap_ids:
+            click.echo("", err=True)
+            click.echo(
+                "⚠️  The instance was destroyed but reprovisioning failed.",
+                err=True,
+            )
+            click.echo(
+                f"   Snapshot IDs for manual restore: {', '.join(snap_ids)}",
+                err=True,
+            )
+            click.echo(
+                "   Use 'edc provision' after restoring the state volume from a snapshot.",
+                err=True,
+            )
+        raise SystemExit(1) from exc
+
+    click.echo()
+    click.echo("Next step: run 'edc verify' to confirm rebuild health.")
+    click.echo()
+    click.echo(json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# resize
+# ---------------------------------------------------------------------------
+@main.command("resize")
+@click.option(
+    "--instance-type",
+    default=None,
+    help="New EC2 instance type (e.g. t3a.medium). Requires stop/start cycle.",
+)
+@click.option(
+    "--volume-size",
+    default=None,
+    type=int,
+    help="New root EBS volume size in GB (expand only, applied online).",
+)
+@click.option(
+    "--state-volume-size",
+    default=None,
+    type=int,
+    help="New state EBS volume size in GB (expand only, applied online).",
+)
+@require_aws_creds
+def resize_cmd(
+    instance_type: str | None,
+    volume_size: int | None,
+    state_volume_size: int | None,
+) -> None:
+    """Resize the instance type and/or EBS volumes in place.
+
+    Instance type changes require a stop/start cycle (data is preserved).
+    Volume size changes are applied online without a restart.
+    Volume shrinking is not supported by AWS.
+    """
+    if instance_type is None and volume_size is None and state_volume_size is None:
+        click.echo(
+            "Error: specify at least one of --instance-type, --volume-size, "
+            "or --state-volume-size.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    result = ec2.resize(
+        instance_type=instance_type,
+        volume_size_gb=volume_size,
+        state_volume_size_gb=state_volume_size,
+    )
+    click.echo()
+    click.echo(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,23 @@
+# Portainer CE — container management UI
+# Access via Tailscale: https://edcloud:9443
+#
+# Note: Portainer is started directly in cloud-init (not via compose)
+# because it needs to be available before any other stacks are deployed.
+# This file is kept as documentation / for manual re-deployment.
+#
+# Security: Bound to localhost to prevent accidental public exposure.
+# Access via SSH tunnel or Tailscale network: ssh -L 9443:localhost:9443 ubuntu@edcloud
+
+services:
+  portainer:
+    container_name: portainer
+    image: portainer/portainer-ce:lts
+    restart: always
+    ports:
+      - "127.0.0.1:9443:9443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+
+volumes:
+  portainer_data:

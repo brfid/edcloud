@@ -1,0 +1,10 @@
+[Unit]
+Description=Run edc weekly snapshot
+
+[Timer]
+OnCalendar=Sun *-*-* 03:15:00
+Persistent=true
+Unit=edc-weekly-snapshot.service
+
+[Install]
+WantedBy=timers.target

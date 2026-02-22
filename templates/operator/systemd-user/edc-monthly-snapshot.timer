@@ -1,0 +1,10 @@
+[Unit]
+Description=Run edc monthly snapshot
+
+[Timer]
+OnCalendar=monthly
+Persistent=true
+Unit=edc-monthly-snapshot.service
+
+[Install]
+WantedBy=timers.target

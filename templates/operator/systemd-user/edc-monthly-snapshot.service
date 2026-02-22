@@ -1,0 +1,7 @@
+[Unit]
+Description=edc monthly snapshot
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/edcloud/edc.env
+ExecStart=%h/.local/bin/edc snapshot -d monthly-snapshot

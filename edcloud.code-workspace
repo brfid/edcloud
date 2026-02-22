@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"chat.tools.terminal.autoApprove": {
+			"pip": true,
+			".venv/bin/pip": true,
+			".venv/bin/pytest": true,
+			".venv/bin/ruff": true
+		}
+	}
+}
