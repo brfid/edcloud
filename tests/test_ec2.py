@@ -260,7 +260,7 @@ class TestProvision:
         assert block_mappings[0]["DeviceName"] == "/dev/sda1"
         assert block_mappings[0]["Ebs"]["DeleteOnTermination"] is True
         assert block_mappings[1]["DeviceName"] == "/dev/sdf"
-        assert block_mappings[1]["Ebs"]["VolumeSize"] == 20
+        assert block_mappings[1]["Ebs"]["VolumeSize"] == 30
         assert block_mappings[1]["Ebs"]["DeleteOnTermination"] is False
         # Verify IMDS settings
         metadata_opts = kwargs["MetadataOptions"]

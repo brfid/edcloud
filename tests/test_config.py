@@ -16,9 +16,9 @@ from edcloud.config import (
 def test_default_config() -> None:
     cfg = InstanceConfig()
     assert cfg.instance_type == "t3a.small"
-    assert cfg.volume_size_gb == 16
+    assert cfg.volume_size_gb == 30
     assert cfg.volume_type == "gp3"
-    assert cfg.state_volume_size_gb == 20
+    assert cfg.state_volume_size_gb == 30
     assert cfg.state_volume_type == "gp3"
     assert cfg.state_volume_device_name == "/dev/sdf"
     assert cfg.tailscale_hostname == "edcloud"

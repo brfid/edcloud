@@ -24,9 +24,9 @@ NAME_TAG = "edcloud"
 # EC2 defaults
 # ---------------------------------------------------------------------------
 DEFAULT_INSTANCE_TYPE = "t3a.small"
-DEFAULT_VOLUME_SIZE_GB = 16  # Root: OS + Docker + dev tools (~6GB used baseline)
+DEFAULT_VOLUME_SIZE_GB = 30  # Root: OS + dev tools (containerd data lives on state volume)
 DEFAULT_VOLUME_TYPE = "gp3"
-DEFAULT_STATE_VOLUME_SIZE_GB = 20  # State: home + Docker data (starts ~1GB, grows with use)
+DEFAULT_STATE_VOLUME_SIZE_GB = 30  # State: home + Docker + containerd data
 DEFAULT_STATE_VOLUME_TYPE = "gp3"
 DEFAULT_STATE_VOLUME_DEVICE_NAME = "/dev/sdf"
 
