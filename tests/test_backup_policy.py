@@ -30,7 +30,6 @@ class TestPolicyStatus:
                         {"Name": "daily"},
                         {"Name": "weekly"},
                         {"Name": "monthly"},
-                        {"Name": "quarterly"},
                     ]
                 }
             }
@@ -55,14 +54,12 @@ class TestEnsurePolicy:
             daily_keep=1,
             weekly_keep=1,
             monthly_keep=1,
-            quarterly_keep=1,
         )
         assert result["action"] == "created"
         assert result["policy_id"] == "policy-new"
-        assert result["quarterly_keep"] == 1
 
     @patch("edcloud.backup_policy._dlm_client")
-    def test_creates_includes_quarterly_schedule(self, mock_dlm_client):
+    def test_creates_includes_daily_weekly_monthly_schedules(self, mock_dlm_client):
         mock_dlm = MagicMock()
         mock_dlm.get_lifecycle_policies.return_value = {"Policies": []}
         mock_dlm.create_lifecycle_policy.return_value = {"PolicyId": "policy-new"}
@@ -72,8 +69,10 @@ class TestEnsurePolicy:
 
         call_kwargs = mock_dlm.create_lifecycle_policy.call_args[1]
         schedule_names = [s["Name"] for s in call_kwargs["PolicyDetails"]["Schedules"]]
-        assert "quarterly" in schedule_names
-        assert len(schedule_names) == 4
+        assert "daily" in schedule_names
+        assert "weekly" in schedule_names
+        assert "monthly" in schedule_names
+        assert len(schedule_names) == 3
 
     @patch("edcloud.backup_policy._dlm_client")
     def test_updates_when_existing(self, mock_dlm_client):
@@ -90,7 +89,6 @@ class TestEnsurePolicy:
             daily_keep=1,
             weekly_keep=1,
             monthly_keep=1,
-            quarterly_keep=1,
         )
         assert result["action"] == "updated"
         mock_dlm.update_lifecycle_policy.assert_called_once()

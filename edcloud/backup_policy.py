@@ -26,9 +26,7 @@ def _target_tags() -> list[dict[str, str]]:
     ]
 
 
-def _policy_details(
-    daily_keep: int, weekly_keep: int, monthly_keep: int, quarterly_keep: int
-) -> dict[str, Any]:
+def _policy_details(daily_keep: int, weekly_keep: int, monthly_keep: int) -> dict[str, Any]:
     return {
         "PolicyType": "EBS_SNAPSHOT_MANAGEMENT",
         "ResourceTypes": ["VOLUME"],
@@ -75,19 +73,6 @@ def _policy_details(
                     {"Key": "edcloud:backup-tier", "Value": "monthly"},
                 ],
             },
-            {
-                "Name": "quarterly",
-                "CopyTags": True,
-                "CreateRule": {
-                    "CronExpression": "cron(0 6 1 1,4,7,10 ? *)",
-                },
-                "RetainRule": {"Count": quarterly_keep},
-                "TagsToAdd": [
-                    {"Key": MANAGER_TAG_KEY, "Value": MANAGER_TAG_VALUE},
-                    {"Key": "Name", "Value": f"{NAME_TAG}-dlm-quarterly"},
-                    {"Key": "edcloud:backup-tier", "Value": "quarterly"},
-                ],
-            },
         ],
     }
 
@@ -123,22 +108,20 @@ def ensure_policy(
     daily_keep: int = 1,
     weekly_keep: int = 1,
     monthly_keep: int = 1,
-    quarterly_keep: int = 1,
     enabled: bool = True,
 ) -> dict[str, Any]:
     """Create or update the managed DLM policy with tiered retention.
 
     Default retention keeps exactly one snapshot per tier:
-    - daily:     1 snapshot (~1 day old)
-    - weekly:    1 snapshot (~1 week old, every Sunday)
-    - monthly:   1 snapshot (~1 month old, 1st of month)
-    - quarterly: 1 snapshot (~3 months old, 1st of Jan/Apr/Jul/Oct)
+    - daily:   1 snapshot (~1 day old)
+    - weekly:  1 snapshot (~1 week old, every Sunday)
+    - monthly: 1 snapshot (~1 month old, 1st of month)
 
     DLM targets EBS volumes by tag and runs independently of instance state,
     so snapshots accumulate on schedule whether the instance is running or not.
     """
-    if daily_keep <= 0 or weekly_keep <= 0 or monthly_keep <= 0 or quarterly_keep <= 0:
-        raise ValueError("daily_keep, weekly_keep, monthly_keep, and quarterly_keep must be > 0")
+    if daily_keep <= 0 or weekly_keep <= 0 or monthly_keep <= 0:
+        raise ValueError("daily_keep, weekly_keep, and monthly_keep must be > 0")
 
     dlm = _dlm_client()
     state = "ENABLED" if enabled else "DISABLED"
@@ -146,7 +129,6 @@ def ensure_policy(
         daily_keep=daily_keep,
         weekly_keep=weekly_keep,
         monthly_keep=monthly_keep,
-        quarterly_keep=quarterly_keep,
     )
     summary = _find_policy_summary()
 
@@ -165,7 +147,6 @@ def ensure_policy(
             "daily_keep": daily_keep,
             "weekly_keep": weekly_keep,
             "monthly_keep": monthly_keep,
-            "quarterly_keep": quarterly_keep,
         }
 
     policy_id = summary["PolicyId"]
@@ -183,7 +164,6 @@ def ensure_policy(
         "daily_keep": daily_keep,
         "weekly_keep": weekly_keep,
         "monthly_keep": monthly_keep,
-        "quarterly_keep": quarterly_keep,
     }
 
 

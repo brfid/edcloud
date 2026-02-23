@@ -422,7 +422,6 @@ def test_backup_policy_apply_uses_defaults(
         daily_keep=1,
         weekly_keep=1,
         monthly_keep=1,
-        quarterly_keep=1,
         enabled=True,
     )
 
@@ -973,7 +972,7 @@ def test_tailscale_check_logs_warning_when_cli_not_found(
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.ec2.destroy")
 @patch("edcloud.cli.ec2.status")
-@patch("edcloud.cli.snapshot.auto_snapshot_before_destroy")
+@patch("edcloud.cli.snapshot.snapshot_and_prune")
 @patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
 @patch("edcloud.cli.tailscale.tailscale_available", return_value=True)
 @patch("edcloud.cli.get_region", return_value="us-east-1")
@@ -1021,7 +1020,7 @@ def test_reprovision_snapshots_destroys_and_provisions(
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.ec2.destroy")
 @patch("edcloud.cli.ec2.status")
-@patch("edcloud.cli.snapshot.auto_snapshot_before_destroy")
+@patch("edcloud.cli.snapshot.snapshot_and_prune")
 @patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
 @patch("edcloud.cli.tailscale.tailscale_available", return_value=True)
 @patch("edcloud.cli.get_region", return_value="us-east-1")
@@ -1067,7 +1066,7 @@ def test_reprovision_skip_snapshot_skips_snapshot(
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.ec2.destroy")
 @patch("edcloud.cli.ec2.status")
-@patch("edcloud.cli.snapshot.auto_snapshot_before_destroy")
+@patch("edcloud.cli.snapshot.snapshot_and_prune")
 @patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
 @patch("edcloud.cli.tailscale.tailscale_available", return_value=True)
 @patch("edcloud.cli.get_region", return_value="us-east-1")
