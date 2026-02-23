@@ -24,9 +24,9 @@ NAME_TAG = "edcloud"
 # EC2 defaults
 # ---------------------------------------------------------------------------
 DEFAULT_INSTANCE_TYPE = "t3a.small"
-DEFAULT_VOLUME_SIZE_GB = 16  # Root: OS + Docker + dev tools (~6GB used baseline)
+DEFAULT_VOLUME_SIZE_GB = 30  # Root: OS + dev tools (containerd data lives on state volume)
 DEFAULT_VOLUME_TYPE = "gp3"
-DEFAULT_STATE_VOLUME_SIZE_GB = 20  # State: home + Docker data (starts ~1GB, grows with use)
+DEFAULT_STATE_VOLUME_SIZE_GB = 30  # State: home + Docker + containerd data
 DEFAULT_STATE_VOLUME_TYPE = "gp3"
 DEFAULT_STATE_VOLUME_DEVICE_NAME = "/dev/sdf"
 
@@ -69,7 +69,7 @@ HOURLY_RATES: dict[str, float] = {
 EBS_MONTHLY_RATE_PER_GB = 0.08
 SNAPSHOT_MONTHLY_RATE_PER_GB = 0.05
 EIP_UNATTACHED_MONTHLY_RATE = 3.60
-DEFAULT_HOURS_PER_DAY = 4
+DEFAULT_HOURS_PER_DAY = 8
 DEFAULT_SNAPSHOT_KEEP_LAST = 3
 
 

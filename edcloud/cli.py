@@ -286,7 +286,7 @@ def provision(
         # Auto-snapshot if existing instance (unless --skip-snapshot)
         if not skip_snapshot:
             click.echo("Checking for existing instance to snapshot...")
-            snap_ids = snapshot.auto_snapshot_before_destroy()
+            snap_ids = snapshot.snapshot_and_prune("pre-provision", wait=True)
             if snap_ids:
                 click.echo(f"✅ Created pre-provision snapshot(s): {', '.join(snap_ids)}")
                 click.echo()
@@ -358,15 +358,8 @@ def provision(
     _print_audit_summary("post-provision")
 
     click.echo()
-    click.echo("Applying DLM backup policy...")
-    try:
-        role_arn = iam.ensure_dlm_lifecycle_role({"edcloud:managed": "true", "Name": "edcloud"})
-        backup_policy.ensure_policy(execution_role_arn=role_arn)
-        click.echo("✅ DLM backup policy active (daily/weekly/monthly/quarterly, 1 snapshot each)")
-    except Exception as exc:
-        click.echo(f"Warning: backup policy setup failed: {exc}", err=True)
-        click.echo("  Run 'edc backup-policy apply' manually to enable backups.", err=True)
-
+    click.echo("Snapshots are managed by the CLI (max 3, pruned on each trigger).")
+    click.echo("  Use 'edc snapshot --list' to view, 'edc backup-policy apply' for DLM.")
     click.echo()
     click.echo(json.dumps(result, indent=2))
 
@@ -664,6 +657,15 @@ def up(allow_tailscale_name_conflicts: bool) -> None:
     """Start the edcloud instance."""
     if not allow_tailscale_name_conflicts:
         _ensure_no_tailscale_name_conflicts()
+
+    # On-start snapshot (fire-and-forget; prune enforces 3-snapshot cap)
+    try:
+        snap_ids = snapshot.snapshot_and_prune("on-start", wait=False)
+        if snap_ids:
+            click.echo(f"On-start snapshot queued: {', '.join(snap_ids)}")
+    except Exception as exc:
+        click.echo(f"Warning: on-start snapshot skipped ({exc})", err=True)
+
     ec2.start()
     ts_ip = tailscale.get_tailscale_ip(DEFAULT_TAILSCALE_HOSTNAME)
     if ts_ip:
@@ -751,14 +753,13 @@ def status() -> None:
         click.echo(f"  Storage: ${cost.get('storage_monthly', 0):.2f}")
         click.echo(f"  Total:   ${cost.get('total_monthly', 0):.2f}")
 
-    # Backup policy
-    bp = backup_policy.policy_status()
+    # Snapshots
+    snaps = snapshot.list_snapshots()
+    completed = [s for s in snaps if s["state"] == "completed"]
     click.echo()
-    if bp.get("exists"):
-        bp_state = bp.get("state", "UNKNOWN")
-        click.echo(f"Backups:   DLM policy {bp.get('policy_id')}  [{bp_state}]")
-    else:
-        click.echo("Backups:   no DLM policy — run 'edc backup-policy apply' to enable")
+    click.echo(
+        f"Snapshots: {len(snaps)} managed ({len(completed)} completed) — use 'edc snapshot --list'"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -824,17 +825,6 @@ def destroy(
         click.echo(str(exc), err=True)
         raise SystemExit(1) from exc
 
-    # Warn if DLM backup policy is absent or disabled
-    bp = backup_policy.policy_status()
-    if not bp.get("exists") or bp.get("state") != "ENABLED":
-        bp_detail = (
-            "no DLM policy found" if not bp.get("exists") else f"policy state: {bp.get('state')}"
-        )
-        click.echo(f"Warning: backups are not active ({bp_detail}).", err=True)
-        click.echo("  The state volume has no recent automated snapshots.", err=True)
-        click.echo("  Run 'edc backup-policy apply' to enable backups.", err=True)
-        click.echo()
-
     if info.get("exists") and require_fresh_snapshot:
         recent = snapshot.find_recent_prechange_snapshot(fresh_snapshot_max_age_minutes)
         if not recent:
@@ -855,7 +845,7 @@ def destroy(
 
     run_optional_auto_snapshot(
         skip_snapshot=skip_snapshot,
-        auto_snapshot=snapshot.auto_snapshot_before_destroy,
+        auto_snapshot=lambda: snapshot.snapshot_and_prune("pre-destroy", wait=True),
         echo=click.echo,
         echo_err=lambda msg: click.echo(msg, err=True),
         confirm_continue=lambda msg: click.confirm(msg),
@@ -1079,14 +1069,12 @@ def backup_policy_status_cmd() -> None:
 @click.option("--daily-keep", default=1, type=int, show_default=True)
 @click.option("--weekly-keep", default=1, type=int, show_default=True)
 @click.option("--monthly-keep", default=1, type=int, show_default=True)
-@click.option("--quarterly-keep", default=1, type=int, show_default=True)
 @click.option("--disabled", is_flag=True, help="Create/update policy in DISABLED state.")
 @require_aws_creds
 def backup_policy_apply_cmd(
     daily_keep: int,
     weekly_keep: int,
     monthly_keep: int,
-    quarterly_keep: int,
     disabled: bool,
 ) -> None:
     """Create or update the managed DLM backup policy."""
@@ -1101,7 +1089,6 @@ def backup_policy_apply_cmd(
         daily_keep=daily_keep,
         weekly_keep=weekly_keep,
         monthly_keep=monthly_keep,
-        quarterly_keep=quarterly_keep,
         enabled=not disabled,
     )
     click.echo(json.dumps(result, indent=2))
@@ -1473,7 +1460,7 @@ def reprovision(
         snap_ids, result = run_reprovision_flow(
             info=info,
             skip_snapshot=skip_snapshot,
-            auto_snapshot=snapshot.auto_snapshot_before_destroy,
+            auto_snapshot=lambda: snapshot.snapshot_and_prune("pre-reprovision", wait=True),
             destroy_instance=lambda: ec2.destroy(force=True),
             cleanup_orphaned_volumes=lambda: cleanup_module.cleanup_orphaned_volumes(
                 mode="delete", allow_delete_state=False

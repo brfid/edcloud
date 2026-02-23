@@ -243,6 +243,15 @@ runcmd:
     systemctl enable docker
     usermod -aG docker ubuntu
 
+  # --- containerd data-root → state volume ---
+  - |
+    mkdir -p /opt/edcloud/state/containerd
+    # Write containerd config before any images are pulled so data lands on state volume
+    containerd config default > /etc/containerd/config.toml
+    sed -i 's|^root = .*|root = "/opt/edcloud/state/containerd"|' /etc/containerd/config.toml
+    systemctl restart containerd
+    systemctl restart docker
+
   # --- Tailscale ---
   - |
     set -eu
