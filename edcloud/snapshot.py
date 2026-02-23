@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from edcloud.config import (
+    DEFAULT_SNAPSHOT_KEEP_LAST,
     MANAGER_TAG_KEY,
     MANAGER_TAG_VALUE,
     NAME_TAG,
@@ -282,6 +283,47 @@ def auto_snapshot_before_destroy() -> list[str]:
         log.info("Waiting for snapshot(s) to complete before proceeding...")
         wait_for_snapshot_completion(snap_ids)
         log.info("Snapshot(s) completed.")
+    return snap_ids
+
+
+def snapshot_and_prune(
+    description: str,
+    keep: int = DEFAULT_SNAPSHOT_KEEP_LAST,
+    wait: bool = True,
+) -> list[str]:
+    """Prune → snapshot → prune, enforcing a hard cap of *keep* snapshots.
+
+    The pre-prune heals drift from a previously failed post-prune.
+    The post-prune enforces the cap after the new snapshot is created.
+    Worst-case drift is +1 (snapshot succeeded, both prunes failed) — self-heals
+    on the next trigger.
+
+    Args:
+        description: Snapshot description.
+        keep: Maximum snapshots to retain after the operation.
+        wait: If ``True``, wait for snapshots to reach completed state before returning.
+
+    Returns:
+        List of created snapshot IDs, or empty list if no instance exists.
+    """
+    ec2 = get_ec2_client()
+    inst = find_instance(ec2)
+    if not inst:
+        return []
+
+    # Pre-prune: heal any drift from a previously failed post-prune
+    prune_snapshots(keep_last=keep, dry_run=False)
+
+    snap_ids = create_snapshot(description)
+
+    # Post-prune: enforce the cap
+    prune_snapshots(keep_last=keep, dry_run=False)
+
+    if wait and snap_ids:
+        log.info("Waiting for snapshot(s) to complete...")
+        wait_for_snapshot_completion(snap_ids)
+        log.info("Snapshot(s) completed.")
+
     return snap_ids
 
 
