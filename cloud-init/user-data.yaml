@@ -149,6 +149,30 @@ write_files:
     content: |
       EDCLOUD_MANAGED=true
 
+  - path: /home/ubuntu/.config/systemd/user/rclone-dropbox.service
+    owner: ubuntu:ubuntu
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Dropbox via rclone FUSE mount
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=notify
+      ExecStartPre=/bin/mkdir -p %h/Dropbox
+      ExecStart=/usr/bin/rclone mount dropbox: %h/Dropbox \
+          --vfs-cache-mode writes \
+          --vfs-cache-max-size 1G \
+          --log-level INFO \
+          --log-file /tmp/rclone-dropbox.log
+      ExecStop=/bin/fusermount3 -uz %h/Dropbox
+      Restart=on-failure
+      RestartSec=10
+
+      [Install]
+      WantedBy=default.target
+
 runcmd:
   # --- State volume: early mount (home bind before other runcmd steps) ---
   - |
@@ -493,6 +517,28 @@ runcmd:
       fi
     '
 
+  # --- rclone config from SSM (Dropbox FUSE mount credentials) ---
+  - |
+    runuser -u ubuntu -- bash -lc '
+      set -euo pipefail
+      if ! command -v aws &>/dev/null || ! command -v rclone &>/dev/null; then
+        exit 0
+      fi
+      RCLONE_CONF=$(aws ssm get-parameter \
+        --name /edcloud/rclone_config \
+        --with-decryption \
+        --query "Parameter.Value" \
+        --output text 2>/dev/null || true)
+      if [ -n "$RCLONE_CONF" ]; then
+        mkdir -p "$HOME/.config/rclone"
+        printf "%s" "$RCLONE_CONF" > "$HOME/.config/rclone/rclone.conf"
+        chmod 600 "$HOME/.config/rclone/rclone.conf"
+        echo "✅ rclone config written from SSM"
+      else
+        echo "ℹ️ No rclone config found in SSM; skipping Dropbox mount setup"
+      fi
+    '
+
   # --- Pull non-secret personal repos (dotfiles/bin/llm-config) ---
   - |
     runuser -u ubuntu -- bash -lc '
@@ -564,6 +610,17 @@ runcmd:
 
   # --- Enable user lingering so user systemd services (e.g. rclone-dropbox) run without a login session ---
   - loginctl enable-linger ubuntu
+
+  # --- Enable rclone-dropbox.service for ubuntu user (if rclone config is present) ---
+  - |
+    if [ -f /home/ubuntu/.config/rclone/rclone.conf ]; then
+      mkdir -p /home/ubuntu/.config/systemd/user/default.target.wants
+      ln -sfn /home/ubuntu/.config/systemd/user/rclone-dropbox.service \
+        /home/ubuntu/.config/systemd/user/default.target.wants/rclone-dropbox.service
+      chown -h ubuntu:ubuntu \
+        /home/ubuntu/.config/systemd/user/default.target.wants/rclone-dropbox.service
+      echo "✅ rclone-dropbox.service enabled for ubuntu"
+    fi
 
   # --- Enable idle-shutdown timer ---
   - systemctl daemon-reload

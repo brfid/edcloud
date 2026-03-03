@@ -40,6 +40,8 @@ AMI_SSM_PARAMETER = (
 # ---------------------------------------------------------------------------
 DEFAULT_TAILSCALE_HOSTNAME = "edcloud"
 DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER = "/edcloud/tailscale_auth_key"
+GITHUB_TOKEN_SSM_PARAMETER = "/edcloud/github_token"
+RCLONE_CONFIG_SSM_PARAMETER = "/edcloud/rclone_config"
 DEFAULT_SSH_USER = "ubuntu"
 
 # ---------------------------------------------------------------------------
