@@ -56,6 +56,7 @@ Console.
   `pre-commit run --all-files`, `pytest -q`).
 
 **Core design:**
+
 - Tailscale-only access (zero inbound rules)
 - Tag-based resource discovery (no state files)
 - Persistent home on state volume
@@ -150,7 +151,13 @@ LazyVim compatibility:
 **Compute:** t3a.small, Ubuntu 24.04, Tailscale SSH only
 **Storage:** 16GB root (disposable), 20GB state at `/opt/edcloud/state` (persistent)
 **Discovery:** Tag `edcloud:managed=true` on all resources
-**Secrets:** AWS SSM Parameter Store
+**Secrets:** AWS SSM Parameter Store (`/edcloud/*` namespace, read by instance IAM role at boot)
+**Bootstrap secrets consumed automatically at cloud-init:**
+
+- `/edcloud/tailscale_auth_key` — Tailscale join key (required)
+- `/edcloud/github_token` — GitHub CLI auth (optional)
+- `/edcloud/rclone_config` — rclone config with Dropbox OAuth token; mounts `~/Dropbox` via FUSE on every build (optional)
+
 **Baseline:** Docker, Portainer, Node.js, Python, and dev tooling are defined in `cloud-init/user-data.yaml`.
 
 For full technical detail, see:

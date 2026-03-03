@@ -177,6 +177,39 @@ Load key into current shell when needed:
 eval "$(edc load-tailscale-env-key)"
 ```
 
+## 2b. Optional SSM secrets (auto-consumed at cloud-init)
+
+The instance IAM role grants `ssm:GetParameter` on all `/edcloud/*` parameters.
+The following are pulled automatically during every build — store them once and
+they apply to every reprovision:
+
+| Parameter | Effect at boot |
+| --- | --- |
+| `/edcloud/tailscale_auth_key` | Joins Tailscale network (required) |
+| `/edcloud/github_token` | Authenticates `gh` CLI (`gh auth login`) |
+| `/edcloud/rclone_config` | Writes `~/.config/rclone/rclone.conf` and enables `rclone-dropbox.service` so `~/Dropbox` is FUSE-mounted |
+
+Store each as `SecureString`:
+
+```bash
+# GitHub personal access token
+aws ssm put-parameter \
+  --name /edcloud/github_token \
+  --type SecureString \
+  --overwrite \
+  --value '<GITHUB_TOKEN>'
+
+# rclone config (run rclone config on a machine with browser access first)
+aws ssm put-parameter \
+  --name /edcloud/rclone_config \
+  --type SecureString \
+  --overwrite \
+  --value "$(cat ~/.config/rclone/rclone.conf)"
+```
+
+All three parameters are optional except `tailscale_auth_key`. If a parameter is
+absent at boot, the corresponding step no-ops and bootstrap continues.
+
 ## 3. Install edcloud CLI
 
 ```bash
@@ -360,6 +393,7 @@ edc verify
 ```
 
 Your state volume is completely independent of instance type, so resizing preserves:
+
 - SSH keys and logins
 - Tailscale identity (same hostname/IP)
 - Docker images and containers
