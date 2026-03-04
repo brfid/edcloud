@@ -36,6 +36,7 @@ semantic version tags.
 ### Recently Completed
 
 - Wired Dropbox FUSE mount via rclone: rclone config stored as SecureString at `/edcloud/rclone_config` in SSM; cloud-init fetches it on every rebuild and enables `rclone-dropbox.service` (user systemd, `~/Dropbox` mount); `RCLONE_CONFIG_SSM_PARAMETER` added to `config.py`.
+- Added oldspeak MCP bootstrap integration while keeping app code in a separate repo: cloud-init now best-effort syncs `~/src/oldspeak` (via `gh` auth path), bootstraps a local venv/install + spaCy model, and installs local wrappers (`~/.local/bin/oldspeak-mcp-stdio`, `~/.local/bin/oldspeak-mcp-http`) for on-host Cline/Claude Code usage. Docs updated in README, RUNBOOK, and ARCHITECTURE.
 
 ## [2026-03-03]
 

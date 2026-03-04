@@ -160,6 +160,18 @@ LazyVim compatibility:
 
 **Baseline:** Docker, Portainer, Node.js, Python, and dev tooling are defined in `cloud-init/user-data.yaml`.
 
+Bootstrap repo sync (when `gh` auth is available on the instance):
+
+- `https://github.com/<gh-user>/dotfiles.git` → `~/src/dotfiles`
+- `https://github.com/<gh-user>/bin.git` → `~/src/bin`
+- `https://github.com/<gh-user>/llm-config.git` → `~/src/llm-config`
+- `https://github.com/<gh-user>/oldspeak.git` → `~/src/oldspeak`
+
+For local MCP usage on edcloud, cloud-init also installs best-effort wrappers:
+
+- `~/.local/bin/oldspeak-mcp-stdio` (recommended for Cline/Claude Code on-host)
+- `~/.local/bin/oldspeak-mcp-http [port]` (localhost HTTP transport, optional)
+
 For full technical detail, see:
 
 - `RUNBOOK.md` for durable host baseline, rebuild workflow, backup/restore operations, and operator procedures.

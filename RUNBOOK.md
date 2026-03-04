@@ -17,7 +17,7 @@ This file is the stable operator procedure guide.
 Open items:
 
 - [x] Add a safe rebuild workflow (`snapshot -> reprovision -> verify`) as a single documented operator path. (`edc reprovision` now prints a post-run reminder to run `edc verify`.)
-- [ ] Improve automatic repo loading: currently dotfiles/bin/llm-config cloning depends on gh auth during cloud-init; consider making repo list configurable and/or adding explicit clone step to provision workflow (e.g., `edc provision --sync-repos`).
+- [ ] Improve automatic repo loading: currently dotfiles/bin/llm-config/oldspeak cloning depends on gh auth during cloud-init; consider making repo list configurable and/or adding explicit clone step to provision workflow (e.g., `edc provision --sync-repos`).
 - [ ] Evaluate a secure operator login workflow that starts from one memorized string without weakening Tailscale/AWS MFA controls.
 - [ ] Centralize default SSH username in repo config (for example `edcloud/config.py`) and have `edc ssh`/`edc verify` read that value.
 - [ ] Keep snapshot spend under soft cap `$2/month`; adjust DLM retention (`edc backup-policy apply --daily-keep N --weekly-keep M --monthly-keep K`) if exceeded.
@@ -635,8 +635,14 @@ Non-secret repo sync baseline:
   - `https://github.com/<gh-user>/dotfiles.git` → `~/src/dotfiles`
   - `https://github.com/<gh-user>/bin.git` → `~/src/bin`
   - `https://github.com/<gh-user>/llm-config.git` → `~/src/llm-config`
+  - `https://github.com/<gh-user>/oldspeak.git` → `~/src/oldspeak`
 - If `~/src/dotfiles/install.sh` exists and is executable, it is run.
 - Executable files in `~/src/bin` are symlinked into `~/.local/bin`.
+- If `~/src/oldspeak/pyproject.toml` exists, cloud-init performs best-effort local
+  MCP bootstrap (`.venv`, editable install, and spaCy model download).
+- Cloud-init also installs best-effort local wrappers for on-host MCP clients:
+  - `~/.local/bin/oldspeak-mcp-stdio`
+  - `~/.local/bin/oldspeak-mcp-http [port]` (localhost bind)
 - Keep these repos non-secret; secrets still belong in SSM/local private files.
 
 AWS-native policy operations (recommended baseline):
