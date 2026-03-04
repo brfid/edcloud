@@ -539,7 +539,7 @@ runcmd:
       fi
     '
 
-  # --- Pull non-secret personal repos (dotfiles/bin/llm-config) ---
+  # --- Pull non-secret personal repos (dotfiles/bin/llm-config/oldspeak) ---
   - |
     runuser -u ubuntu -- bash -lc '
       set -euo pipefail
@@ -576,6 +576,7 @@ runcmd:
       sync_repo dotfiles
       sync_repo bin
       sync_repo llm-config
+      sync_repo oldspeak
 
       # Link bashrc from dotfiles (includes git-prompt PS1)
       if [ -x "$HOME/src/dotfiles/install.sh" ]; then
@@ -585,6 +586,48 @@ runcmd:
       if [ -d "$HOME/src/bin" ]; then
         find "$HOME/src/bin" -maxdepth 1 -type f -perm -u+x -exec ln -sfn {} "$HOME/.local/bin/" \;
       fi
+
+      # Best-effort oldspeak bootstrap for local MCP clients (Cline/Claude Code).
+      if [ -f "$HOME/src/oldspeak/pyproject.toml" ]; then
+        python3 -m venv "$HOME/src/oldspeak/.venv" || true
+        "$HOME/src/oldspeak/.venv/bin/python" -m pip install --upgrade pip || true
+        "$HOME/src/oldspeak/.venv/bin/pip" install -e "$HOME/src/oldspeak" || true
+        "$HOME/src/oldspeak/.venv/bin/python" -m spacy download en_core_web_sm || true
+      fi
+
+      install -m 0755 -d "$HOME/.local/bin"
+
+      cat > "$HOME/.local/bin/oldspeak-mcp-stdio" <<"STDIO_EOF"
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="${HOME}/src/oldspeak"
+VENV="${ROOT}/.venv"
+
+if [ ! -x "${VENV}/bin/python" ]; then
+  echo "oldspeak venv not found at ${VENV}. Re-run bootstrap in ${ROOT}." >&2
+  exit 1
+fi
+
+exec "${VENV}/bin/python" -m oldspeak.server
+STDIO_EOF
+
+      cat > "$HOME/.local/bin/oldspeak-mcp-http" <<"HTTP_EOF"
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="${HOME}/src/oldspeak"
+VENV="${ROOT}/.venv"
+PORT="${1:-8765}"
+
+if [ ! -x "${VENV}/bin/fastmcp" ]; then
+  echo "fastmcp not found at ${VENV}/bin/fastmcp. Re-run bootstrap in ${ROOT}." >&2
+  exit 1
+fi
+
+cd "${ROOT}"
+exec "${VENV}/bin/fastmcp" run oldspeak/server.py --transport http --host 127.0.0.1 --port "${PORT}"
+HTTP_EOF
+
+      chmod 0755 "$HOME/.local/bin/oldspeak-mcp-stdio" "$HOME/.local/bin/oldspeak-mcp-http"
     '
 
   # --- Ensure ubuntu always has baseline aliases, even with custom dotfiles ---
