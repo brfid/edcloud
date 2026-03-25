@@ -7,7 +7,6 @@ from edcloud.tailscale import (
     edcloud_name_conflicts,
     format_conflict_message,
     get_tailscale_ip,
-    ssh_command,
 )
 
 MOCK_TS_STATUS = {
@@ -44,18 +43,6 @@ class TestGetTailscaleIP:
     def test_returns_none_for_unknown_host(self, mock_run, _mock_avail):
         mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(MOCK_TS_STATUS))
         assert get_tailscale_ip("nonexistent") is None
-
-
-class TestSSHCommand:
-    @patch("edcloud.tailscale.get_tailscale_ip", return_value="100.64.1.42")
-    def test_uses_tailscale_ip(self, _mock):
-        cmd = ssh_command("edcloud")
-        assert cmd == ["ssh", "ubuntu@100.64.1.42"]
-
-    @patch("edcloud.tailscale.get_tailscale_ip", return_value=None)
-    def test_falls_back_to_hostname(self, _mock):
-        cmd = ssh_command("edcloud")
-        assert cmd == ["ssh", "ubuntu@edcloud"]
 
 
 def test_edcloud_name_conflicts_detects_suffixed_dns() -> None:

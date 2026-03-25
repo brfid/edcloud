@@ -21,6 +21,8 @@ from edcloud import backup_policy, ec2, iam, ops_health, permissions, snapshot, 
 from edcloud.aws_check import check_aws_credentials, get_region
 from edcloud.aws_clients import ssm_client
 from edcloud.config import (
+    DEFAULT_DOTFILES_BRANCH,
+    DEFAULT_DOTFILES_REPO,
     DEFAULT_SSH_USER,
     DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER,
     DEFAULT_TAILSCALE_HOSTNAME,
@@ -106,11 +108,6 @@ def require_aws_creds(func: Callable[P, R]) -> Callable[P, R]:
             raise SystemExit(1) from exc
 
     return wrapper
-
-
-def _fetch_tailscale_auth_key_from_ssm(parameter_name: str) -> str:
-    """Read a Tailscale auth key from SSM Parameter Store."""
-    return ec2.fetch_tailscale_auth_key_from_ssm(parameter_name)
 
 
 def _run_checked(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -256,6 +253,22 @@ def main() -> None:
     is_flag=True,
     help="Skip fail-fast guard for duplicate/suffixed edcloud Tailscale records.",
 )
+@click.option(
+    "--dotfiles-repo",
+    default=DEFAULT_DOTFILES_REPO,
+    envvar="EDCLOUD_DOTFILES_REPO",
+    show_default=True,
+    help=(
+        "Dotfiles repo URL for bootstrap ('auto' = infer https://github.com/<gh-user>/dotfiles.git)."
+    ),
+)
+@click.option(
+    "--dotfiles-branch",
+    default=DEFAULT_DOTFILES_BRANCH,
+    envvar="EDCLOUD_DOTFILES_BRANCH",
+    show_default=True,
+    help="Dotfiles branch/ref to checkout during bootstrap.",
+)
 @require_aws_creds
 def provision(
     instance_type: str,
@@ -269,6 +282,8 @@ def provision(
     require_existing_state_volume: bool,
     skip_snapshot: bool,
     allow_tailscale_name_conflicts: bool,
+    dotfiles_repo: str,
+    dotfiles_branch: str,
 ) -> None:
     """Create the edcloud EC2 instance from scratch.
 
@@ -301,6 +316,9 @@ def provision(
             "pre-provision",
             skip_snapshot=True,
             allow_delete_state=allow_delete_state_volume,
+            echo=click.echo,
+            confirm=click.confirm,
+            prompt_int=lambda msg, default: click.prompt(msg, type=int, default=default),
         ):
             raise SystemExit(0)
 
@@ -350,6 +368,8 @@ def provision(
         state_volume_size_gb=state_volume_size,
         tailscale_hostname=tailscale_hostname,
         tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
+        dotfiles_repo=dotfiles_repo,
+        dotfiles_branch=dotfiles_branch,
     )
     result = ec2.provision(
         cfg,
@@ -388,7 +408,7 @@ def load_tailscale_env_key(
 ) -> None:
     """Load TAILSCALE_AUTH_KEY from SSM for local operator usage."""
     try:
-        key = _fetch_tailscale_auth_key_from_ssm(tailscale_auth_key_ssm_parameter)
+        key = ec2.fetch_tailscale_auth_key_from_ssm(tailscale_auth_key_ssm_parameter)
     except ClientError as exc:
         click.echo(
             "Error: could not read Tailscale auth key from SSM parameter "
@@ -766,7 +786,6 @@ def status() -> None:
 # destroy
 # ---------------------------------------------------------------------------
 @main.command()
-@click.option("--force", is_flag=True, help="Skip confirmation prompt.")
 @click.option(
     "--confirm-instance-id",
     default=None,
@@ -801,7 +820,6 @@ def status() -> None:
 )
 @require_aws_creds
 def destroy(
-    force: bool,
     confirm_instance_id: str | None,
     require_fresh_snapshot: bool,
     fresh_snapshot_max_age_minutes: int,
@@ -853,7 +871,7 @@ def destroy(
         continue_prompt="Continue with destroy anyway?",
     )
 
-    ec2.destroy(force=force)
+    ec2.destroy()
 
     def _run_post_destroy_cleanup() -> None:
         from edcloud import cleanup as cleanup_module
@@ -863,6 +881,9 @@ def destroy(
             "post-destroy",
             skip_snapshot=True,
             allow_delete_state=allow_delete_state_volume,
+            echo=click.echo,
+            confirm=click.confirm,
+            prompt_int=lambda msg, default: click.prompt(msg, type=int, default=default),
         )
 
     maybe_run_cleanup(skip_cleanup=skip_cleanup, run_cleanup=_run_post_destroy_cleanup)
@@ -1276,7 +1297,7 @@ def permissions_group() -> None:
     """Inspect and verify AWS permissions required by edcloud."""
 
 
-def _permission_profile_choice() -> click.Choice:
+def _permission_profile_choice() -> click.Choice:  # type: ignore[type-arg]
     return click.Choice(["all", *permissions.available_profiles()])
 
 
@@ -1410,6 +1431,22 @@ def permissions_verify_cmd(profiles: tuple[str, ...], json_output: bool) -> None
     is_flag=True,
     help="Skip fail-fast guard for duplicate/suffixed edcloud Tailscale records.",
 )
+@click.option(
+    "--dotfiles-repo",
+    default=DEFAULT_DOTFILES_REPO,
+    envvar="EDCLOUD_DOTFILES_REPO",
+    show_default=True,
+    help=(
+        "Dotfiles repo URL for bootstrap ('auto' = infer https://github.com/<gh-user>/dotfiles.git)."
+    ),
+)
+@click.option(
+    "--dotfiles-branch",
+    default=DEFAULT_DOTFILES_BRANCH,
+    envvar="EDCLOUD_DOTFILES_BRANCH",
+    show_default=True,
+    help="Dotfiles branch/ref to checkout during bootstrap.",
+)
 @require_aws_creds
 def reprovision(
     instance_type: str,
@@ -1420,6 +1457,8 @@ def reprovision(
     skip_snapshot: bool,
     confirm_instance_id: str | None,
     allow_tailscale_name_conflicts: bool,
+    dotfiles_repo: str,
+    dotfiles_branch: str,
 ) -> None:
     """Atomically snapshot → destroy → provision.
 
@@ -1452,6 +1491,8 @@ def reprovision(
         state_volume_size_gb=state_volume_size,
         tailscale_hostname=tailscale_hostname,
         tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
+        dotfiles_repo=dotfiles_repo,
+        dotfiles_branch=dotfiles_branch,
     )
     from edcloud import cleanup as cleanup_module
 
@@ -1461,9 +1502,9 @@ def reprovision(
             info=info,
             skip_snapshot=skip_snapshot,
             auto_snapshot=lambda: snapshot.snapshot_and_prune("pre-reprovision", wait=True),
-            destroy_instance=lambda: ec2.destroy(force=True),
+            destroy_instance=lambda: ec2.destroy(),
             cleanup_orphaned_volumes=lambda: cleanup_module.cleanup_orphaned_volumes(
-                mode="delete", allow_delete_state=False
+                mode="delete", allow_delete_state=False, echo=click.echo
             ),
             provision_replacement=lambda: ec2.provision(cfg, require_existing_state_volume=True),
             echo=click.echo,

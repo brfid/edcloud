@@ -9,10 +9,10 @@ edcloud/
 ├── verify_catalog.py   # Declarative `edc verify` check catalog
 ├── resource_queries.py # Shared managed-resource query/filter helpers
 ├── ec2.py              # EC2 lifecycle core (provision/start/stop/status/destroy/resize)
-├── snapshot.py         # Snapshot create/list/prune + auto pre-destroy snapshots
+├── snapshot.py         # Snapshot create/list/prune
 ├── backup_policy.py    # AWS DLM backup policy management
-├── cleanup.py          # Tailscale + orphaned volume cleanup workflow
-├── tailscale.py        # Tailscale discovery/conflict/SSH helpers
+├── cleanup.py          # Tailscale + orphaned volume cleanup (UI-agnostic)
+├── tailscale.py        # Tailscale discovery/conflict helpers
 ├── iam.py              # IAM role/profile setup + teardown
 ├── resource_audit.py   # Drift + cost audit
 ├── aws_clients.py      # Shared boto3 session/client factories
@@ -28,6 +28,7 @@ edcloud/
 - **Declarative checks:** verification checks live in `verify_catalog.py`, not inline command code.
 - **Shared query primitives:** managed-resource filter/query composition lives in `resource_queries.py`.
 - **Tag-based source of truth:** no local state file; AWS tags define ownership and discovery.
+- **UI-agnostic library modules:** only `cli.py` depends on `click`. Library modules accept I/O callbacks when they need user interaction.
 
 ## Architecture decisions (ADR summary)
 
@@ -37,7 +38,7 @@ edcloud/
 - **Durable state volume + disposable root:** host runtime is replaceable; durable data lives under `/opt/edcloud/state`.
 - **CLI-managed snapshot queue:** a single flat pool capped at 3 snapshots, enforced by the CLI. Every snapshot trigger runs `prune(3) → snapshot → prune(3)` so drift self-heals within one cycle. Triggers: `edc up` (on-start, fire-and-forget), `edc provision`/`edc reprovision`/`edc destroy` (blocking, pre-destructive-op). DLM (`backup-policy`) remains available but is not wired automatically.
 - **SSM-backed runtime secrets:** secrets stay out of git and host bootstrap payloads. The instance IAM role grants `ssm:GetParameter` on `/edcloud/*`. Three parameters are consumed automatically by cloud-init: `tailscale_auth_key` (required), `github_token` (optional, authenticates `gh`), and `rclone_config` (optional, writes rclone config and enables the Dropbox FUSE mount).
-- **Separate app/infrastructure repos:** application MCP code (for example `oldspeak`) remains in its own repository (`~/src/oldspeak` on-host). edcloud bootstraps checkout/update and local wrappers (`oldspeak-mcp-stdio`, `oldspeak-mcp-http`) without vendoring app code into this infra repo.
+- **Separate app/infrastructure repos:** application MCP code (for example `oldspeak`) remains in its own repository (`~/src/oldspeak` on-host). edcloud bootstraps checkout/update and local wrappers (`oldspeak-mcp-stdio`, `oldspeak-mcp-http`) without vendoring app code into this infra repo. Dotfiles bootstrap is configurable via `InstanceConfig.dotfiles_repo` / `dotfiles_branch` and rendered into cloud-init at provision time.
 - **Cloud-init as baseline contract:** reproducible host/tooling baseline is codified in `cloud-init/user-data.yaml`.
 - **CLI-first operations model:** commands must remain safe/repeatable from lightweight ARM/Linux operator nodes.
 

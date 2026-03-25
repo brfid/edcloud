@@ -39,6 +39,8 @@ def test_provision_reads_tailscale_key_from_ssm(
     # Provision now only receives config, SSM parameter is verified but not fetched
     cfg = mock_provision.call_args.args[0]
     assert cfg.tailscale_auth_key_ssm_parameter == "/edcloud/tailscale_auth_key"
+    assert cfg.dotfiles_repo == "auto"
+    assert cfg.dotfiles_branch == "main"
     assert mock_provision.call_args.kwargs["require_existing_state_volume"] is True
     # Verify SSM parameter existence is checked (not fetched with decryption)
     assert ssm.get_parameter.called
@@ -78,6 +80,8 @@ def test_provision_reads_tailscale_key_from_ssm_envvar(
     assert result.exit_code == 0
     cfg = mock_provision.call_args.args[0]
     assert cfg.tailscale_auth_key_ssm_parameter == "/edcloud/tailscale_auth_key"
+    assert cfg.dotfiles_repo == "auto"
+    assert cfg.dotfiles_branch == "main"
     assert mock_provision.call_args.kwargs["require_existing_state_volume"] is True
     call_kwargs = ssm.get_parameter.call_args.kwargs
     assert call_kwargs["Name"] == "/edcloud/tailscale_auth_key"
@@ -210,6 +214,45 @@ def test_provision_allow_new_state_volume_disables_requirement(
 
     assert result.exit_code == 0
     assert mock_provision.call_args.kwargs["require_existing_state_volume"] is False
+
+
+@patch("edcloud.cli.ssm_client")
+@patch("edcloud.cli.ec2.provision")
+@patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_provision_passes_dotfiles_repo_and_branch_to_instance_config(
+    _mock_creds,
+    _mock_region,
+    _mock_conflicts,
+    mock_provision,
+    mock_ssm_client,
+):
+    ssm = MagicMock()
+    ssm.get_parameter.return_value = {"Parameter": {"Value": "exists"}}
+    mock_ssm_client.return_value = ssm
+    mock_provision.return_value = {
+        "instance_id": "i-abc123",
+        "security_group_id": "sg-abc123",
+        "public_ip": "none",
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "provision",
+            "--dotfiles-repo",
+            "https://github.com/example/dotfiles.git",
+            "--dotfiles-branch",
+            "linux-main",
+        ],
+    )
+
+    assert result.exit_code == 0
+    cfg = mock_provision.call_args.args[0]
+    assert cfg.dotfiles_repo == "https://github.com/example/dotfiles.git"
+    assert cfg.dotfiles_branch == "linux-main"
 
 
 @patch("edcloud.cleanup.run_cleanup_workflow", return_value=True)
@@ -484,7 +527,7 @@ def test_verify_fails_when_remote_checks_fail(
     assert "Overall: FAIL" in result.output
 
 
-@patch("edcloud.cli._fetch_tailscale_auth_key_from_ssm", return_value="tailscale-test-key")
+@patch("edcloud.cli.ec2.fetch_tailscale_auth_key_from_ssm", return_value="tailscale-test-key")
 @patch("edcloud.cli.get_region", return_value="us-east-1")
 @patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
 def test_load_tailscale_env_key_shell_export(
@@ -499,7 +542,7 @@ def test_load_tailscale_env_key_shell_export(
     assert "export TAILSCALE_AUTH_KEY=tailscale-test-key" in result.output
 
 
-@patch("edcloud.cli._fetch_tailscale_auth_key_from_ssm", return_value="tailscale-test-key")
+@patch("edcloud.cli.ec2.fetch_tailscale_auth_key_from_ssm", return_value="tailscale-test-key")
 @patch("edcloud.cli.get_region", return_value="us-east-1")
 @patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
 def test_load_tailscale_env_key_requires_output_mode(
@@ -704,7 +747,7 @@ def test_destroy_requires_confirm_instance_id(
     mock_status.return_value = {"exists": True, "instance_id": "i-abc123"}
 
     runner = CliRunner()
-    result = runner.invoke(main, ["destroy", "--force"])
+    result = runner.invoke(main, ["destroy"])
 
     assert result.exit_code == 1
     assert "requires explicit instance ID confirmation" in result.output
@@ -729,7 +772,6 @@ def test_destroy_with_matching_confirm_id_calls_destroy(
         main,
         [
             "destroy",
-            "--force",
             "--confirm-instance-id",
             "i-abc123",
             "--skip-snapshot",
@@ -738,7 +780,7 @@ def test_destroy_with_matching_confirm_id_calls_destroy(
     )
 
     assert result.exit_code == 0
-    mock_destroy.assert_called_once_with(force=True)
+    mock_destroy.assert_called_once_with()
 
 
 @patch("edcloud.cli.snapshot.list_snapshots")
@@ -761,7 +803,6 @@ def test_destroy_require_fresh_snapshot_fails_without_recent_snapshot(
         main,
         [
             "destroy",
-            "--force",
             "--confirm-instance-id",
             "i-abc123",
             "--require-fresh-snapshot",
@@ -800,7 +841,6 @@ def test_destroy_require_fresh_snapshot_passes_with_recent_snapshot(
         main,
         [
             "destroy",
-            "--force",
             "--confirm-instance-id",
             "i-abc123",
             "--require-fresh-snapshot",
@@ -811,7 +851,7 @@ def test_destroy_require_fresh_snapshot_passes_with_recent_snapshot(
 
     assert result.exit_code == 0
     assert "Using pre-change snapshot: snap-abc123" in result.output
-    mock_destroy.assert_called_once_with(force=True)
+    mock_destroy.assert_called_once_with()
 
 
 @patch("edcloud.cli.tailscale.get_tailscale_ip", return_value="100.64.1.1")
@@ -906,7 +946,6 @@ def test_destroy_cleanup_passes_allow_delete_state_volume(
         main,
         [
             "destroy",
-            "--force",
             "--confirm-instance-id",
             "i-abc123",
             "--skip-snapshot",
@@ -915,7 +954,7 @@ def test_destroy_cleanup_passes_allow_delete_state_volume(
     )
 
     assert result.exit_code == 0
-    mock_destroy.assert_called_once_with(force=True)
+    mock_destroy.assert_called_once_with()
     assert mock_cleanup.call_args.kwargs["allow_delete_state"] is True
 
 
@@ -1011,7 +1050,7 @@ def test_reprovision_snapshots_destroys_and_provisions(
 
     assert result.exit_code == 0, result.output
     mock_snapshot.assert_called_once()
-    mock_destroy.assert_called_once_with(force=True)
+    mock_destroy.assert_called_once_with()
     mock_provision.assert_called_once()
     assert "Next step: run 'edc verify' to confirm rebuild health." in result.output
 
@@ -1137,6 +1176,52 @@ def test_reprovision_delegates_to_lifecycle_flow(
 
     assert result.exit_code == 0
     assert mock_flow.called
+
+
+@patch("edcloud.cli.run_reprovision_flow")
+@patch("edcloud.cli.ec2.status")
+@patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
+@patch("edcloud.cli.tailscale.tailscale_available", return_value=True)
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_reprovision_passes_dotfiles_repo_and_branch_to_instance_config(
+    _mock_creds,
+    _mock_region,
+    _mock_available,
+    _mock_conflicts,
+    mock_status,
+    mock_flow,
+):
+    mock_status.return_value = {"exists": True, "instance_id": "i-abc123"}
+    mock_flow.return_value = (
+        ["snap-abc123"],
+        {"instance_id": "i-new", "security_group_id": "sg-new", "public_ip": "1.2.3.4"},
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "reprovision",
+            "--confirm-instance-id",
+            "i-abc123",
+            "--tailscale-auth-key-ssm-parameter",
+            "/edcloud/tailscale_auth_key",
+            "--dotfiles-repo",
+            "https://github.com/example/dotfiles.git",
+            "--dotfiles-branch",
+            "linux-main",
+        ],
+    )
+
+    assert result.exit_code == 0
+    from edcloud.config import InstanceConfig
+
+    provision_lambda = mock_flow.call_args.kwargs["provision_replacement"]
+    closure_cells = [cell.cell_contents for cell in (provision_lambda.__closure__ or ())]
+    cfg = next(c for c in closure_cells if isinstance(c, InstanceConfig))
+    assert cfg.dotfiles_repo == "https://github.com/example/dotfiles.git"
+    assert cfg.dotfiles_branch == "linux-main"
 
 
 @patch("edcloud.cli.ec2.destroy")

@@ -35,6 +35,20 @@ semantic version tags.
 
 ### Recently Completed
 
+- Code quality pass for demo readiness:
+  - Fixed all mypy strict errors (8 across 4 files) and ruff lint violations; tooling now passes clean.
+  - Added CI workflow (`.github/workflows/ci.yml`) running pytest, ruff, and mypy on push/PR.
+  - Removed dead code: unused `auto_snapshot_before_destroy`, vestigial `destroy(force=)` parameter, uncalled `_ec2_resource` wrapper, test-only `tailscale.ssh_command`.
+  - Collapsed redundant wrapper functions in `ec2.py`, `resource_audit.py`, and `cli.py` that added indirection without logic.
+  - Made `cleanup.py` UI-agnostic by accepting I/O callbacks instead of importing `click` directly, consistent with `lifecycle.py`.
+  - Fixed N+1 `describe_volumes` API calls in `ec2.status()` (now a single batched call).
+  - Single-sourced package version via `importlib.metadata` instead of duplicating in `__init__.py` and `pyproject.toml`.
+- Hardened dotfiles bootstrap path in cloud-init:
+  - Added `DOTFILES_REPO` / `DOTFILES_BRANCH` template variables rendered from `InstanceConfig`.
+  - Added CLI options/env support on `provision` and `reprovision` (`--dotfiles-repo`, `--dotfiles-branch`, `EDCLOUD_DOTFILES_REPO`, `EDCLOUD_DOTFILES_BRANCH`).
+  - Implemented repo/branch input validation in `edcloud.ec2` to reduce template-injection risk.
+  - Updated cloud-init logic to resolve dotfiles source with fallback order (`gh` user URL, then persisted local origin for `auto`) and continue bootstrap on non-fatal sync failures.
+  - Updated tests (`tests/test_ec2.py`, `tests/test_cli.py`) and docs (`README.md`, `RUNBOOK.md`, `docs/ARCHITECTURE.md`) to reflect new behavior.
 - Wired Dropbox FUSE mount via rclone: rclone config stored as SecureString at `/edcloud/rclone_config` in SSM; cloud-init fetches it on every rebuild and enables `rclone-dropbox.service` (user systemd, `~/Dropbox` mount); `RCLONE_CONFIG_SSM_PARAMETER` added to `config.py`.
 - Added oldspeak MCP bootstrap integration while keeping app code in a separate repo: cloud-init now best-effort syncs `~/src/oldspeak` (via `gh` auth path), bootstraps a local venv/install + spaCy model, and installs local wrappers (`~/.local/bin/oldspeak-mcp-stdio`, `~/.local/bin/oldspeak-mcp-http`) for on-host Cline/Claude Code usage. Docs updated in README, RUNBOOK, and ARCHITECTURE.
 

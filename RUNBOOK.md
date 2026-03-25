@@ -17,7 +17,7 @@ This file is the stable operator procedure guide.
 Open items:
 
 - [x] Add a safe rebuild workflow (`snapshot -> reprovision -> verify`) as a single documented operator path. (`edc reprovision` now prints a post-run reminder to run `edc verify`.)
-- [ ] Improve automatic repo loading: currently dotfiles/bin/llm-config/oldspeak cloning depends on gh auth during cloud-init; consider making repo list configurable and/or adding explicit clone step to provision workflow (e.g., `edc provision --sync-repos`).
+- [x] Improve automatic repo loading: dotfiles bootstrap now supports explicit CLI/env configuration (`--dotfiles-repo`, `--dotfiles-branch`) with `auto` fallback to gh user or existing local origin; non-dotfiles repo sync remains gh-auth-driven.
 - [ ] Evaluate a secure operator login workflow that starts from one memorized string without weakening Tailscale/AWS MFA controls.
 - [ ] Centralize default SSH username in repo config (for example `edcloud/config.py`) and have `edc ssh`/`edc verify` read that value.
 - [ ] Keep snapshot spend under soft cap `$2/month`; adjust DLM retention (`edc backup-policy apply --daily-keep N --weekly-keep M --monthly-keep K`) if exceeded.
@@ -631,8 +631,13 @@ Operating policy:
 
 Non-secret repo sync baseline:
 
-- If `gh` is authenticated during cloud-init, bootstrap attempts to pull/update:
-  - `https://github.com/<gh-user>/dotfiles.git` → `~/src/dotfiles`
+- Dotfiles sync is configurable at provision/reprovision time:
+  - `--dotfiles-repo` / `EDCLOUD_DOTFILES_REPO` (`auto` default)
+  - `--dotfiles-branch` / `EDCLOUD_DOTFILES_BRANCH` (`main` default)
+- For `--dotfiles-repo auto`, cloud-init resolves in order:
+  1. `https://github.com/<gh-user>/dotfiles.git` when `gh` auth is available
+  2. existing `~/src/dotfiles` origin URL from persistent home state
+- Additional repos still require `gh` auth and are synced from the authenticated user namespace:
   - `https://github.com/<gh-user>/bin.git` → `~/src/bin`
   - `https://github.com/<gh-user>/llm-config.git` → `~/src/llm-config`
   - `https://github.com/<gh-user>/oldspeak.git` → `~/src/oldspeak`

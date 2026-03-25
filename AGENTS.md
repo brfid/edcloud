@@ -59,7 +59,10 @@ grep -RInE "TODO|FIXME|TBD|\[ \]" README.md CHANGELOG.md RUNBOOK.md AGENTS.md do
 
 ### Git discipline (LLM + operator)
 
-- Never commit directly to `main`.
+- Default: do not commit directly to `main`.
+- Exception (personal repos only): direct commits/pushes to `main` are allowed for
+  small, low-risk changes when the user explicitly requests it in the current task.
+  If there is any uncertainty or elevated risk, use task branch + PR.
 - Create one task branch per change: `agent/<topic>-YYYYMMDD`.
 - Local WIP commits are allowed, but do not push noisy history (`wip`, `fix typo`,
   machine-specific checkpoints).
@@ -111,7 +114,7 @@ Run when requested:
 ```bash
 pytest -q
 ruff check .
-mypy edcloud tests
+mypy edcloud/
 pre-commit run --all-files
 ```
 

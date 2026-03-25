@@ -82,7 +82,7 @@ def _find_policy_summary() -> dict[str, Any] | None:
     resp = dlm.get_lifecycle_policies()
     for policy in resp.get("Policies", []):
         if policy.get("Description") == DLM_LIFECYCLE_POLICY_NAME:
-            return policy
+            return dict(policy)
     return None
 
 

@@ -110,8 +110,11 @@ def test_run_cleanup_workflow_completes_noninteractive(mock_ts_cleanup, mock_vol
     result = run_cleanup_workflow("post-destroy", skip_snapshot=True, interactive=False)
 
     assert result is True
-    mock_ts_cleanup.assert_called_once_with(interactive=False)
-    mock_vol_cleanup.assert_called_once_with(mode="keep", allow_delete_state=False)
+    mock_ts_cleanup.assert_called_once()
+    assert mock_ts_cleanup.call_args.kwargs["interactive"] is False
+    mock_vol_cleanup.assert_called_once()
+    assert mock_vol_cleanup.call_args.kwargs["mode"] == "keep"
+    assert mock_vol_cleanup.call_args.kwargs["allow_delete_state"] is False
 
 
 @patch("edcloud.cleanup.cleanup_orphaned_volumes")

@@ -48,13 +48,6 @@ Console.
 
 ## Public collaboration expectations
 
-- Open issues for bugs, reliability gaps, or unclear operator docs.
-- Keep changes scoped and reviewable; prefer focused PRs over broad rewrites.
-- Preserve the core guardrails: Tailscale-only access, managed-tag discovery,
-  and SSM-backed secret handling.
-- For lifecycle-risking changes, include validation notes (for example:
-  `pre-commit run --all-files`, `pytest -q`).
-
 **Core design:**
 
 - Tailscale-only access (zero inbound rules)
@@ -160,12 +153,18 @@ LazyVim compatibility:
 
 **Baseline:** Docker, Portainer, Node.js, Python, and dev tooling are defined in `cloud-init/user-data.yaml`.
 
-Bootstrap repo sync (when `gh` auth is available on the instance):
+Bootstrap repo sync:
 
-- `https://github.com/<gh-user>/dotfiles.git` → `~/src/dotfiles`
-- `https://github.com/<gh-user>/bin.git` → `~/src/bin`
-- `https://github.com/<gh-user>/llm-config.git` → `~/src/llm-config`
-- `https://github.com/<gh-user>/oldspeak.git` → `~/src/oldspeak`
+- Dotfiles are always attempted first via cloud-init using configurable inputs:
+  - `--dotfiles-repo` / `EDCLOUD_DOTFILES_REPO` (`auto` default)
+  - `--dotfiles-branch` / `EDCLOUD_DOTFILES_BRANCH` (`main` default)
+- `--dotfiles-repo auto` resolution order:
+  1. `https://github.com/<gh-user>/dotfiles.git` when `gh auth` is available
+  2. existing `~/src/dotfiles` origin URL (if present on persisted home)
+- Additional non-secret repos still sync from GitHub user namespace when `gh` auth is available:
+  - `https://github.com/<gh-user>/bin.git` → `~/src/bin`
+  - `https://github.com/<gh-user>/llm-config.git` → `~/src/llm-config`
+  - `https://github.com/<gh-user>/oldspeak.git` → `~/src/oldspeak`
 
 For local MCP usage on edcloud, cloud-init also installs best-effort wrappers:
 

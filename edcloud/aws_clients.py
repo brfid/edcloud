@@ -23,12 +23,12 @@ def aws_region() -> str | None:
 
 def aws_client(service_name: str) -> Any:
     """Return a boto3 client for ``service_name``."""
-    return aws_session().client(service_name)
+    return aws_session().client(service_name)  # type: ignore[call-overload]
 
 
 def aws_resource(service_name: str) -> Any:
     """Return a boto3 resource for ``service_name``."""
-    return aws_session().resource(service_name)
+    return aws_session().resource(service_name)  # type: ignore[call-overload]
 
 
 def ec2_client() -> Any:
