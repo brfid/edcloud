@@ -42,6 +42,8 @@ DEFAULT_TAILSCALE_HOSTNAME = "edcloud"
 DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER = "/edcloud/tailscale_auth_key"
 GITHUB_TOKEN_SSM_PARAMETER = "/edcloud/github_token"
 RCLONE_CONFIG_SSM_PARAMETER = "/edcloud/rclone_config"
+DEFAULT_DOTFILES_REPO = "auto"
+DEFAULT_DOTFILES_BRANCH = "main"
 DEFAULT_SSH_USER = "ubuntu"
 
 # ---------------------------------------------------------------------------
@@ -145,6 +147,8 @@ class InstanceConfig:
     state_volume_device_name: str = DEFAULT_STATE_VOLUME_DEVICE_NAME
     tailscale_hostname: str = DEFAULT_TAILSCALE_HOSTNAME
     tailscale_auth_key_ssm_parameter: str = DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER
+    dotfiles_repo: str = DEFAULT_DOTFILES_REPO
+    dotfiles_branch: str = DEFAULT_DOTFILES_BRANCH
     ami_ssm_parameter: str = AMI_SSM_PARAMETER
     tags: dict[str, str] = field(
         default_factory=lambda: {

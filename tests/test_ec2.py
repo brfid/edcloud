@@ -136,13 +136,19 @@ class TestUserDataRendering:
             "/edcloud/tailscale_auth_key",
             "my-hostname",
             "us-east-1",
+            "https://github.com/example/dotfiles.git",
+            "main",
         )
         assert "/edcloud/tailscale_auth_key" in rendered
         assert "my-hostname" in rendered
         assert "us-east-1" in rendered
+        assert "https://github.com/example/dotfiles.git" in rendered
+        assert "main" in rendered
         assert "${TAILSCALE_AUTH_KEY_SSM_PARAMETER}" not in rendered
         assert "${TAILSCALE_HOSTNAME}" not in rendered
         assert "${AWS_REGION}" not in rendered
+        assert "${DOTFILES_REPO}" not in rendered
+        assert "${DOTFILES_BRANCH}" not in rendered
 
 
 class TestInputValidation:
@@ -223,6 +229,51 @@ class TestInputValidation:
 
         with pytest.raises(ValueError, match="Invalid aws_region"):
             _validate_user_data_inputs("edcloud", aws_region="us-east-1; whoami")
+
+    def test_valid_dotfiles_repo_values_pass(self):
+        from edcloud.ec2 import _validate_user_data_inputs
+
+        _validate_user_data_inputs("edcloud", dotfiles_repo="auto")
+        _validate_user_data_inputs(
+            "edcloud",
+            dotfiles_repo="https://github.com/example/dotfiles.git",
+        )
+        _validate_user_data_inputs(
+            "edcloud",
+            dotfiles_repo="git@github.com:example/dotfiles.git",
+        )
+
+    def test_invalid_dotfiles_repo_values_raise(self):
+        from edcloud.ec2 import _validate_user_data_inputs
+
+        with pytest.raises(ValueError, match="Invalid dotfiles_repo"):
+            _validate_user_data_inputs(
+                "edcloud", dotfiles_repo="https://gitlab.com/example/dotfiles"
+            )
+
+        with pytest.raises(ValueError, match="Invalid dotfiles_repo"):
+            _validate_user_data_inputs(
+                "edcloud", dotfiles_repo="https://github.com/example/dotfiles"
+            )
+
+    def test_valid_dotfiles_branch_values_pass(self):
+        from edcloud.ec2 import _validate_user_data_inputs
+
+        _validate_user_data_inputs("edcloud", dotfiles_branch="main")
+        _validate_user_data_inputs("edcloud", dotfiles_branch="feature/linux-refresh")
+        _validate_user_data_inputs("edcloud", dotfiles_branch="release-2026.03")
+
+    def test_invalid_dotfiles_branch_values_raise(self):
+        from edcloud.ec2 import _validate_user_data_inputs
+
+        with pytest.raises(ValueError, match="Invalid dotfiles_branch"):
+            _validate_user_data_inputs("edcloud", dotfiles_branch="")
+
+        with pytest.raises(ValueError, match="Invalid dotfiles_branch"):
+            _validate_user_data_inputs("edcloud", dotfiles_branch="main..prod")
+
+        with pytest.raises(ValueError, match="Invalid dotfiles_branch"):
+            _validate_user_data_inputs("edcloud", dotfiles_branch="-main")
 
 
 class TestProvision:

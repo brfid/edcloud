@@ -70,10 +70,6 @@ class AuditReport:
         return asdict(self)
 
 
-def _list_instances(ec2_client: Any, filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return list_instances(ec2_client, filters)
-
-
 def _managed_addresses(ec2_client: Any) -> list[dict[str, Any]]:
     try:
         resp = ec2_client.describe_addresses(Filters=managed_filter())
@@ -98,8 +94,8 @@ def audit_resources(
 
     findings: list[AuditFinding] = []
 
-    managed_instances = _list_instances(ec2, managed_filter())
-    named_instances = _list_instances(ec2, [{"Name": "tag:Name", "Values": [NAME_TAG]}])
+    managed_instances = list_instances(ec2, managed_filter())
+    named_instances = list_instances(ec2, [{"Name": "tag:Name", "Values": [NAME_TAG]}])
     untagged_named_instances = [
         i for i in named_instances if not has_managed_tag(i.get("Tags", []))
     ]

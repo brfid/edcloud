@@ -17,9 +17,8 @@ from typing import Any
 from botocore.exceptions import ClientError
 
 from edcloud.aws_check import get_region
-from edcloud.aws_clients import ec2_client as _shared_ec2_client
-from edcloud.aws_clients import ec2_resource as _shared_ec2_resource
-from edcloud.aws_clients import ssm_client as _shared_ssm_client
+from edcloud.aws_clients import ec2_client as _ec2_client
+from edcloud.aws_clients import ssm_client as _ssm_client
 from edcloud.config import (
     DEFAULT_HOURS_PER_DAY,
     EBS_MONTHLY_RATE_PER_GB,
@@ -36,6 +35,7 @@ from edcloud.config import (
     get_volume_ids,
     has_managed_tag,
     managed_filter,
+    tag_value,
 )
 from edcloud.discovery import list_instances
 from edcloud.iam import delete_instance_profile, ensure_instance_profile
@@ -57,21 +57,6 @@ class TagDriftError(RuntimeError):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _ec2_client() -> Any:
-    """Return a low-level EC2 client."""
-    return _shared_ec2_client()
-
-
-def _ec2_resource() -> Any:
-    """Return a high-level EC2 resource."""
-    return _shared_ec2_resource()
-
-
-def _ssm_client() -> Any:
-    """Return a low-level SSM client."""
-    return _shared_ssm_client()
 
 
 def get_ec2_client() -> Any:
@@ -104,11 +89,6 @@ def fetch_tailscale_auth_key_from_ssm(parameter_name: str) -> str:
 def _instance_summary(instances: list[dict[str, Any]]) -> str:
     """Format a compact ``id (state)`` summary for one or more instances."""
     return ", ".join(f"{i['InstanceId']} ({i['State']['Name']})" for i in instances)
-
-
-def _list_instances(client: Any, filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Describe instances matching *filters*, excluding terminated ones."""
-    return list_instances(client, filters)
 
 
 def _validate_instance_volume_tags(client: Any, instance: dict[str, Any]) -> None:
@@ -245,7 +225,7 @@ def _find_instance(client: Any) -> dict[str, Any] | None:
     Raises:
         TagDriftError: On duplicate managed instances or missing tags.
     """
-    managed_instances = _list_instances(client, managed_filter())
+    managed_instances = list_instances(client, managed_filter())
     if len(managed_instances) > 1:
         raise TagDriftError(
             "Tag drift detected: multiple managed instances found: "
@@ -255,7 +235,7 @@ def _find_instance(client: Any) -> dict[str, Any] | None:
         )
 
     if not managed_instances:
-        named_instances = _list_instances(client, [{"Name": "tag:Name", "Values": [NAME_TAG]}])
+        named_instances = list_instances(client, [{"Name": "tag:Name", "Values": [NAME_TAG]}])
         untagged_named = [i for i in named_instances if not has_managed_tag(i.get("Tags", []))]
         if untagged_named:
             instance_ids = " ".join(i["InstanceId"] for i in untagged_named)
@@ -387,6 +367,8 @@ def _validate_user_data_inputs(
     tailscale_auth_key: str | None = None,
     tailscale_auth_key_ssm_parameter: str | None = None,
     aws_region: str | None = None,
+    dotfiles_repo: str | None = None,
+    dotfiles_branch: str | None = None,
 ) -> None:
     """Validate user-data template inputs to prevent injection attacks.
 
@@ -430,11 +412,39 @@ def _validate_user_data_inputs(
             f"Invalid aws_region: {aws_region!r}. Must match AWS region format (e.g., us-east-1)."
         )
 
+    # Validate dotfiles repo selector
+    if dotfiles_repo is not None:
+        if dotfiles_repo == "auto":
+            pass
+        elif not re.match(
+            r"^(https://github\.com|git@github\.com:)[A-Za-z0-9._/-]+\.git$",
+            dotfiles_repo,
+        ):
+            raise ValueError(
+                f"Invalid dotfiles_repo: {dotfiles_repo!r}. "
+                "Use 'auto', an https GitHub URL, or an SSH GitHub URL ending in .git."
+            )
+
+    # Validate git branch/ref-ish input used for dotfiles checkout
+    if dotfiles_branch is not None:
+        if not re.match(r"^[A-Za-z0-9._/-]{1,100}$", dotfiles_branch):
+            raise ValueError(
+                f"Invalid dotfiles_branch: {dotfiles_branch!r}. "
+                "Use a simple branch/ref name (alphanumeric, ., _, /, -)."
+            )
+        if ".." in dotfiles_branch or dotfiles_branch.startswith("-"):
+            raise ValueError(
+                f"Invalid dotfiles_branch: {dotfiles_branch!r}. "
+                "Branch cannot contain '..' or start with '-'."
+            )
+
 
 def _render_user_data(
     tailscale_auth_key_ssm_parameter: str,
     tailscale_hostname: str,
     aws_region: str,
+    dotfiles_repo: str,
+    dotfiles_branch: str,
 ) -> str:
     """Read the cloud-init template and interpolate runtime variables.
 
@@ -450,12 +460,16 @@ def _render_user_data(
         tailscale_hostname=tailscale_hostname,
         tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
         aws_region=aws_region,
+        dotfiles_repo=dotfiles_repo,
+        dotfiles_branch=dotfiles_branch,
     )
     template = _USER_DATA_PATH.read_text()
     return (
         template.replace("${TAILSCALE_AUTH_KEY_SSM_PARAMETER}", tailscale_auth_key_ssm_parameter)
         .replace("${TAILSCALE_HOSTNAME}", tailscale_hostname)
         .replace("${AWS_REGION}", aws_region)
+        .replace("${DOTFILES_REPO}", dotfiles_repo)
+        .replace("${DOTFILES_BRANCH}", dotfiles_branch)
     )
 
 
@@ -540,6 +554,8 @@ def provision(
         tailscale_auth_key_ssm_parameter=cfg.tailscale_auth_key_ssm_parameter,
         tailscale_hostname=cfg.tailscale_hostname,
         aws_region=aws_region,
+        dotfiles_repo=cfg.dotfiles_repo,
+        dotfiles_branch=cfg.dotfiles_branch,
     )
     log.info(
         "  Tailscale auth key will be fetched from SSM: %s",
@@ -840,21 +856,20 @@ def status() -> dict[str, Any]:
     public_ip = inst.get("PublicIpAddress")
     instance_type = inst.get("InstanceType", "unknown")
 
-    # Get volume info
+    # Get volume info (single API call for all attached volumes)
+    vol_ids = get_volume_ids(inst)
     volumes = []
-    for bdm in inst.get("BlockDeviceMappings", []):
-        vol_id = bdm.get("Ebs", {}).get("VolumeId")
-        if vol_id:
-            vol_resp = ec2.describe_volumes(VolumeIds=[vol_id])
-            for v in vol_resp.get("Volumes", []):
-                volumes.append(
-                    {
-                        "volume_id": v["VolumeId"],
-                        "size_gb": v["Size"],
-                        "type": v["VolumeType"],
-                        "state": v["State"],
-                    }
-                )
+    if vol_ids:
+        vol_resp = ec2.describe_volumes(VolumeIds=vol_ids)
+        for v in vol_resp.get("Volumes", []):
+            volumes.append(
+                {
+                    "volume_id": v["VolumeId"],
+                    "size_gb": v["Size"],
+                    "type": v["VolumeType"],
+                    "state": v["State"],
+                }
+            )
 
     # Orphaned managed volumes (available, not attached to this instance)
     orphaned_vol_resp = ec2.describe_volumes(
@@ -890,15 +905,12 @@ def status() -> dict[str, Any]:
     return result
 
 
-def destroy(force: bool = False) -> None:
+def destroy() -> None:
     """Terminate the edcloud instance and clean up its security group and IAM.
 
     The root EBS volume is deleted automatically on termination
     (``DeleteOnTermination=True``).  The state volume survives and is
     reattached on the next provision.
-
-    Args:
-        force: Skip the interactive confirmation prompt.
     """
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
@@ -943,8 +955,6 @@ def destroy(force: bool = False) -> None:
     # Report surviving managed volumes (state volume is expected; others are not)
     surviving = list_managed_volumes(ec2)
     for v in surviving:
-        from edcloud.config import tag_value
-
         role = tag_value(v.get("Tags", []), VOLUME_ROLE_TAG_KEY) or "unknown"
         if role == STATE_VOLUME_ROLE:
             log.info("State volume preserved: %s  %sGB", v["VolumeId"], v["Size"])

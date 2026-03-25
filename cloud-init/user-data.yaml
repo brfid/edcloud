@@ -1,6 +1,6 @@
 #cloud-config
 # edcloud instance bootstrap
-# Variables: ${TAILSCALE_AUTH_KEY_SSM_PARAMETER}, ${TAILSCALE_HOSTNAME}, ${AWS_REGION}
+# Variables: ${TAILSCALE_AUTH_KEY_SSM_PARAMETER}, ${TAILSCALE_HOSTNAME}, ${AWS_REGION}, ${DOTFILES_REPO}, ${DOTFILES_BRANCH}
 
 package_update: true
 package_upgrade: true
@@ -459,6 +459,15 @@ runcmd:
     BREWENV
     chmod 0644 /etc/profile.d/edcloud-brew.sh
 
+    # Install default Homebrew packages
+    runuser -u ubuntu -- bash -lc '
+      set -euo pipefail
+      if [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+        eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+        brew install lazygit || true
+      fi
+    '
+
     runuser -u ubuntu -- bash -lc '
       set -euo pipefail
       export HOME="${HOME:-/home/ubuntu}"
@@ -544,39 +553,80 @@ runcmd:
     runuser -u ubuntu -- bash -lc '
       set -euo pipefail
 
-      if ! command -v gh &>/dev/null; then
-        exit 0
-      fi
-
-      if ! gh auth status &>/dev/null; then
-        echo "ℹ️ gh not authenticated; skipping dotfiles/bin/llm-config sync"
-        exit 0
-      fi
-
-      GH_USER=$(gh api user --jq .login 2>/dev/null || true)
-      if [ -z "$GH_USER" ]; then
-        echo "ℹ️ could not resolve GitHub username; skipping repo sync"
-        exit 0
-      fi
-
       mkdir -p "$HOME/src" "$HOME/.local/bin"
 
-      sync_repo() {
-        local name="$1"
-        local repo_url="https://github.com/${GH_USER}/${name}.git"
-        local target="$HOME/src/${name}"
+      DOTFILES_REPO_INPUT="${DOTFILES_REPO}"
+      DOTFILES_BRANCH_INPUT="${DOTFILES_BRANCH}"
+
+      GH_USER=""
+      if command -v gh &>/dev/null && gh auth status &>/dev/null; then
+        GH_USER=$(gh api user --jq .login 2>/dev/null || true)
+      fi
+
+      sync_git_repo() {
+        local repo_url="$1"
+        local target="$2"
+        local branch="$3"
+
+        if [ -z "$repo_url" ]; then
+          return 1
+        fi
 
         if [ -d "$target/.git" ]; then
-          git -C "$target" pull --ff-only || true
+          git -C "$target" remote set-url origin "$repo_url" || true
+          if git -C "$target" fetch --depth=1 origin "$branch"; then
+            git -C "$target" checkout -B "$branch" "origin/$branch" || true
+          else
+            git -C "$target" pull --ff-only || true
+          fi
         else
-          git clone "$repo_url" "$target" || true
+          if ! git clone --depth=1 --branch "$branch" "$repo_url" "$target"; then
+            git clone "$repo_url" "$target" || return 1
+            git -C "$target" checkout "$branch" || true
+          fi
         fi
       }
 
-      sync_repo dotfiles
-      sync_repo bin
-      sync_repo llm-config
-      sync_repo oldspeak
+      sync_named_repo_for_gh_user() {
+        local name="$1"
+        local target="$HOME/src/$name"
+
+        if [ -z "$GH_USER" ]; then
+          return 0
+        fi
+
+        local repo_url="https://github.com/${GH_USER}/${name}.git"
+        sync_git_repo "$repo_url" "$target" "main" || true
+      }
+
+      DOTFILES_REPO_URL=""
+      if [ "$DOTFILES_REPO_INPUT" = "auto" ]; then
+        if [ -n "$GH_USER" ]; then
+          DOTFILES_REPO_URL="https://github.com/${GH_USER}/dotfiles.git"
+        elif [ -d "$HOME/src/dotfiles/.git" ]; then
+          DOTFILES_REPO_URL=$(git -C "$HOME/src/dotfiles" remote get-url origin 2>/dev/null || true)
+        fi
+      else
+        DOTFILES_REPO_URL="$DOTFILES_REPO_INPUT"
+      fi
+
+      if [ -n "$DOTFILES_REPO_URL" ]; then
+        if sync_git_repo "$DOTFILES_REPO_URL" "$HOME/src/dotfiles" "$DOTFILES_BRANCH_INPUT"; then
+          echo "✅ dotfiles synced from ${DOTFILES_REPO_URL} (${DOTFILES_BRANCH_INPUT})"
+        else
+          echo "⚠️ dotfiles sync failed for ${DOTFILES_REPO_URL}; continuing bootstrap"
+        fi
+      else
+        echo "ℹ️ dotfiles repo not resolved (DOTFILES_REPO=auto without gh auth or existing clone); skipping dotfiles sync"
+      fi
+
+      if [ -n "$GH_USER" ]; then
+        sync_named_repo_for_gh_user bin
+        sync_named_repo_for_gh_user llm-config
+        sync_named_repo_for_gh_user oldspeak
+      else
+        echo "ℹ️ gh not authenticated; skipping bin/llm-config/oldspeak sync"
+      fi
 
       # Link bashrc from dotfiles (includes git-prompt PS1)
       if [ -x "$HOME/src/dotfiles/install.sh" ]; then
@@ -668,6 +718,15 @@ HTTP_EOF
   # --- Enable idle-shutdown timer ---
   - systemctl daemon-reload
   - systemctl enable --now edcloud-idle-shutdown.timer
+
+  # --- browsh (text-based browser, requires Firefox) ---
+  - |
+    BROWSH_VERSION="1.8.2"
+    BROWSH_DEB="/tmp/browsh_${BROWSH_VERSION}_linux_amd64.deb"
+    curl -fsSL "https://github.com/browsh-org/browsh/releases/download/v${BROWSH_VERSION}/browsh_${BROWSH_VERSION}_linux_amd64.deb" \
+      -o "$BROWSH_DEB"
+    dpkg -i "$BROWSH_DEB"
+    rm -f "$BROWSH_DEB"
 
   # --- Signal completion ---
   - echo "edcloud bootstrap complete $(date -Iseconds)" > /tmp/edcloud-ready

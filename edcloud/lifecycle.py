@@ -79,7 +79,7 @@ def run_reprovision_flow(
     skip_snapshot: bool,
     auto_snapshot: Callable[[], list[str]],
     destroy_instance: Callable[[], None],
-    cleanup_orphaned_volumes: Callable[[], None],
+    cleanup_orphaned_volumes: Callable[[], object],
     provision_replacement: Callable[[], dict[str, Any]],
     echo: Callable[[str], None],
     echo_err: Callable[[str], None],

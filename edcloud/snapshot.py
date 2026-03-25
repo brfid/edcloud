@@ -108,7 +108,7 @@ def _find_single_state_volume(ec2: Any) -> dict[str, Any]:
         raise RuntimeError(
             f"Restore drill requires a single managed state volume, but found multiple: {ids}"
         )
-    return volumes[0]
+    return dict(volumes[0])
 
 
 def _latest_completed_snapshot_for_volume(ec2: Any, volume_id: str) -> dict[str, Any]:
@@ -124,7 +124,7 @@ def _latest_completed_snapshot_for_volume(ec2: Any, volume_id: str) -> dict[str,
     if not snapshots:
         raise RuntimeError(f"No completed snapshots found for state volume {volume_id}.")
     snapshots.sort(key=lambda s: s.get("StartTime", ""), reverse=True)
-    return snapshots[0]
+    return dict(snapshots[0])
 
 
 def _validated_snapshot_for_volume(ec2: Any, snapshot_id: str, volume_id: str) -> dict[str, Any]:
@@ -143,7 +143,7 @@ def _validated_snapshot_for_volume(ec2: Any, snapshot_id: str, volume_id: str) -
         raise RuntimeError(
             f"Snapshot {snapshot_id} is in state {snap.get('State')}; must be completed."
         )
-    return snap
+    return dict(snap)
 
 
 def run_restore_drill(
@@ -259,31 +259,6 @@ def find_recent_prechange_snapshot(max_age_minutes: int) -> dict[str, object] | 
         if freshest is None or parsed > freshest[0]:
             freshest = (parsed, snap_info)
     return freshest[1] if freshest else None
-
-
-def auto_snapshot_before_destroy() -> list[str]:
-    """Snapshot all volumes of the current instance before a destructive op.
-
-    Waits for all snapshots to reach ``completed`` state before returning,
-    so the caller can safely proceed with destructive operations.
-
-    Returns:
-        List of snapshot IDs created, or empty list if no instance exists.
-    """
-    ec2 = get_ec2_client()
-    inst = find_instance(ec2)
-    if not inst:
-        # No instance to snapshot
-        return []
-
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
-    description = f"auto-pre-destroy-{ts}"
-    snap_ids = create_snapshot(description)
-    if snap_ids:
-        log.info("Waiting for snapshot(s) to complete before proceeding...")
-        wait_for_snapshot_completion(snap_ids)
-        log.info("Snapshot(s) completed.")
-    return snap_ids
 
 
 def snapshot_and_prune(

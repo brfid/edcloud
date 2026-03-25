@@ -12,8 +12,6 @@ import shutil
 import subprocess  # nosec B404
 from typing import Any
 
-from edcloud.config import DEFAULT_SSH_USER
-
 
 def _tailscale_status() -> dict[str, Any] | None:
     """Run ``tailscale status --json`` and return the parsed payload.
@@ -267,20 +265,3 @@ def cleanup_offline_edcloud_devices() -> tuple[int, str]:
         "This will ensure your next provision uses 'edcloud' (no suffix)."
     )
     return (len(offline), message)
-
-
-def ssh_command(hostname: str, user: str = DEFAULT_SSH_USER) -> list[str]:
-    """Build an SSH command targeting a Tailscale hostname.
-
-    Auto-detects the active edcloud device when *hostname* is ``"edcloud"``.
-
-    Args:
-        hostname: Tailscale hostname to connect to.
-        user: Remote username.
-
-    Returns:
-        Command list suitable for ``subprocess.run``.
-    """
-    ip = get_tailscale_ip(hostname)
-    target = ip if ip else hostname
-    return ["ssh", f"{user}@{target}"]
