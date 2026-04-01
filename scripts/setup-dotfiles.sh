@@ -15,7 +15,7 @@ cd "$DOTFILES"
 stow --target="$HOME" bash shell nvim gh claude vscode tmux systemd-user git
 
 # Profile-specific shell local
-ln -sfn "$DOTFILES/shell/.config/shell/local.d/edcloud.sh" \
+ln -sfn "$DOTFILES/packages/shell/.config/shell/local.d/edcloud.sh" \
     "$HOME/.config/shell/local"
 
 echo "Dotfiles linked for edcloud."
