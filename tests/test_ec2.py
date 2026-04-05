@@ -429,8 +429,11 @@ class TestStart:
         mock_client.start_instances.assert_called_once_with(InstanceIds=["i-abc123"])
         mock_client.get_waiter.assert_called_once_with("instance_running")
 
+    @patch("edcloud.ec2._ec2_client")
     @patch("edcloud.ec2._find_instance")
-    def test_noop_when_already_running(self, mock_find_instance: MagicMock) -> None:
+    def test_noop_when_already_running(
+        self, mock_find_instance: MagicMock, _mock_client: MagicMock
+    ) -> None:
         mock_find_instance.return_value = {"InstanceId": "i-abc123", "State": {"Name": "running"}}
 
         from edcloud.ec2 import start
@@ -458,8 +461,11 @@ class TestStop:
         mock_client.stop_instances.assert_called_once_with(InstanceIds=["i-abc123"])
         mock_client.get_waiter.assert_called_once_with("instance_stopped")
 
+    @patch("edcloud.ec2._ec2_client")
     @patch("edcloud.ec2._find_instance")
-    def test_noop_when_already_stopped(self, mock_find_instance: MagicMock) -> None:
+    def test_noop_when_already_stopped(
+        self, mock_find_instance: MagicMock, _mock_client: MagicMock
+    ) -> None:
         mock_find_instance.return_value = {"InstanceId": "i-abc123", "State": {"Name": "stopped"}}
 
         from edcloud.ec2 import stop

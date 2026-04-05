@@ -154,6 +154,7 @@ def test_up_runs_with_clean_tailscale_conflict_guard(
     mock_start.assert_called_once()
 
 
+@patch("edcloud.cli.ssm_client")
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
 @patch("edcloud.cli.get_region", return_value="us-east-1")
@@ -163,6 +164,7 @@ def test_provision_passes_require_existing_state_volume_flag(
     _mock_region,
     _mock_conflicts,
     mock_provision,
+    mock_ssm,
 ):
     mock_provision.return_value = {
         "instance_id": "i-abc123",
@@ -185,6 +187,7 @@ def test_provision_passes_require_existing_state_volume_flag(
     assert mock_provision.call_args.kwargs["require_existing_state_volume"] is True
 
 
+@patch("edcloud.cli.ssm_client")
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
 @patch("edcloud.cli.get_region", return_value="us-east-1")
@@ -194,6 +197,7 @@ def test_provision_allow_new_state_volume_disables_requirement(
     _mock_region,
     _mock_conflicts,
     mock_provision,
+    mock_ssm,
 ):
     mock_provision.return_value = {
         "instance_id": "i-abc123",
@@ -255,6 +259,7 @@ def test_provision_passes_dotfiles_repo_and_branch_to_instance_config(
     assert cfg.dotfiles_branch == "linux-main"
 
 
+@patch("edcloud.cli.ssm_client")
 @patch("edcloud.cleanup.run_cleanup_workflow", return_value=True)
 @patch("edcloud.cli.ec2.provision")
 @patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
@@ -266,6 +271,7 @@ def test_provision_cleanup_passes_allow_delete_state_volume(
     _mock_conflicts,
     mock_provision,
     mock_cleanup,
+    mock_ssm,
 ):
     mock_provision.return_value = {
         "instance_id": "i-abc123",
@@ -590,10 +596,11 @@ def test_setup_ssm_tokens_stores_tokens(_mock_creds, _mock_region, mock_ssm_clie
     assert "/edcloud/tailscale_auth_key" in put_calls
 
 
+@patch("edcloud.cli.ssm_client")
 @patch("edcloud.cli.get_region", return_value="us-east-1")
 @patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
 def test_setup_ssm_tokens_rejects_nonstandard_tailscale_key_without_prompt(
-    _mock_creds, _mock_region
+    _mock_creds, _mock_region, mock_ssm
 ):
     runner = CliRunner()
     result = runner.invoke(
@@ -879,13 +886,14 @@ def test_down_calls_stop(_mock_creds, _mock_region, mock_stop):
     mock_stop.assert_called_once()
 
 
+@patch("edcloud.cli.snapshot.list_snapshots", return_value=[])
 @patch("edcloud.cli.tailscale.get_tailscale_ip", return_value="100.64.1.1")
 @patch("edcloud.cli.tailscale.is_reachable", return_value=True)
 @patch("edcloud.cli.ec2.status")
 @patch("edcloud.cli.get_region", return_value="us-east-1")
 @patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
 def test_status_displays_instance_info(
-    _mock_creds, _mock_region, mock_status, _mock_reachable, _mock_tailscale
+    _mock_creds, _mock_region, mock_status, _mock_reachable, _mock_tailscale, _mock_snaps
 ):
     mock_status.return_value = {
         "exists": True,
