@@ -35,6 +35,20 @@ semantic version tags.
 
 ### Recently Completed
 
+- Architecture refactor for self-documentation and module clarity:
+  - Extracted `user_data.py` from `ec2.py` — cloud-init template rendering with `string.Template` safe substitution replacing fragile `str.replace` chains.
+  - Extracted `security_group.py` from `ec2.py` — SG discovery/lifecycle and `TagDriftError` as the unified tag-drift exception across all modules.
+  - Extracted `cline_sync.py` from `cli.py` — Cline OAuth sync workflow (validation, diagnostics, file transfer) as a UI-agnostic library module.
+  - Added `types.py` with `TypedDict` definitions (`InstanceStatus`, `ProvisionResult`, `ResizeResult`, `VolumeInfo`, `CostEstimate`, `SnapshotInfo`, etc.) for typed API contracts.
+  - Added `py.typed` PEP 561 marker for downstream type-checking support.
+  - Unified `TagDriftError` usage: `snapshot.py` now raises `TagDriftError` (not `RuntimeError`) for duplicate state volume conditions, consistent with `ec2.py`.
+  - Updated `lifecycle.py` to accept `Mapping[str, Any]` for TypedDict compatibility.
+  - Bumped version to `1.0.0`; updated license field to PEP 639 format.
+  - Added Python 3.14 to CI matrix; removed commented-out mypy pre-commit hook.
+  - Added `*.code-workspace` to `.gitignore`.
+  - Added `__all__` to `__init__.py`.
+  - Documented `scripts/setup-dotfiles.sh` purpose and relationship to cloud-init bootstrap.
+  - Updated `docs/ARCHITECTURE.md` with new module structure, dotfiles bootstrap flow, and design principles.
 - Code quality pass for demo readiness:
   - Fixed all mypy strict errors (8 across 4 files) and ruff lint violations; tooling now passes clean.
   - Added CI workflow (`.github/workflows/ci.yml`) running pytest, ruff, and mypy on push/PR.

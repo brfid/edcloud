@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "edcloud"
-version = "0.1.0"
+version = "1.0.0"
 description = "Personal cloud lab CLI — provision, manage, and access an EC2 instance over Tailscale."
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 authors = [{name = "Brad Fiedler"}]
 
 dependencies = [
@@ -30,6 +30,9 @@ edcloud = "edcloud.cli:main"
 [tool.setuptools.packages.find]
 include = ["edcloud*"]
 
+[tool.setuptools.package-data]
+edcloud = ["py.typed"]
+
 [tool.ruff]
 target-version = "py310"
 line-length = 99
@@ -44,7 +47,7 @@ warn_return_any = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["tests.*"]
+module = "tests.*"
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
 check_untyped_defs = false

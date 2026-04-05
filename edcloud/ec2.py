@@ -8,10 +8,8 @@ from __future__ import annotations
 
 import logging
 import random  # nosec B311
-import re
 import time
 from contextlib import suppress
-from pathlib import Path
 from typing import Any
 
 from botocore.exceptions import ClientError
@@ -27,7 +25,6 @@ from edcloud.config import (
     MANAGER_TAG_VALUE,
     NAME_TAG,
     ROOT_VOLUME_ROLE,
-    SECURITY_GROUP_DESC,
     SECURITY_GROUP_NAME,
     STATE_VOLUME_ROLE,
     VOLUME_ROLE_TAG_KEY,
@@ -40,18 +37,23 @@ from edcloud.config import (
 from edcloud.discovery import list_instances
 from edcloud.iam import delete_instance_profile, ensure_instance_profile
 from edcloud.resource_queries import list_managed_volumes
+from edcloud.security_group import (
+    TagDriftError,
+    delete_security_group,
+    ensure_security_group,
+    find_security_group,
+)
+from edcloud.types import (
+    CostEstimate,
+    InstanceStatus,
+    OrphanedResources,
+    ProvisionResult,
+    ResizeResult,
+    VolumeInfo,
+)
+from edcloud.user_data import render as _render_user_data
 
 log = logging.getLogger(__name__)
-
-_USER_DATA_PATH = Path(__file__).resolve().parent.parent / "cloud-init" / "user-data.yaml"
-
-
-class TagDriftError(RuntimeError):
-    """Tag-based discovery invariants were violated.
-
-    Raised when managed-resource tags are missing, duplicated, or
-    inconsistent — situations that cannot be resolved automatically.
-    """
 
 
 # ---------------------------------------------------------------------------
@@ -118,13 +120,13 @@ def _validate_instance_volume_tags(client: Any, instance: dict[str, Any]) -> Non
     )
 
 
-def _managed_orphan_report(client: Any) -> dict[str, list[str]]:
+def _managed_orphan_report(client: Any) -> OrphanedResources:
     """Scan for managed resources not attached to an active instance.
 
     Returns:
-        Dict with ``security_groups`` and ``volumes`` lists of orphaned IDs.
+        OrphanedResources with ``security_groups`` and ``volumes`` lists.
     """
-    report: dict[str, list[str]] = {"security_groups": [], "volumes": []}
+    report = OrphanedResources(security_groups=[], volumes=[])
 
     sg_resp = client.describe_security_groups(Filters=managed_filter())
     for sg in sg_resp.get("SecurityGroups", []):
@@ -139,7 +141,7 @@ def _managed_orphan_report(client: Any) -> dict[str, list[str]]:
     return report
 
 
-def _orphaned_resources_text(report: dict[str, list[str]]) -> str:
+def _orphaned_resources_text(report: OrphanedResources) -> str:
     """Render human-readable lines for orphaned-resource IDs."""
     lines: list[str] = []
     security_groups = report.get("security_groups", [])
@@ -258,49 +260,9 @@ def _find_instance(client: Any) -> dict[str, Any] | None:
 def _find_security_group(client: Any) -> str | None:
     """Return the edcloud security-group ID, or ``None`` if it doesn't exist.
 
-    Raises:
-        TagDriftError: On duplicate or untagged security groups.
+    Delegates to ``security_group.find_security_group``.
     """
-    try:
-        resp = client.describe_security_groups(
-            Filters=[{"Name": "group-name", "Values": [SECURITY_GROUP_NAME]}]
-        )
-    except ClientError:
-        return None
-
-    groups = resp.get("SecurityGroups", [])
-    managed_groups = [g for g in groups if has_managed_tag(g.get("Tags", []))]
-    unmanaged_groups = [g for g in groups if not has_managed_tag(g.get("Tags", []))]
-
-    if len(managed_groups) > 1:
-        raise TagDriftError(
-            "Tag drift detected: multiple managed security groups named "
-            f"`{SECURITY_GROUP_NAME}` found: {', '.join(g['GroupId'] for g in managed_groups)}\n"
-            "Remediation: keep one security group and remove extras."
-        )
-
-    if managed_groups and unmanaged_groups:
-        raise TagDriftError(
-            "Tag drift detected: mixed tagged/untagged security groups share name "
-            f"`{SECURITY_GROUP_NAME}`.\n"
-            f"Managed: {', '.join(g['GroupId'] for g in managed_groups)}\n"
-            f"Untagged: {', '.join(g['GroupId'] for g in unmanaged_groups)}\n"
-            "Remediation: retag or delete the untagged duplicate group(s)."
-        )
-
-    if unmanaged_groups and not managed_groups:
-        ids = " ".join(g["GroupId"] for g in unmanaged_groups)
-        raise TagDriftError(
-            f"Tag drift detected: security group(s) named `{SECURITY_GROUP_NAME}` exist but "
-            f"missing `{MANAGER_TAG_KEY}={MANAGER_TAG_VALUE}`: "
-            f"{', '.join(g['GroupId'] for g in unmanaged_groups)}\n"
-            "Remediation:\n"
-            f"  aws ec2 create-tags --resources {ids} "
-            f"--tags Key={MANAGER_TAG_KEY},Value={MANAGER_TAG_VALUE}\n"
-            "  or delete stale security groups."
-        )
-
-    return managed_groups[0]["GroupId"] if managed_groups else None
+    return find_security_group(client)
 
 
 def _resolve_ami(ssm_parameter: str) -> str:
@@ -370,106 +332,19 @@ def _validate_user_data_inputs(
     dotfiles_repo: str | None = None,
     dotfiles_branch: str | None = None,
 ) -> None:
-    """Validate user-data template inputs to prevent injection attacks.
+    """Validate user-data template inputs.
 
-    Args:
-        tailscale_hostname: DNS-safe hostname (1-63 chars, alphanumeric/hyphen).
-        tailscale_auth_key: Raw auth key value (checked for shell-dangerous chars).
-        tailscale_auth_key_ssm_parameter: SSM parameter path (path-safe chars only).
-        aws_region: AWS region string (e.g. ``us-east-1``).
-
-    Raises:
-        ValueError: If any input contains invalid or dangerous characters.
+    Delegates to ``user_data.validate_inputs``.
     """
-    # Validate hostname: DNS-safe, 1-63 chars
-    if not re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$", tailscale_hostname):
-        raise ValueError(
-            f"Invalid tailscale_hostname: {tailscale_hostname!r}. "
-            "Must be 1-63 alphanumeric/hyphen characters, cannot start/end with hyphen."
-        )
+    from edcloud.user_data import validate_inputs
 
-    # Validate auth key if provided (transitional, for old flow)
-    if tailscale_auth_key is not None:
-        dangerous_chars = ["\n", "\r", "`", "$(", "${", ";", "'", '"', "|", "&"]
-        for char in dangerous_chars:
-            if char in tailscale_auth_key:
-                raise ValueError(
-                    f"Invalid tailscale_auth_key: contains dangerous character {char!r}"
-                )
-
-    # Validate SSM parameter path if provided
-    if tailscale_auth_key_ssm_parameter is not None and not re.match(
-        r"^[a-zA-Z0-9/_.-]+$", tailscale_auth_key_ssm_parameter
-    ):
-        raise ValueError(
-            f"Invalid tailscale_auth_key_ssm_parameter: {tailscale_auth_key_ssm_parameter!r}. "
-            "Must contain only alphanumeric, /, _, ., - characters."
-        )
-
-    # Validate AWS region if provided
-    if aws_region is not None and not re.match(r"^[a-z]{2}(-[a-z]+-[0-9]+)?$", aws_region):
-        raise ValueError(
-            f"Invalid aws_region: {aws_region!r}. Must match AWS region format (e.g., us-east-1)."
-        )
-
-    # Validate dotfiles repo selector
-    if dotfiles_repo is not None:
-        if dotfiles_repo == "auto":
-            pass
-        elif not re.match(
-            r"^(https://github\.com|git@github\.com:)[A-Za-z0-9._/-]+\.git$",
-            dotfiles_repo,
-        ):
-            raise ValueError(
-                f"Invalid dotfiles_repo: {dotfiles_repo!r}. "
-                "Use 'auto', an https GitHub URL, or an SSH GitHub URL ending in .git."
-            )
-
-    # Validate git branch/ref-ish input used for dotfiles checkout
-    if dotfiles_branch is not None:
-        if not re.match(r"^[A-Za-z0-9._/-]{1,100}$", dotfiles_branch):
-            raise ValueError(
-                f"Invalid dotfiles_branch: {dotfiles_branch!r}. "
-                "Use a simple branch/ref name (alphanumeric, ., _, /, -)."
-            )
-        if ".." in dotfiles_branch or dotfiles_branch.startswith("-"):
-            raise ValueError(
-                f"Invalid dotfiles_branch: {dotfiles_branch!r}. "
-                "Branch cannot contain '..' or start with '-'."
-            )
-
-
-def _render_user_data(
-    tailscale_auth_key_ssm_parameter: str,
-    tailscale_hostname: str,
-    aws_region: str,
-    dotfiles_repo: str,
-    dotfiles_branch: str,
-) -> str:
-    """Read the cloud-init template and interpolate runtime variables.
-
-    Args:
-        tailscale_auth_key_ssm_parameter: SSM parameter the instance reads at boot.
-        tailscale_hostname: MagicDNS hostname to register.
-        aws_region: Region for SSM API calls from the instance.
-
-    Returns:
-        Rendered user-data string ready for RunInstances.
-    """
-    _validate_user_data_inputs(
+    validate_inputs(
         tailscale_hostname=tailscale_hostname,
+        tailscale_auth_key=tailscale_auth_key,
         tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
         aws_region=aws_region,
         dotfiles_repo=dotfiles_repo,
         dotfiles_branch=dotfiles_branch,
-    )
-    template = _USER_DATA_PATH.read_text()
-    return (
-        template.replace("${TAILSCALE_AUTH_KEY_SSM_PARAMETER}", tailscale_auth_key_ssm_parameter)
-        .replace("${TAILSCALE_HOSTNAME}", tailscale_hostname)
-        .replace("${AWS_REGION}", aws_region)
-        .replace("${DOTFILES_REPO}", dotfiles_repo)
-        .replace("${DOTFILES_BRANCH}", dotfiles_branch)
     )
 
 
@@ -481,7 +356,7 @@ def _render_user_data(
 def provision(
     cfg: InstanceConfig,
     require_existing_state_volume: bool = False,
-) -> dict[str, str]:
+) -> ProvisionResult:
     """Create the edcloud instance from scratch.
 
     The Tailscale auth key is fetched from SSM at boot time by the instance
@@ -522,23 +397,7 @@ def provision(
     log.info("Provisioning edcloud instance...")
 
     # 1. Security group -------------------------------------------------------
-    sg_id = _find_security_group(ec2)
-    if sg_id:
-        log.info("  Security group exists: %s", sg_id)
-    else:
-        vpc_id = _get_default_vpc_id(ec2)
-        resp = ec2.create_security_group(
-            GroupName=SECURITY_GROUP_NAME,
-            Description=SECURITY_GROUP_DESC,
-            VpcId=vpc_id,
-        )
-        sg_id = str(resp["GroupId"])
-        _apply_tags(ec2, [sg_id], cfg.tags)
-
-        # Revoke the default "allow all outbound" rule? No — we need outbound
-        # for apt, Docker pulls, Tailscale coordination, etc.
-        # No inbound rules: all access comes via Tailscale tunnel.
-        log.info("  Created security group: %s (no inbound rules)", sg_id)
+    sg_id = ensure_security_group(ec2, cfg.tags)
 
     # 2. IAM instance profile -------------------------------------------------
     profile_arn = ensure_instance_profile(cfg.tags)
@@ -737,11 +596,11 @@ def provision(
     log.info("  Cloud-init is installing Docker, Tailscale, and Portainer.")
     log.info("  This takes 2-3 minutes. Run 'edc status' to check progress.")
 
-    return {
-        "instance_id": str(instance_id),
-        "security_group_id": str(sg_id),
-        "public_ip": public_ip,
-    }
+    return ProvisionResult(
+        instance_id=str(instance_id),
+        security_group_id=str(sg_id),
+        public_ip=public_ip,
+    )
 
 
 def start() -> str:
@@ -831,7 +690,7 @@ def stop() -> str:
     return iid
 
 
-def status() -> dict[str, Any]:
+def status() -> InstanceStatus:
     """Return current instance status.
 
     Returns:
@@ -845,10 +704,10 @@ def status() -> dict[str, Any]:
 
     if not inst:
         orphaned = _managed_orphan_report(ec2)
-        return {
-            "exists": False,
-            "orphaned_resources": orphaned,
-        }
+        return InstanceStatus(
+            exists=False,
+            orphaned_resources=orphaned,
+        )
 
     iid = inst["InstanceId"]
     state = inst["State"]["Name"]
@@ -858,17 +717,17 @@ def status() -> dict[str, Any]:
 
     # Get volume info (single API call for all attached volumes)
     vol_ids = get_volume_ids(inst)
-    volumes = []
+    volumes: list[VolumeInfo] = []
     if vol_ids:
         vol_resp = ec2.describe_volumes(VolumeIds=vol_ids)
         for v in vol_resp.get("Volumes", []):
             volumes.append(
-                {
-                    "volume_id": v["VolumeId"],
-                    "size_gb": v["Size"],
-                    "type": v["VolumeType"],
-                    "state": v["State"],
-                }
+                VolumeInfo(
+                    volume_id=v["VolumeId"],
+                    size_gb=v["Size"],
+                    type=v["VolumeType"],
+                    state=v["State"],
+                )
             )
 
     # Orphaned managed volumes (available, not attached to this instance)
@@ -886,22 +745,22 @@ def status() -> dict[str, Any]:
     storage_monthly = sum(v["size_gb"] for v in volumes) * EBS_MONTHLY_RATE_PER_GB
     total_monthly = compute_monthly + storage_monthly
 
-    result: dict[str, Any] = {
-        "exists": True,
-        "instance_id": iid,
-        "state": state,
-        "instance_type": instance_type,
-        "public_ip": public_ip,
-        "launch_time": str(launch_time) if launch_time else None,
-        "volumes": volumes,
-        "orphaned_volumes": orphaned_volumes,
-        "cost_estimate": {
-            "compute_monthly": round(compute_monthly, 2),
-            "storage_monthly": round(storage_monthly, 2),
-            "total_monthly": round(total_monthly, 2),
-            "note": f"Assumes {DEFAULT_HOURS_PER_DAY}hrs/day runtime",
-        },
-    }
+    result = InstanceStatus(
+        exists=True,
+        instance_id=iid,
+        state=state,
+        instance_type=instance_type,
+        public_ip=public_ip,
+        launch_time=str(launch_time) if launch_time else None,
+        volumes=volumes,
+        orphaned_volumes=orphaned_volumes,
+        cost_estimate=CostEstimate(
+            compute_monthly=round(compute_monthly, 2),
+            storage_monthly=round(storage_monthly, 2),
+            total_monthly=round(total_monthly, 2),
+            note=f"Assumes {DEFAULT_HOURS_PER_DAY}hrs/day runtime",
+        ),
+    )
     return result
 
 
@@ -938,16 +797,7 @@ def destroy() -> None:
     log.info("Instance terminated.")
 
     # Clean up security group (may fail if other resources use it)
-    sg_id = _find_security_group(ec2)
-    if sg_id:
-        try:
-            # Wait briefly for ENI detachment
-            time.sleep(5)
-            ec2.delete_security_group(GroupId=sg_id)
-            log.info("Deleted security group: %s", sg_id)
-        except ClientError as exc:
-            log.warning("Could not delete security group %s: %s", sg_id, exc)
-            log.warning("You may need to delete it manually after ENIs are released.")
+    delete_security_group(ec2)
 
     # Clean up IAM instance profile
     delete_instance_profile()
@@ -971,7 +821,7 @@ def resize(
     instance_type: str | None = None,
     volume_size_gb: int | None = None,
     state_volume_size_gb: int | None = None,
-) -> dict[str, Any]:
+) -> ResizeResult:
     """Resize the edcloud instance type and/or EBS volumes in place.
 
     Instance type change requires a stop → modify → start cycle.
@@ -1002,7 +852,7 @@ def resize(
 
     iid = inst["InstanceId"]
     current_state = inst["State"]["Name"]
-    result: dict[str, Any] = {"instance_id": iid}
+    result = ResizeResult(instance_id=iid)
 
     # ------------------------------------------------------------------
     # Volume resizes (online — no instance stop required)

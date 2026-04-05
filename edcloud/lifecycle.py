@@ -6,14 +6,14 @@ reusable guardrail and snapshot/cleanup sequencing behavior.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
 
 
 def require_confirmed_instance_id(
-    info: dict[str, Any],
+    info: Mapping[str, Any],
     confirm_instance_id: str | None,
     command_name: str,
 ) -> None:
@@ -75,16 +75,16 @@ def maybe_run_cleanup(
 
 def run_reprovision_flow(
     *,
-    info: dict[str, Any],
+    info: Mapping[str, Any],
     skip_snapshot: bool,
     auto_snapshot: Callable[[], list[str]],
     destroy_instance: Callable[[], None],
     cleanup_orphaned_volumes: Callable[[], object],
-    provision_replacement: Callable[[], dict[str, Any]],
+    provision_replacement: Callable[[], Mapping[str, Any]],
     echo: Callable[[str], None],
     echo_err: Callable[[str], None],
     confirm_continue: Callable[[str], bool],
-) -> tuple[list[str], dict[str, Any]]:
+) -> tuple[list[str], Mapping[str, Any]]:
     """Execute snapshot -> destroy -> cleanup -> provision reprovision flow."""
     snap_ids = run_optional_auto_snapshot(
         skip_snapshot=skip_snapshot,

@@ -18,6 +18,7 @@ from edcloud.config import (
     managed_filter,
 )
 from edcloud.ec2 import find_instance, get_ec2_client
+from edcloud.security_group import TagDriftError
 
 log = logging.getLogger(__name__)
 
@@ -105,7 +106,7 @@ def _find_single_state_volume(ec2: Any) -> dict[str, Any]:
         raise RuntimeError("No managed state volume found for restore drill.")
     if len(volumes) > 1:
         ids = ", ".join(v["VolumeId"] for v in volumes)
-        raise RuntimeError(
+        raise TagDriftError(
             f"Restore drill requires a single managed state volume, but found multiple: {ids}"
         )
     return dict(volumes[0])

@@ -30,6 +30,7 @@ env/
 .vscode/
 .idea/
 .claude/settings.local.json
+*.code-workspace
 *.swp
 *.swo
 *~

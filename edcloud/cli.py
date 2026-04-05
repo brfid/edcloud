@@ -9,8 +9,7 @@ import os
 import shlex
 import shutil
 import subprocess  # nosec B404
-from collections.abc import Callable
-from datetime import datetime, timezone
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import ParamSpec, TypeVar
 
@@ -35,6 +34,7 @@ from edcloud.lifecycle import (
     run_reprovision_flow,
 )
 from edcloud.resource_audit import audit_resources
+from edcloud.security_group import TagDriftError
 from edcloud.verify_catalog import VERIFY_CHECKS
 
 P = ParamSpec("P")
@@ -42,7 +42,7 @@ R = TypeVar("R")
 
 
 def _resolve_ssh_target(
-    info: dict[str, object],
+    info: Mapping[str, object],
     public_ip: bool,
     user: str,
     hostname: str,
@@ -558,45 +558,34 @@ def sync_cline_auth(
     dry_run: bool,
 ) -> None:
     """Sync Cline OAuth files from local machine to a remote host with backup semantics."""
+    from edcloud import cline_sync
+
     source_secrets_path = Path(source_secrets).expanduser().resolve()
-    if not source_secrets_path.exists():
-        raise click.ClickException(f"Source secrets file not found: {source_secrets_path}")
-
-    with source_secrets_path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if "openai-codex-oauth-credentials" not in payload:
-        raise click.ClickException(
-            "Missing expected key in secrets.json: openai-codex-oauth-credentials"
+    try:
+        _, include_global_state = cline_sync.validate_source(
+            source_secrets_path, include_global_state
         )
+    except FileNotFoundError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
-    source_global_state = source_secrets_path.with_name("globalState.json")
-    if include_global_state and not source_global_state.exists():
+    click.echo(f"Remote target: {remote}")
+    click.echo(f"Source secrets: {source_secrets_path}")
+    if include_global_state:
+        source_global_state = source_secrets_path.with_name("globalState.json")
+        click.echo(f"Source globalState: {source_global_state}")
+    elif Path(source_secrets).expanduser().resolve().with_name("globalState.json").exists():
+        pass  # already handled by validate_source
+    else:
         click.echo(
             "Warning: globalState.json not found next to secrets.json; "
             "continuing with secrets-only sync.",
             err=True,
         )
-        include_global_state = False
-
-    click.echo(f"Remote target: {remote}")
-    click.echo(f"Source secrets: {source_secrets_path}")
-    if include_global_state:
-        click.echo(f"Source globalState: {source_global_state}")
 
     if remote_diagnostics:
-        diagnostics_script = (
-            "set -euo pipefail; "
-            'echo "remote diagnostics:"; '
-            'echo "  user: $(whoami)"; '
-            'echo "  home: $HOME"; '
-            f'echo "  config_dir: $HOME/{remote_config_dir}"; '
-            "if command -v cline >/dev/null 2>&1; then "
-            'echo "  cline_path: $(command -v cline)"; '
-            'echo "  cline_version: $(cline --version 2>/dev/null || echo unknown)"; '
-            'else echo "  cline_path: missing"; fi'
-        )
-        diagnostics = _run_checked(["ssh", *ssh_opts, remote, diagnostics_script])
-        out = diagnostics.stdout.strip()
+        out = cline_sync.run_remote_diagnostics(remote, ssh_opts, remote_config_dir)
         if out:
             click.echo(out)
 
@@ -604,62 +593,13 @@ def sync_cline_auth(
         click.echo(f"[dry-run] Would backup and sync files under ~/{remote_config_dir}/")
         return
 
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    remote_backup_dir = f"{remote_config_dir}/backups"
-    remote_secrets = f"{remote_config_dir}/secrets.json"
-    remote_global_state = f"{remote_config_dir}/globalState.json"
-
-    backup_script = (
-        "set -euo pipefail; "
-        f'mkdir -p "$HOME/{remote_config_dir}" "$HOME/{remote_backup_dir}"; '
-        f'if [[ -f "$HOME/{remote_secrets}" ]]; then cp "$HOME/{remote_secrets}" '
-        f'"$HOME/{remote_backup_dir}/secrets.json.{ts}"; fi; '
-        f'if [[ {1 if include_global_state else 0} -eq 1 && -f "$HOME/{remote_global_state}" ]]; '
-        f'then cp "$HOME/{remote_global_state}" '
-        f'"$HOME/{remote_backup_dir}/globalState.json.{ts}"; fi'
+    cline_sync.sync_files(
+        remote=remote,
+        ssh_opts=ssh_opts,
+        source_secrets_path=source_secrets_path,
+        remote_config_dir=remote_config_dir,
+        include_global_state=include_global_state,
     )
-    _run_checked(["ssh", *ssh_opts, remote, backup_script])
-
-    _run_checked(
-        [
-            "scp",
-            *ssh_opts,
-            str(source_secrets_path),
-            f"{remote}:~/{remote_config_dir}/secrets.json.new",
-        ]
-    )
-    if include_global_state:
-        _run_checked(
-            [
-                "scp",
-                *ssh_opts,
-                str(source_global_state),
-                f"{remote}:~/{remote_config_dir}/globalState.json.new",
-            ]
-        )
-
-    install_script = (
-        "set -euo pipefail; "
-        f'mv "$HOME/{remote_config_dir}/secrets.json.new" "$HOME/{remote_secrets}"; '
-        f'chmod 600 "$HOME/{remote_secrets}"; '
-        f"if [[ {1 if include_global_state else 0} -eq 1 ]]; "
-        f'then mv "$HOME/{remote_config_dir}/globalState.json.new" '
-        f'"$HOME/{remote_global_state}"; chmod 600 "$HOME/{remote_global_state}"; fi'
-    )
-    _run_checked(["ssh", *ssh_opts, remote, install_script])
-
-    verify_script = (
-        "set -euo pipefail; "
-        f'test -s "$HOME/{remote_secrets}"; '
-        f"grep -q 'openai-codex-oauth-credentials' \"$HOME/{remote_secrets}\"; "
-        f"stat -c 'remote file: %n owner=%U:%G mode=%a size=%s' \"$HOME/{remote_secrets}\"; "
-        f"if [[ {1 if include_global_state else 0} -eq 1 ]]; then "
-        f'test -s "$HOME/{remote_global_state}"; '
-        f"stat -c 'remote file: %n owner=%U:%G mode=%a size=%s' \"$HOME/{remote_global_state}\"; "
-        "fi"
-    )
-    _run_checked(["ssh", *ssh_opts, remote, verify_script])
-
     click.echo("Cline auth sync complete.")
 
 
@@ -756,11 +696,11 @@ def status() -> None:
         )
 
     # Orphaned volume warning
-    orphaned = info.get("orphaned_volumes", [])
-    if orphaned:
+    orphaned_vols: list[str] = info.get("orphaned_volumes", [])
+    if orphaned_vols:
         click.echo()
-        click.echo(f"Warning: {len(orphaned)} orphaned managed volume(s) accruing cost:")
-        for vol_id in orphaned:
+        click.echo(f"Warning: {len(orphaned_vols)} orphaned managed volume(s) accruing cost:")
+        for vol_id in orphaned_vols:
             click.echo(f"  {vol_id}")
         click.echo("  Delete manually: aws ec2 delete-volume --volume-id <id>")
 
@@ -1511,7 +1451,7 @@ def reprovision(
             echo_err=lambda msg: click.echo(msg, err=True),
             confirm_continue=lambda msg: click.confirm(msg),
         )
-    except (RuntimeError, ec2.TagDriftError, ClientError, BotoCoreError) as exc:
+    except (RuntimeError, TagDriftError, ClientError, BotoCoreError) as exc:
         click.echo(f"❌ Provisioning failed: {exc}", err=True)
         if snap_ids:
             click.echo("", err=True)

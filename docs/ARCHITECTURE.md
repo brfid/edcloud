@@ -18,17 +18,24 @@ edcloud/
 ├── aws_clients.py      # Shared boto3 session/client factories
 ├── aws_check.py        # Credential/region checks
 ├── discovery.py        # Shared EC2 instance discovery helpers
-└── config.py           # Constants, tags, defaults, InstanceConfig
+├── config.py           # Constants, tags, defaults, InstanceConfig
+├── types.py            # TypedDict definitions for API contracts
+├── user_data.py        # Cloud-init template rendering + input validation
+├── security_group.py   # Security group discovery/lifecycle + TagDriftError
+├── cline_sync.py       # Cline OAuth secret sync to remote hosts
+└── py.typed            # PEP 561 type-checking marker
 ```
 
 ## Design principles
 
-- **Thin command adapters:** `cli.py` should focus on options, user I/O, and delegation.
+- **Thin command adapters:** `cli.py` focuses on options, user I/O, and delegation.
 - **Centralized orchestration:** repeated lifecycle flows live in `lifecycle.py`.
 - **Declarative checks:** verification checks live in `verify_catalog.py`, not inline command code.
 - **Shared query primitives:** managed-resource filter/query composition lives in `resource_queries.py`.
 - **Tag-based source of truth:** no local state file; AWS tags define ownership and discovery.
 - **UI-agnostic library modules:** only `cli.py` depends on `click`. Library modules accept I/O callbacks when they need user interaction.
+- **Typed API contracts:** major return values use `TypedDict` definitions in `types.py` so callers and type checkers can verify field access.
+- **Single-pass template rendering:** `user_data.py` uses `string.Template.safe_substitute` to avoid cascading replacement issues.
 
 ## Architecture decisions (ADR summary)
 
@@ -41,8 +48,20 @@ edcloud/
 - **Separate app/infrastructure repos:** application MCP code (for example `oldspeak`) remains in its own repository (`~/src/oldspeak` on-host). edcloud bootstraps checkout/update and local wrappers (`oldspeak-mcp-stdio`, `oldspeak-mcp-http`) without vendoring app code into this infra repo. Dotfiles bootstrap is configurable via `InstanceConfig.dotfiles_repo` / `dotfiles_branch` and rendered into cloud-init at provision time.
 - **Cloud-init as baseline contract:** reproducible host/tooling baseline is codified in `cloud-init/user-data.yaml`.
 - **CLI-first operations model:** commands must remain safe/repeatable from lightweight ARM/Linux operator nodes.
+- **TagDriftError as unified exception:** all tag-based discovery invariant violations (duplicate instances, duplicate security groups, duplicate state volumes) raise `TagDriftError` from `security_group.py`, providing consistent error handling across modules.
 
 ## Key runtime flows
+
+### Dotfiles bootstrap
+
+Dotfiles are synced during cloud-init via configurable inputs:
+
+1. `InstanceConfig.dotfiles_repo` / `dotfiles_branch` are rendered into cloud-init by `user_data.render()`.
+2. Cloud-init resolves the repo URL: `auto` → `https://github.com/<gh-user>/dotfiles.git` (via `gh api user`), or falls back to existing `~/src/dotfiles` origin URL.
+3. `sync_git_repo()` (shell function in cloud-init) clones or updates `~/src/dotfiles`.
+4. If `~/src/dotfiles/install.sh` exists, it is executed to link configs.
+
+`scripts/setup-dotfiles.sh` is a standalone operator tool for manual re-linking of dotfiles configs outside of cloud-init (e.g. after editing dotfiles on a running instance).
 
 ### Destroy (default)
 
@@ -68,6 +87,10 @@ edcloud/
 - **Lifecycle guardrails/snapshot flow:** shared in `lifecycle.py` (`require_confirmed_instance_id`, `run_optional_auto_snapshot`, `maybe_run_cleanup`).
 - **Managed volume query filters:** shared in `resource_queries.py` (`managed_volume_filters`, `list_managed_volumes`) and reused by `cleanup.py`/`ec2.py`.
 - **Verification check catalog:** extracted into `verify_catalog.py` and consumed by `cli.verify_cmd`.
+- **User-data rendering:** extracted into `user_data.py` with `string.Template`-based safe substitution.
+- **Security group management:** extracted into `security_group.py` with `TagDriftError` as the unified tag-drift exception.
+- **Cline sync workflow:** extracted into `cline_sync.py` with validation, diagnostics, and file sync as separate functions.
+- **API type contracts:** `types.py` provides `TypedDict` definitions for `InstanceStatus`, `ProvisionResult`, `ResizeResult`, `SnapshotInfo`, etc.
 
 ## Notes
 
