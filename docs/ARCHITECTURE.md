@@ -60,8 +60,7 @@ Dotfiles are synced during cloud-init via configurable inputs:
 2. Cloud-init resolves the repo URL: `auto` → `https://github.com/<gh-user>/dotfiles.git` (via `gh api user`), or falls back to existing `~/src/dotfiles` origin URL.
 3. `sync_git_repo()` (shell function in cloud-init) clones or updates `~/src/dotfiles`.
 4. If `~/src/dotfiles/install.sh` exists, it is executed to link configs.
-
-`scripts/setup-dotfiles.sh` is a standalone operator tool for manual re-linking of dotfiles configs outside of cloud-init (e.g. after editing dotfiles on a running instance).
+5. Otherwise, relink on a running host via the instructions in `AGENTS.md`.
 
 ### Destroy (default)
 

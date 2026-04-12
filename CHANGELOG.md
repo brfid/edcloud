@@ -47,7 +47,7 @@ semantic version tags.
   - Added Python 3.14 to CI matrix; removed commented-out mypy pre-commit hook.
   - Added `*.code-workspace` to `.gitignore`.
   - Added `__all__` to `__init__.py`.
-  - Documented `scripts/setup-dotfiles.sh` purpose and relationship to cloud-init bootstrap.
+  - Replaced manual `scripts/setup-dotfiles.sh` with terse `AGENTS.md` instructions for dotfiles relink on a running host.
   - Updated `docs/ARCHITECTURE.md` with new module structure, dotfiles bootstrap flow, and design principles.
 - Code quality pass for demo readiness:
   - Fixed all mypy strict errors (8 across 4 files) and ruff lint violations; tooling now passes clean.

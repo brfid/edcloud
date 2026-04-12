@@ -29,6 +29,15 @@ Priorities:
 - Tests: `tests/`
 - Operator runbook and backup policy: `RUNBOOK.md`
 
+## Dotfiles relink
+
+On a running edcloud host, do not use a helper script.
+
+- Read `~/src/dotfiles/README.md`.
+- Link the edcloud profile directly.
+- Do not assume `~/src/dotfiles/install.sh` exists.
+- Do not create links to paths that do not exist.
+
 ## Changelog memory model
 
 Use `CHANGELOG.md` as agent working memory.

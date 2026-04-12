@@ -2,23 +2,8 @@
 
 ## Operator scripts
 
-### `setup-dotfiles.sh`
-
-Manual re-linking tool for dotfiles configs on a running edcloud instance.
-Assumes `~/src/dotfiles` is already cloned (cloud-init handles the initial
-clone during provisioning).
-
-```bash
-# Run on the edcloud instance after editing dotfiles
-~/src/edcloud/scripts/setup-dotfiles.sh
-
-# Or with a custom dotfiles path
-DOTFILES=~/src/dotfiles ~/src/edcloud/scripts/setup-dotfiles.sh
-```
-
-This is separate from the cloud-init bootstrap path, which calls
-`~/src/dotfiles/install.sh` if it exists. Use `setup-dotfiles.sh` when you
-want to re-link configs without reprovisioning.
+Dotfiles relink is agent-driven. On a running host, use the instructions in
+`AGENTS.md` and `~/src/dotfiles/README.md`. There is no `setup-dotfiles.sh`.
 
 ## Script migrations
 
