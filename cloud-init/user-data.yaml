@@ -628,10 +628,8 @@ runcmd:
         echo "ℹ️ gh not authenticated; skipping bin/llm-config/oldspeak sync"
       fi
 
-      # Link bashrc from dotfiles (includes git-prompt PS1)
-      if [ -x "$HOME/src/dotfiles/install.sh" ]; then
-        "$HOME/src/dotfiles/install.sh" || true
-      fi
+      # Dotfiles are cloned but not auto-linked. Apply them post-rebuild
+      # (e.g. via an LLM CLI reading ~/src/dotfiles/*/README.md live-path maps).
 
       if [ -d "$HOME/src/bin" ]; then
         find "$HOME/src/bin" -maxdepth 1 -type f -perm -u+x -exec ln -sfn {} "$HOME/.local/bin/" \;

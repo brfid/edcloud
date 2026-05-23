@@ -35,6 +35,10 @@ semantic version tags.
 
 ### Recently Completed
 
+- Aligned rebuild flow with declarative dotfiles repo: removed stale
+  `install.sh` invocation from cloud-init, updated `README.md` and `RUNBOOK.md`
+  to document dotfiles application as a post-rebuild operator step
+  (manual or LLM-driven). No CLI, IAM, or SSM surface changes.
 - Architecture refactor for self-documentation and module clarity:
   - Extracted `user_data.py` from `ec2.py` — cloud-init template rendering with `string.Template` safe substitution replacing fragile `str.replace` chains.
   - Extracted `security_group.py` from `ec2.py` — SG discovery/lifecycle and `TagDriftError` as the unified tag-drift exception across all modules.

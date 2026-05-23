@@ -155,16 +155,15 @@ LazyVim compatibility:
 
 Bootstrap repo sync:
 
-- Dotfiles are always attempted first via cloud-init using configurable inputs:
-  - `--dotfiles-repo` / `EDCLOUD_DOTFILES_REPO` (`auto` default)
-  - `--dotfiles-branch` / `EDCLOUD_DOTFILES_BRANCH` (`main` default)
-- `--dotfiles-repo auto` resolution order:
-  1. `https://github.com/<gh-user>/dotfiles.git` when `gh auth` is available
-  2. existing `~/src/dotfiles` origin URL (if present on persisted home)
-- Additional non-secret repos still sync from GitHub user namespace when `gh` auth is available:
-  - `https://github.com/<gh-user>/bin.git` → `~/src/bin`
-  - `https://github.com/<gh-user>/llm-config.git` → `~/src/llm-config`
-  - `https://github.com/<gh-user>/oldspeak.git` → `~/src/oldspeak`
+- Cloud-init clones non-secret repos but does not apply them. Dotfiles are
+  declarative (per-folder `README.md` with `Live paths:` maps); apply
+  post-rebuild manually or via an LLM CLI on the host.
+- Dotfiles clone target is configurable: `--dotfiles-repo` /
+  `EDCLOUD_DOTFILES_REPO` (`auto` default = `https://github.com/<gh-user>/dotfiles.git`
+  via `gh auth`, falling back to the existing origin on persisted home),
+  `--dotfiles-branch` / `EDCLOUD_DOTFILES_BRANCH` (`main` default).
+- Additional repos sync from the `gh`-authenticated user namespace:
+  `bin`, `llm-config`, `oldspeak` under `~/src/`.
 
 For local MCP usage on edcloud, cloud-init also installs best-effort wrappers:
 

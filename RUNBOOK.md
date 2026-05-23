@@ -641,7 +641,9 @@ Non-secret repo sync baseline:
   - `https://github.com/<gh-user>/bin.git` → `~/src/bin`
   - `https://github.com/<gh-user>/llm-config.git` → `~/src/llm-config`
   - `https://github.com/<gh-user>/oldspeak.git` → `~/src/oldspeak`
-- If `~/src/dotfiles/install.sh` exists and is executable, it is run.
+- Dotfiles are cloned but not auto-linked. The repo is now declarative
+  (per-folder `README.md` with `Live paths:` maps); apply post-rebuild by hand
+  or via an LLM CLI on the host. Edcloud knows nothing about its internals.
 - Executable files in `~/src/bin` are symlinked into `~/.local/bin`.
 - If `~/src/oldspeak/pyproject.toml` exists, cloud-init performs best-effort local
   MCP bootstrap (`.venv`, editable install, and spaCy model download).
