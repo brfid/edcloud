@@ -26,17 +26,8 @@ def aws_client(service_name: str) -> Any:
     return aws_session().client(service_name)  # type: ignore[call-overload]
 
 
-def aws_resource(service_name: str) -> Any:
-    """Return a boto3 resource for ``service_name``."""
-    return aws_session().resource(service_name)  # type: ignore[call-overload]
-
-
 def ec2_client() -> Any:
     return aws_client("ec2")
-
-
-def ec2_resource() -> Any:
-    return aws_resource("ec2")
 
 
 def ssm_client() -> Any:

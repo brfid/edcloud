@@ -8,9 +8,9 @@ from edcloud.config import MANAGER_TAG_KEY, MANAGER_TAG_VALUE, InstanceConfig, m
 from edcloud.ec2 import (
     TagDriftError,
     _find_instance,
-    _find_security_group,
     provision,
 )
+from edcloud.security_group import find_security_group
 
 
 class TestManagedFilter:
@@ -76,7 +76,7 @@ class TestFindSecurityGroup:
     def test_returns_none_when_no_groups(self):
         mock_client = MagicMock()
         mock_client.describe_security_groups.return_value = {"SecurityGroups": []}
-        assert _find_security_group(mock_client) is None
+        assert find_security_group(mock_client) is None
 
     def test_returns_group_id(self):
         mock_client = MagicMock()
@@ -88,14 +88,14 @@ class TestFindSecurityGroup:
                 }
             ]
         }
-        result = _find_security_group(mock_client)
+        result = find_security_group(mock_client)
         assert result == "sg-abc123"
 
     def test_uses_group_name_filter(self):
         mock_client = MagicMock()
         mock_client.describe_security_groups.return_value = {"SecurityGroups": []}
 
-        _find_security_group(mock_client)
+        find_security_group(mock_client)
 
         kwargs = mock_client.describe_security_groups.call_args.kwargs
         assert kwargs["Filters"] == [{"Name": "group-name", "Values": ["edcloud-sg"]}]
@@ -107,7 +107,7 @@ class TestFindSecurityGroup:
         }
 
         with pytest.raises(TagDriftError, match="missing `edcloud:managed=true`"):
-            _find_security_group(mock_client)
+            find_security_group(mock_client)
 
     def test_raises_on_duplicate_managed_groups(self):
         mock_client = MagicMock()
@@ -125,14 +125,14 @@ class TestFindSecurityGroup:
         }
 
         with pytest.raises(TagDriftError, match="multiple managed security groups"):
-            _find_security_group(mock_client)
+            find_security_group(mock_client)
 
 
 class TestUserDataRendering:
     def test_render_substitutes_variables(self):
-        from edcloud.ec2 import _render_user_data
+        from edcloud.user_data import render
 
-        rendered = _render_user_data(
+        rendered = render(
             "/edcloud/tailscale_auth_key",
             "my-hostname",
             "us-east-1",
@@ -153,30 +153,30 @@ class TestUserDataRendering:
 
 class TestInputValidation:
     def test_valid_hostname_passes(self):
-        from edcloud.ec2 import _validate_user_data_inputs
+        from edcloud.user_data import validate_inputs
 
         # Should not raise
-        _validate_user_data_inputs("edcloud", tailscale_auth_key="tskey-auth-valid123")
-        _validate_user_data_inputs("my-host-123", tailscale_auth_key="tskey-valid")
-        _validate_user_data_inputs("a", tailscale_auth_key="tskey")
+        validate_inputs("edcloud", tailscale_auth_key="tskey-auth-valid123")
+        validate_inputs("my-host-123", tailscale_auth_key="tskey-valid")
+        validate_inputs("a", tailscale_auth_key="tskey")
 
     def test_invalid_hostname_raises(self):
-        from edcloud.ec2 import _validate_user_data_inputs
+        from edcloud.user_data import validate_inputs
 
         with pytest.raises(ValueError, match="Invalid tailscale_hostname"):
-            _validate_user_data_inputs("-invalid", tailscale_auth_key="tskey")
+            validate_inputs("-invalid", tailscale_auth_key="tskey")
 
         with pytest.raises(ValueError, match="Invalid tailscale_hostname"):
-            _validate_user_data_inputs("invalid-", tailscale_auth_key="tskey")
+            validate_inputs("invalid-", tailscale_auth_key="tskey")
 
         with pytest.raises(ValueError, match="Invalid tailscale_hostname"):
-            _validate_user_data_inputs("host_name", tailscale_auth_key="tskey")
+            validate_inputs("host_name", tailscale_auth_key="tskey")
 
         with pytest.raises(ValueError, match="Invalid tailscale_hostname"):
-            _validate_user_data_inputs("host name", tailscale_auth_key="tskey")
+            validate_inputs("host name", tailscale_auth_key="tskey")
 
     def test_injection_attempts_rejected(self):
-        from edcloud.ec2 import _validate_user_data_inputs
+        from edcloud.user_data import validate_inputs
 
         dangerous_auth_keys = [
             "tskey-$(whoami)",
@@ -191,96 +191,96 @@ class TestInputValidation:
 
         for dangerous_key in dangerous_auth_keys:
             with pytest.raises(ValueError, match="dangerous character"):
-                _validate_user_data_inputs("edcloud", tailscale_auth_key=dangerous_key)
+                validate_inputs("edcloud", tailscale_auth_key=dangerous_key)
 
     def test_valid_ssm_parameter_passes(self):
-        from edcloud.ec2 import _validate_user_data_inputs
+        from edcloud.user_data import validate_inputs
 
-        _validate_user_data_inputs(
+        validate_inputs(
             "edcloud",
             tailscale_auth_key_ssm_parameter="/edcloud/tailscale_auth_key",
         )
-        _validate_user_data_inputs(
+        validate_inputs(
             "edcloud",
             tailscale_auth_key_ssm_parameter="/my-app/nested/param_name.value",
         )
 
     def test_invalid_ssm_parameter_raises(self):
-        from edcloud.ec2 import _validate_user_data_inputs
+        from edcloud.user_data import validate_inputs
 
         with pytest.raises(ValueError, match="Invalid tailscale_auth_key_ssm_parameter"):
-            _validate_user_data_inputs(
+            validate_inputs(
                 "edcloud",
                 tailscale_auth_key_ssm_parameter="/bad/param;injection",
             )
 
     def test_valid_region_passes(self):
-        from edcloud.ec2 import _validate_user_data_inputs
+        from edcloud.user_data import validate_inputs
 
-        _validate_user_data_inputs("edcloud", aws_region="us-east-1")
-        _validate_user_data_inputs("edcloud", aws_region="eu-west-2")
-        _validate_user_data_inputs("edcloud", aws_region="ap-southeast-3")
+        validate_inputs("edcloud", aws_region="us-east-1")
+        validate_inputs("edcloud", aws_region="eu-west-2")
+        validate_inputs("edcloud", aws_region="ap-southeast-3")
 
     def test_invalid_region_raises(self):
-        from edcloud.ec2 import _validate_user_data_inputs
+        from edcloud.user_data import validate_inputs
 
         with pytest.raises(ValueError, match="Invalid aws_region"):
-            _validate_user_data_inputs("edcloud", aws_region="USEAST1")
+            validate_inputs("edcloud", aws_region="USEAST1")
 
         with pytest.raises(ValueError, match="Invalid aws_region"):
-            _validate_user_data_inputs("edcloud", aws_region="us-east-1; whoami")
+            validate_inputs("edcloud", aws_region="us-east-1; whoami")
 
     def test_valid_dotfiles_repo_values_pass(self):
-        from edcloud.ec2 import _validate_user_data_inputs
+        from edcloud.user_data import validate_inputs
 
-        _validate_user_data_inputs("edcloud", dotfiles_repo="auto")
-        _validate_user_data_inputs(
+        validate_inputs("edcloud", dotfiles_repo="auto")
+        validate_inputs(
             "edcloud",
             dotfiles_repo="https://github.com/example/dotfiles.git",
         )
-        _validate_user_data_inputs(
+        validate_inputs(
             "edcloud",
             dotfiles_repo="git@github.com:example/dotfiles.git",
         )
 
     def test_invalid_dotfiles_repo_values_raise(self):
-        from edcloud.ec2 import _validate_user_data_inputs
+        from edcloud.user_data import validate_inputs
 
         with pytest.raises(ValueError, match="Invalid dotfiles_repo"):
-            _validate_user_data_inputs(
+            validate_inputs(
                 "edcloud", dotfiles_repo="https://gitlab.com/example/dotfiles"
             )
 
         with pytest.raises(ValueError, match="Invalid dotfiles_repo"):
-            _validate_user_data_inputs(
+            validate_inputs(
                 "edcloud", dotfiles_repo="https://github.com/example/dotfiles"
             )
 
     def test_valid_dotfiles_branch_values_pass(self):
-        from edcloud.ec2 import _validate_user_data_inputs
+        from edcloud.user_data import validate_inputs
 
-        _validate_user_data_inputs("edcloud", dotfiles_branch="main")
-        _validate_user_data_inputs("edcloud", dotfiles_branch="feature/linux-refresh")
-        _validate_user_data_inputs("edcloud", dotfiles_branch="release-2026.03")
+        validate_inputs("edcloud", dotfiles_branch="main")
+        validate_inputs("edcloud", dotfiles_branch="feature/linux-refresh")
+        validate_inputs("edcloud", dotfiles_branch="release-2026.03")
 
     def test_invalid_dotfiles_branch_values_raise(self):
-        from edcloud.ec2 import _validate_user_data_inputs
+        from edcloud.user_data import validate_inputs
 
         with pytest.raises(ValueError, match="Invalid dotfiles_branch"):
-            _validate_user_data_inputs("edcloud", dotfiles_branch="")
+            validate_inputs("edcloud", dotfiles_branch="")
 
         with pytest.raises(ValueError, match="Invalid dotfiles_branch"):
-            _validate_user_data_inputs("edcloud", dotfiles_branch="main..prod")
+            validate_inputs("edcloud", dotfiles_branch="main..prod")
 
         with pytest.raises(ValueError, match="Invalid dotfiles_branch"):
-            _validate_user_data_inputs("edcloud", dotfiles_branch="-main")
+            validate_inputs("edcloud", dotfiles_branch="-main")
 
 
 class TestProvision:
     @patch("edcloud.ec2._ec2_client")
     @patch("edcloud.ec2._find_instance", return_value=None)
-    @patch("edcloud.ec2._find_security_group", return_value="sg-abc123")
-    @patch("edcloud.ec2._render_user_data", return_value="#cloud-config")
+    @patch("edcloud.security_group.find_security_group", return_value="sg-abc123")
+    @patch("edcloud.user_data.render", return_value="#cloud-config")
     @patch("edcloud.ec2._resolve_ami", return_value="ami-abc123")
     @patch("edcloud.ec2._get_aws_region", return_value="us-east-1")
     @patch(
@@ -324,8 +324,8 @@ class TestProvision:
     @patch("edcloud.ec2._ec2_client")
     @patch("edcloud.ec2._find_orphaned_state_volume_id", return_value="vol-state-existing")
     @patch("edcloud.ec2._find_instance")
-    @patch("edcloud.ec2._find_security_group", return_value="sg-abc123")
-    @patch("edcloud.ec2._render_user_data", return_value="#cloud-config")
+    @patch("edcloud.security_group.find_security_group", return_value="sg-abc123")
+    @patch("edcloud.user_data.render", return_value="#cloud-config")
     @patch("edcloud.ec2._resolve_ami", return_value="ami-abc123")
     @patch("edcloud.ec2._get_aws_region", return_value="us-east-1")
     @patch(
@@ -379,8 +379,8 @@ class TestProvision:
     @patch("edcloud.ec2._ec2_client")
     @patch("edcloud.ec2._find_orphaned_state_volume_id", return_value=None)
     @patch("edcloud.ec2._find_instance", return_value=None)
-    @patch("edcloud.ec2._find_security_group", return_value="sg-abc123")
-    @patch("edcloud.ec2._render_user_data", return_value="#cloud-config")
+    @patch("edcloud.security_group.find_security_group", return_value="sg-abc123")
+    @patch("edcloud.user_data.render", return_value="#cloud-config")
     @patch("edcloud.ec2._resolve_ami", return_value="ami-abc123")
     @patch("edcloud.ec2._get_aws_region", return_value="us-east-1")
     @patch(

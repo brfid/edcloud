@@ -135,20 +135,10 @@ class SnapshotCostReport(TypedDict):
     over_soft_cap: bool
 
 
-class CleanupResult(TypedDict, total=False):
-    """Return type of ``backup_policy.disable_policy()``."""
-
-    exists: bool
-    policy_id: str
-    state: str
-    policy_name: str
-
-
 # Re-export for convenience — modules can ``from edcloud.types import Any``
 # when they also need the escape hatch.
 __all__: list[str] = [
     "BackupPolicyResult",
-    "CleanupResult",
     "CostEstimate",
     "InstanceStatus",
     "OrphanedResources",

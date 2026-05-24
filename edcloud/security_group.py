@@ -7,6 +7,7 @@ Manages the single ``edcloud-sg`` security group with zero inbound rules
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from botocore.exceptions import ClientError
@@ -113,8 +114,6 @@ def delete_security_group(client: Any) -> None:
     if not sg_id:
         return
     try:
-        import time
-
         time.sleep(5)
         client.delete_security_group(GroupId=sg_id)
         log.info("Deleted security group: %s", sg_id)

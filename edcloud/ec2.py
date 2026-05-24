@@ -41,7 +41,6 @@ from edcloud.security_group import (
     TagDriftError,
     delete_security_group,
     ensure_security_group,
-    find_security_group,
 )
 from edcloud.types import (
     CostEstimate,
@@ -257,14 +256,6 @@ def _find_instance(client: Any) -> dict[str, Any] | None:
     return inst
 
 
-def _find_security_group(client: Any) -> str | None:
-    """Return the edcloud security-group ID, or ``None`` if it doesn't exist.
-
-    Delegates to ``security_group.find_security_group``.
-    """
-    return find_security_group(client)
-
-
 def _resolve_ami(ssm_parameter: str) -> str:
     """Resolve an AMI ID from an SSM public parameter.
 
@@ -322,35 +313,6 @@ def _get_aws_region() -> str:
             "No AWS region configured. Set AWS_DEFAULT_REGION or run 'aws configure'."
         )
     return region
-
-
-def _validate_user_data_inputs(
-    tailscale_hostname: str,
-    tailscale_auth_key: str | None = None,
-    tailscale_auth_key_ssm_parameter: str | None = None,
-    aws_region: str | None = None,
-    dotfiles_repo: str | None = None,
-    dotfiles_branch: str | None = None,
-) -> None:
-    """Validate user-data template inputs.
-
-    Delegates to ``user_data.validate_inputs``.
-    """
-    from edcloud.user_data import validate_inputs
-
-    validate_inputs(
-        tailscale_hostname=tailscale_hostname,
-        tailscale_auth_key=tailscale_auth_key,
-        tailscale_auth_key_ssm_parameter=tailscale_auth_key_ssm_parameter,
-        aws_region=aws_region,
-        dotfiles_repo=dotfiles_repo,
-        dotfiles_branch=dotfiles_branch,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 
 def provision(

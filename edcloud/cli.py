@@ -67,22 +67,22 @@ def _resolve_ssh_target(
             raise RuntimeError("No public IP available. Remove --public-ip or assign a public IP.")
         ssh_base = ["ssh", "-o", "StrictHostKeyChecking=accept-new", f"{user}@{target}"]
         return target, ssh_base
-    else:
-        ts_ip = tailscale.get_tailscale_ip(hostname)
-        if not ts_ip:
-            raise RuntimeError(
-                f"Tailscale IP not found for '{hostname}'. "
-                "Check tailnet connectivity or use --public-ip."
-            )
-        ssh_base = [
-            "ssh",
-            "-o",
-            "ProxyCommand=none",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            f"{user}@{ts_ip}",
-        ]
-        return ts_ip, ssh_base
+
+    ts_ip = tailscale.get_tailscale_ip(hostname)
+    if not ts_ip:
+        raise RuntimeError(
+            f"Tailscale IP not found for '{hostname}'. "
+            "Check tailnet connectivity or use --public-ip."
+        )
+    ssh_base = [
+        "ssh",
+        "-o",
+        "ProxyCommand=none",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        f"{user}@{ts_ip}",
+    ]
+    return ts_ip, ssh_base
 
 
 def require_aws_creds(func: Callable[P, R]) -> Callable[P, R]:

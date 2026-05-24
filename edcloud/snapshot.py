@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from edcloud.config import (
     DEFAULT_SNAPSHOT_KEEP_LAST,
@@ -109,7 +109,7 @@ def _find_single_state_volume(ec2: Any) -> dict[str, Any]:
         raise TagDriftError(
             f"Restore drill requires a single managed state volume, but found multiple: {ids}"
         )
-    return dict(volumes[0])
+    return cast(dict[str, Any], volumes[0])
 
 
 def _latest_completed_snapshot_for_volume(ec2: Any, volume_id: str) -> dict[str, Any]:
@@ -125,7 +125,7 @@ def _latest_completed_snapshot_for_volume(ec2: Any, volume_id: str) -> dict[str,
     if not snapshots:
         raise RuntimeError(f"No completed snapshots found for state volume {volume_id}.")
     snapshots.sort(key=lambda s: s.get("StartTime", ""), reverse=True)
-    return dict(snapshots[0])
+    return cast(dict[str, Any], snapshots[0])
 
 
 def _validated_snapshot_for_volume(ec2: Any, snapshot_id: str, volume_id: str) -> dict[str, Any]:
@@ -144,7 +144,7 @@ def _validated_snapshot_for_volume(ec2: Any, snapshot_id: str, volume_id: str) -
         raise RuntimeError(
             f"Snapshot {snapshot_id} is in state {snap.get('State')}; must be completed."
         )
-    return dict(snap)
+    return cast(dict[str, Any], snap)
 
 
 def run_restore_drill(
