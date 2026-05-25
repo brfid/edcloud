@@ -75,6 +75,21 @@ class TestEnsurePolicy:
         assert len(schedule_names) == 3
 
     @patch("edcloud.backup_policy._dlm_client")
+    def test_creates_does_not_add_name_tag_when_copying_tags(self, mock_dlm_client):
+        mock_dlm = MagicMock()
+        mock_dlm.get_lifecycle_policies.return_value = {"Policies": []}
+        mock_dlm.create_lifecycle_policy.return_value = {"PolicyId": "policy-new"}
+        mock_dlm_client.return_value = mock_dlm
+
+        ensure_policy(execution_role_arn="arn:aws:iam::123:role/edcloud-dlm")
+
+        call_kwargs = mock_dlm.create_lifecycle_policy.call_args[1]
+        for schedule in call_kwargs["PolicyDetails"]["Schedules"]:
+            tag_keys = [tag["Key"] for tag in schedule["TagsToAdd"]]
+            assert schedule["CopyTags"] is True
+            assert "Name" not in tag_keys
+
+    @patch("edcloud.backup_policy._dlm_client")
     def test_updates_when_existing(self, mock_dlm_client):
         mock_dlm = MagicMock()
         mock_dlm.get_lifecycle_policies.return_value = {

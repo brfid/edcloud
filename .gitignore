@@ -29,6 +29,7 @@ env/
 # IDEs
 .vscode/
 .idea/
+.codex
 .claude/settings.local.json
 *.code-workspace
 *.swp

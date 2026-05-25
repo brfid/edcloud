@@ -9,7 +9,6 @@ from edcloud.config import (
     DLM_LIFECYCLE_POLICY_NAME,
     MANAGER_TAG_KEY,
     MANAGER_TAG_VALUE,
-    NAME_TAG,
     STATE_VOLUME_ROLE,
     VOLUME_ROLE_TAG_KEY,
 )
@@ -43,7 +42,6 @@ def _policy_details(daily_keep: int, weekly_keep: int, monthly_keep: int) -> dic
                 "RetainRule": {"Count": daily_keep},
                 "TagsToAdd": [
                     {"Key": MANAGER_TAG_KEY, "Value": MANAGER_TAG_VALUE},
-                    {"Key": "Name", "Value": f"{NAME_TAG}-dlm-daily"},
                     {"Key": "edcloud:backup-tier", "Value": "daily"},
                 ],
             },
@@ -56,7 +54,6 @@ def _policy_details(daily_keep: int, weekly_keep: int, monthly_keep: int) -> dic
                 "RetainRule": {"Count": weekly_keep},
                 "TagsToAdd": [
                     {"Key": MANAGER_TAG_KEY, "Value": MANAGER_TAG_VALUE},
-                    {"Key": "Name", "Value": f"{NAME_TAG}-dlm-weekly"},
                     {"Key": "edcloud:backup-tier", "Value": "weekly"},
                 ],
             },
@@ -69,7 +66,6 @@ def _policy_details(daily_keep: int, weekly_keep: int, monthly_keep: int) -> dic
                 "RetainRule": {"Count": monthly_keep},
                 "TagsToAdd": [
                     {"Key": MANAGER_TAG_KEY, "Value": MANAGER_TAG_VALUE},
-                    {"Key": "Name", "Value": f"{NAME_TAG}-dlm-monthly"},
                     {"Key": "edcloud:backup-tier", "Value": "monthly"},
                 ],
             },
