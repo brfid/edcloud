@@ -36,6 +36,16 @@ Core assumptions:
 - Keep AWS DLM backup policy enabled and review `edc backup-policy status` periodically.
 - Run restore drills and validate backup recovery.
 
+## Secret and PII guards
+
+Automated checks reduce the chance of committing secrets or personal data:
+
+- `gitleaks` scans staged changes as a pre-commit hook and scans full history in CI (`.github/workflows/secret-scan.yml`). Rules and allowlist live in `.gitleaks.toml`, including a Tailscale auth-key pattern.
+- `detect-secrets` runs as a pre-commit hook against `.secrets.baseline`.
+- `.gitignore` excludes operator-local auth material: Tailscale keys, rclone and Cline OAuth files (`secrets.json`, `globalState.json`), `.env` / `.envrc`, and AWS CLI credential and output files.
+
+Install the hooks with `pip install pre-commit && pre-commit install`. These guards are defense-in-depth, not a substitute for keeping runtime secrets in SSM.
+
 ## Vulnerability reporting
 
 Do not open public issues for security vulnerabilities.

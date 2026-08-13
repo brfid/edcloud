@@ -39,12 +39,13 @@ Console.
 
 ## Repository workflow
 
-- `main` is protected and should be updated via pull request only.
-- Merge policy is squash-only (merge commits and rebase merges disabled).
-- Linear history is required on `main`.
-- Force-push and branch deletion are disabled on `main`.
-- For agent/operator changes: work on task branches (`agent/<topic>-YYYYMMDD`),
-  clean history before push, then merge via PR.
+- `main` is the working branch; changes land directly on `main`.
+- Secrets and PII are guarded before they can reach the remote: `gitleaks`
+  runs as a pre-commit hook and in CI (`.github/workflows/secret-scan.yml`,
+  full history), `detect-secrets` checks against `.secrets.baseline`, and
+  `.gitignore` excludes operator-local auth material (Tailscale keys, rclone
+  and Cline config, `.env`).
+- Install the hooks once: `pip install pre-commit && pre-commit install`.
 
 ## Public collaboration expectations
 

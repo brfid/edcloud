@@ -46,10 +46,21 @@ htmlcov/
 
 # Secrets & local config
 .env
+.envrc
 *.pem
 *.key
 secrets.yaml
 config.local.yaml
+
+# edcloud auth material (operator-local; never commit)
+*.tskey
+tailscale-auth-key*
+rclone.conf
+rclone.conf.*
+# Cline OAuth files synced by `edc sync-cline-auth`
+secrets.json
+globalState.json
+.cline/
 
 # AWS
 .aws/credentials

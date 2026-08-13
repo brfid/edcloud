@@ -1,0 +1,24 @@
+# gitleaks configuration for edcloud.
+# Runs in CI (.github/workflows/secret-scan.yml) and as a pre-commit hook.
+
+title = "edcloud gitleaks config"
+
+[extend]
+# Start from gitleaks' built-in rule set (AWS keys, private keys, generic
+# high-entropy tokens, etc.) and add edcloud-specific rules below.
+useDefault = true
+
+[[rules]]
+id = "tailscale-auth-key"
+description = "Tailscale auth/API key"
+# Real keys are tskey-<kind>-<keyid>-<secret>; the 24+ char run of key
+# characters after the prefix skips doc placeholders like tskey-auth-... .
+regex = '''tskey-[a-zA-Z0-9-]{24,}'''
+keywords = ["tskey-"]
+
+[allowlist]
+description = "Repository artifacts that legitimately contain secret-shaped data"
+paths = [
+  # detect-secrets baseline: stores hashed fingerprints, not live secrets.
+  '''\.secrets\.baseline''',
+]
