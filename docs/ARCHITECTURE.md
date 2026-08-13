@@ -35,7 +35,7 @@ edcloud/
 - **Tag-based source of truth:** no local state file; AWS tags define ownership and discovery.
 - **UI-agnostic library modules:** only `cli.py` depends on `click`. Library modules accept I/O callbacks when they need user interaction.
 - **Typed API contracts:** major return values use `TypedDict` definitions in `types.py` so callers and type checkers can verify field access.
-- **Single-pass template rendering:** `user_data.py` uses `string.Template.safe_substitute` to avoid cascading replacement issues.
+- **Single-pass template rendering:** `user_data.py` uses a `string.Template` subclass with a distinct `@@{KEY}` delimiter so cloud-init shell variables (`$VAR` / `${VAR}`) can never collide with edcloud render slots. Rendering is strict (`substitute`, not `safe_substitute`) and guards against a slot left in shell `${KEY}` form.
 
 ## Architecture decisions (ADR summary)
 
@@ -86,7 +86,7 @@ Dotfiles are synced during cloud-init via configurable inputs:
 - **Lifecycle guardrails/snapshot flow:** shared in `lifecycle.py` (`require_confirmed_instance_id`, `run_optional_auto_snapshot`, `maybe_run_cleanup`).
 - **Managed volume query filters:** shared in `resource_queries.py` (`managed_volume_filters`, `list_managed_volumes`) and reused by `cleanup.py`/`ec2.py`.
 - **Verification check catalog:** extracted into `verify_catalog.py` and consumed by `cli.verify_cmd`.
-- **User-data rendering:** extracted into `user_data.py` with `string.Template`-based safe substitution.
+- **User-data rendering:** extracted into `user_data.py` with a distinct-delimiter (`@@{KEY}`) `string.Template` so shell `$VAR` usage never collides with render slots.
 - **Security group management:** extracted into `security_group.py` with `TagDriftError` as the unified tag-drift exception.
 - **Cline sync workflow:** extracted into `cline_sync.py` with validation, diagnostics, and file sync as separate functions.
 - **API type contracts:** `types.py` provides `TypedDict` definitions for `InstanceStatus`, `ProvisionResult`, `ResizeResult`, `SnapshotInfo`, etc.

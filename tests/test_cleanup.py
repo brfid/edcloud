@@ -107,7 +107,7 @@ def test_run_cleanup_workflow_completes_noninteractive(mock_ts_cleanup, mock_vol
     mock_ts_cleanup.return_value = True
     mock_vol_cleanup.return_value = True
 
-    result = run_cleanup_workflow("post-destroy", skip_snapshot=True, interactive=False)
+    result = run_cleanup_workflow("post-destroy", interactive=False)
 
     assert result is True
     mock_ts_cleanup.assert_called_once()
@@ -124,7 +124,7 @@ def test_run_cleanup_workflow_aborts_when_tailscale_step_fails(mock_ts_cleanup, 
     mock_ts_cleanup.return_value = False
     mock_vol_cleanup.return_value = True
 
-    result = run_cleanup_workflow("pre-provision", skip_snapshot=True, interactive=True)
+    result = run_cleanup_workflow("pre-provision", interactive=True)
 
     assert result is False
     mock_vol_cleanup.assert_not_called()
@@ -137,6 +137,6 @@ def test_run_cleanup_workflow_aborts_when_volume_step_fails(mock_ts_cleanup, moc
     mock_ts_cleanup.return_value = True
     mock_vol_cleanup.return_value = False
 
-    result = run_cleanup_workflow("pre-provision", skip_snapshot=True, interactive=True)
+    result = run_cleanup_workflow("pre-provision", interactive=True)
 
     assert result is False

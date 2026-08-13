@@ -19,6 +19,7 @@ from edcloud.config import (
 )
 from edcloud.ec2 import find_instance, get_ec2_client
 from edcloud.security_group import TagDriftError
+from edcloud.types import PruneResult, RestoreDrillResult, SnapshotInfo
 
 log = logging.getLogger(__name__)
 
@@ -152,7 +153,7 @@ def run_restore_drill(
     instance_id: str | None = None,
     device_name: str = "/dev/sdg",
     keep_temporary_volume: bool = False,
-) -> dict[str, Any]:
+) -> RestoreDrillResult:
     """Run a non-destructive EBS restore drill.
 
     Creates a temporary volume from a state-volume snapshot. Optionally attaches
@@ -234,7 +235,7 @@ def run_restore_drill(
     }
 
 
-def find_recent_prechange_snapshot(max_age_minutes: int) -> dict[str, object] | None:
+def find_recent_prechange_snapshot(max_age_minutes: int) -> SnapshotInfo | None:
     """Return the freshest completed pre-change snapshot within *max_age_minutes*.
 
     Args:
@@ -244,7 +245,7 @@ def find_recent_prechange_snapshot(max_age_minutes: int) -> dict[str, object] | 
         Snapshot info dict, or ``None`` if nothing qualifies.
     """
     now = datetime.now(timezone.utc)
-    freshest: tuple[datetime, dict[str, object]] | None = None
+    freshest: tuple[datetime, SnapshotInfo] | None = None
     for snap_info in list_snapshots():
         description = str(snap_info.get("description", "")).strip().lower()
         if not description.startswith(PRECHANGE_SNAPSHOT_PREFIX):
@@ -366,19 +367,19 @@ def create_snapshot(description: str | None = None) -> list[str]:
     return snapshot_ids
 
 
-def list_snapshots() -> list[dict[str, Any]]:
+def list_snapshots() -> list[SnapshotInfo]:
     """List all edcloud-managed snapshots, most recent first.
 
     Returns:
-        Dicts with keys: ``snapshot_id``, ``volume_id``, ``size_gb``,
-        ``state``, ``progress``, ``start_time``, ``description``, ``name``.
+        ``SnapshotInfo`` dicts (``snapshot_id``, ``volume_id``, ``size_gb``,
+        ``state``, ``progress``, ``start_time``, ``description``, ``name``).
     """
     ec2 = get_ec2_client()
     resp = ec2.describe_snapshots(
         Filters=managed_filter(),
         OwnerIds=["self"],
     )
-    snapshots = []
+    snapshots: list[SnapshotInfo] = []
     for s in resp.get("Snapshots", []):
         tags = {t["Key"]: t["Value"] for t in s.get("Tags", [])}
         snapshots.append(
@@ -399,9 +400,9 @@ def list_snapshots() -> list[dict[str, Any]]:
 
 
 def prune_snapshots(
-    keep_last: int = 3,
+    keep_last: int = DEFAULT_SNAPSHOT_KEEP_LAST,
     dry_run: bool = True,
-) -> dict[str, Any]:
+) -> PruneResult:
     """Delete all but the most recent *keep_last* snapshots.
 
     Snapshots are ordered newest-first; the oldest beyond *keep_last* are

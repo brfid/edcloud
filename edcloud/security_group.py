@@ -19,6 +19,7 @@ from edcloud.config import (
     SECURITY_GROUP_NAME,
     has_managed_tag,
 )
+from edcloud.discovery import default_vpc_id
 
 log = logging.getLogger(__name__)
 
@@ -93,9 +94,7 @@ def ensure_security_group(
         log.info("  Security group exists: %s", sg_id)
         return sg_id
 
-    from edcloud.ec2 import _get_default_vpc_id
-
-    vpc_id = _get_default_vpc_id(client)
+    vpc_id = default_vpc_id(client)
     resp = client.create_security_group(
         GroupName=SECURITY_GROUP_NAME,
         Description=SECURITY_GROUP_DESC,

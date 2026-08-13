@@ -7,27 +7,20 @@ from a local operator machine to a remote edcloud instance over SSH.
 from __future__ import annotations
 
 import json
-import shlex
-import subprocess  # nosec B404
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-
-def _run_checked(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    """Run a subprocess command and raise RuntimeError on failure."""
-    proc = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603
-    if proc.returncode != 0:
-        detail = proc.stderr.strip() or proc.stdout.strip() or "unknown error"
-        raise RuntimeError(f"Command failed: {' '.join(shlex.quote(p) for p in cmd)}\n{detail}")
-    return proc
+from edcloud.proc import run_checked as _run_checked
 
 
 def validate_source(
     source_secrets_path: Path,
     include_global_state: bool,
-) -> tuple[dict[str, Any], bool]:
-    """Validate source files and return parsed secrets + adjusted global_state flag.
+) -> bool:
+    """Validate source files and return the adjusted ``include_global_state`` flag.
+
+    The flag is demoted to ``False`` when the caller requested a globalState
+    sync but no ``globalState.json`` sits next to the secrets file.
 
     Raises:
         FileNotFoundError: If secrets file is missing.
@@ -45,7 +38,7 @@ def validate_source(
     if include_global_state and not source_global_state.exists():
         include_global_state = False
 
-    return payload, include_global_state
+    return include_global_state
 
 
 def run_remote_diagnostics(

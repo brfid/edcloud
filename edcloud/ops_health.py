@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+
+from edcloud.config import SNAPSHOT_MONTHLY_RATE_PER_GB
+from edcloud.types import SnapshotCostReport, SnapshotInfo
 
 
 def estimate_snapshot_monthly_cost(
-    snapshots: Sequence[dict[str, Any]],
+    snapshots: Sequence[SnapshotInfo],
     *,
-    gb_month_rate: float = 0.05,
+    gb_month_rate: float = SNAPSHOT_MONTHLY_RATE_PER_GB,
     soft_cap_usd: float = 2.0,
-) -> dict[str, Any]:
+) -> SnapshotCostReport:
     """Estimate monthly EBS snapshot spend from snapshot list output.
 
     The estimate is intentionally simple and conservative for operator guardrails:

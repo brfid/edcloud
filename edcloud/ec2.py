@@ -152,6 +152,22 @@ def _orphaned_resources_text(report: OrphanedResources) -> str:
     return "\n".join(lines)
 
 
+def _raise_if_orphans(client: Any, remediation: str) -> None:
+    """Raise ``TagDriftError`` if managed resources exist without an instance.
+
+    Called on the "no managed instance found" path of lifecycle operations to
+    distinguish a clean absence from leftover managed resources. *remediation*
+    is the operation-specific guidance appended after the shared preamble.
+    """
+    orphaned = _managed_orphan_report(client)
+    if orphaned["security_groups"] or orphaned["volumes"]:
+        raise TagDriftError(
+            "No managed edcloud instance found, but orphaned managed resources exist.\n"
+            f"{_orphaned_resources_text(orphaned)}\n"
+            f"Remediation: {remediation}"
+        )
+
+
 def _apply_tags(client: Any, resource_ids: list[str], tags: dict[str, str]) -> None:
     """Apply tags to one or more resources."""
     tag_list = [{"Key": k, "Value": v} for k, v in tags.items()]
@@ -286,19 +302,6 @@ def _resolve_ami(ssm_parameter: str) -> str:
             if images:
                 return str(images[0]["ImageId"])
         raise
-
-
-def _get_default_vpc_id(client: Any) -> str:
-    """Return the default VPC ID.
-
-    Raises:
-        RuntimeError: If no default VPC exists.
-    """
-    resp = client.describe_vpcs(Filters=[{"Name": "is-default", "Values": ["true"]}])
-    vpcs = resp.get("Vpcs", [])
-    if not vpcs:
-        raise RuntimeError("No default VPC found. Create one or specify a VPC ID.")
-    return str(vpcs[0]["VpcId"])
 
 
 def _get_aws_region() -> str:
@@ -578,14 +581,11 @@ def start() -> str:
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
     if not inst:
-        orphaned = _managed_orphan_report(ec2)
-        if orphaned["security_groups"] or orphaned["volumes"]:
-            raise TagDriftError(
-                "No managed edcloud instance found, but orphaned managed resources exist.\n"
-                f"{_orphaned_resources_text(orphaned)}\n"
-                "Remediation: either clean them up manually or run `edc provision` "
-                "to create a fresh managed instance."
-            )
+        _raise_if_orphans(
+            ec2,
+            "either clean them up manually or run `edc provision` "
+            "to create a fresh managed instance.",
+        )
         raise RuntimeError("No edcloud instance found. Run 'edc provision' first.")
 
     iid = str(inst["InstanceId"])
@@ -624,13 +624,7 @@ def stop() -> str:
     ec2 = _ec2_client()
     inst = _find_instance(ec2)
     if not inst:
-        orphaned = _managed_orphan_report(ec2)
-        if orphaned["security_groups"] or orphaned["volumes"]:
-            raise TagDriftError(
-                "No managed edcloud instance found, but orphaned managed resources exist.\n"
-                f"{_orphaned_resources_text(orphaned)}\n"
-                "Remediation: clean up stale resources or reprovision."
-            )
+        _raise_if_orphans(ec2, "clean up stale resources or reprovision.")
         raise RuntimeError("No edcloud instance found.")
 
     iid = str(inst["InstanceId"])
@@ -737,14 +731,11 @@ def destroy() -> None:
     inst = _find_instance(ec2)
 
     if not inst:
-        orphaned = _managed_orphan_report(ec2)
-        if orphaned["security_groups"] or orphaned["volumes"]:
-            raise TagDriftError(
-                "No managed edcloud instance found, but orphaned managed resources exist.\n"
-                f"{_orphaned_resources_text(orphaned)}\n"
-                "Remediation: delete stale resources manually in AWS or reprovision "
-                "and then run `edc destroy` again."
-            )
+        _raise_if_orphans(
+            ec2,
+            "delete stale resources manually in AWS or reprovision "
+            "and then run `edc destroy` again.",
+        )
         log.info("No edcloud instance found. Nothing to destroy.")
         return
 

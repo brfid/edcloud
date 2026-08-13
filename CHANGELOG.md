@@ -35,6 +35,12 @@ semantic version tags.
 
 ### Recently Completed
 
+- Maintainability pass (simplification / DRY / SoC / robustness):
+  - Removed dead code: the unused `skip_snapshot` parameter on `cleanup.run_cleanup_workflow`, a dead `elif ...: pass` branch in `sync-cline-auth`, and `cline_sync.validate_source`'s discarded parsed-payload return value. Fixed the author-name typo in `pyproject.toml`.
+  - DRY: single-sourced the `run_checked` subprocess helper (new `proc.py`) used by `cli.py` and `cline_sync.py`; extracted `ec2._raise_if_orphans` to collapse the "no instance, orphans exist" `TagDriftError` block duplicated across `start`/`stop`/`destroy`; defaulted prune keep-count and snapshot GB-month rate from their `config` constants instead of re-hardcoding `3` / `0.05`.
+  - Wired the previously-unused `SnapshotInfo`, `PruneResult`, `RestoreDrillResult`, `BackupPolicyResult`, and `SnapshotCostReport` TypedDicts into their producing functions so the typed API contracts are checked end-to-end (`mypy --strict`).
+  - SoC: moved the default-VPC lookup to `discovery.default_vpc_id`, removing a private in-function `from edcloud.ec2 import _get_default_vpc_id` reach-in from `security_group.py`.
+  - Robustness: cloud-init render slots now use a distinct `@@{KEY}` delimiter (`string.Template` subclass with strict `substitute` + guard) so shell `$VAR` / `${VAR}` can never silently collide with a render key. Added `tests/test_user_data.py`.
 - Aligned rebuild flow with declarative dotfiles repo: removed stale
   `install.sh` invocation from cloud-init, updated `README.md` and `RUNBOOK.md`
   to document dotfiles application as a post-rebuild operator step

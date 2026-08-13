@@ -22,9 +22,11 @@ from edcloud.aws_clients import ssm_client
 from edcloud.config import (
     DEFAULT_DOTFILES_BRANCH,
     DEFAULT_DOTFILES_REPO,
+    DEFAULT_SNAPSHOT_KEEP_LAST,
     DEFAULT_SSH_USER,
     DEFAULT_TAILSCALE_AUTH_KEY_SSM_PARAMETER,
     DEFAULT_TAILSCALE_HOSTNAME,
+    SNAPSHOT_MONTHLY_RATE_PER_GB,
     InstanceConfig,
 )
 from edcloud.lifecycle import (
@@ -33,6 +35,7 @@ from edcloud.lifecycle import (
     run_optional_auto_snapshot,
     run_reprovision_flow,
 )
+from edcloud.proc import run_checked as _run_checked
 from edcloud.resource_audit import audit_resources
 from edcloud.security_group import TagDriftError
 from edcloud.verify_catalog import VERIFY_CHECKS
@@ -108,15 +111,6 @@ def require_aws_creds(func: Callable[P, R]) -> Callable[P, R]:
             raise SystemExit(1) from exc
 
     return wrapper
-
-
-def _run_checked(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    """Run a subprocess command and raise RuntimeError on failure."""
-    proc = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603
-    if proc.returncode != 0:
-        detail = proc.stderr.strip() or proc.stdout.strip() or "unknown error"
-        raise RuntimeError(f"Command failed: {' '.join(shlex.quote(p) for p in cmd)}\n{detail}")
-    return proc
 
 
 def _ensure_no_tailscale_name_conflicts(base_hostname: str = DEFAULT_TAILSCALE_HOSTNAME) -> None:
@@ -314,7 +308,6 @@ def provision(
         # Run cleanup workflow
         if not cleanup_module.run_cleanup_workflow(
             "pre-provision",
-            skip_snapshot=True,
             allow_delete_state=allow_delete_state_volume,
             echo=click.echo,
             confirm=click.confirm,
@@ -561,8 +554,9 @@ def sync_cline_auth(
     from edcloud import cline_sync
 
     source_secrets_path = Path(source_secrets).expanduser().resolve()
+    requested_global_state = include_global_state
     try:
-        _, include_global_state = cline_sync.validate_source(
+        include_global_state = cline_sync.validate_source(
             source_secrets_path, include_global_state
         )
     except FileNotFoundError as exc:
@@ -575,9 +569,8 @@ def sync_cline_auth(
     if include_global_state:
         source_global_state = source_secrets_path.with_name("globalState.json")
         click.echo(f"Source globalState: {source_global_state}")
-    elif Path(source_secrets).expanduser().resolve().with_name("globalState.json").exists():
-        pass  # already handled by validate_source
-    else:
+    elif requested_global_state:
+        # Requested but validate_source demoted it: the sibling file is missing.
         click.echo(
             "Warning: globalState.json not found next to secrets.json; "
             "continuing with secrets-only sync.",
@@ -819,7 +812,6 @@ def destroy(
         click.echo()
         cleanup_module.run_cleanup_workflow(
             "post-destroy",
-            skip_snapshot=True,
             allow_delete_state=allow_delete_state_volume,
             echo=click.echo,
             confirm=click.confirm,
@@ -838,7 +830,7 @@ def destroy(
 @click.option("--prune", is_flag=True, help="Delete all but the most recent snapshots.")
 @click.option(
     "--keep",
-    default=3,
+    default=DEFAULT_SNAPSHOT_KEEP_LAST,
     type=int,
     show_default=True,
     help="Number of most-recent snapshots to retain when pruning.",
@@ -905,7 +897,7 @@ def snapshot_cmd(
 )
 @click.option(
     "--gb-month-rate",
-    default=0.05,
+    default=SNAPSHOT_MONTHLY_RATE_PER_GB,
     type=float,
     show_default=True,
     help="Estimated USD per GB-month for snapshot storage.",

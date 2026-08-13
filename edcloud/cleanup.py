@@ -187,7 +187,6 @@ def _delete_volumes(
 
 def run_cleanup_workflow(
     phase: str,
-    skip_snapshot: bool = False,
     interactive: bool = True,
     allow_delete_state: bool = False,
     *,
@@ -201,7 +200,6 @@ def run_cleanup_workflow(
 
     Args:
         phase: Human-readable label (e.g. ``"pre-provision"``).
-        skip_snapshot: Unused -- reserved for future snapshot-before-cleanup.
         interactive: Prompt for confirmations when ``True``.
         allow_delete_state: Pass through to volume cleanup.
         echo: Callable for output messages.

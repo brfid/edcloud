@@ -19,3 +19,16 @@ def list_instances(ec2_client: Any, filters: list[dict[str, Any]]) -> list[dict[
     for reservation in resp.get("Reservations", []):
         instances.extend(reservation.get("Instances", []))
     return instances
+
+
+def default_vpc_id(ec2_client: Any) -> str:
+    """Return the account's default VPC ID.
+
+    Raises:
+        RuntimeError: If no default VPC exists.
+    """
+    resp = ec2_client.describe_vpcs(Filters=[{"Name": "is-default", "Values": ["true"]}])
+    vpcs = resp.get("Vpcs", [])
+    if not vpcs:
+        raise RuntimeError("No default VPC found. Create one or specify a VPC ID.")
+    return str(vpcs[0]["VpcId"])

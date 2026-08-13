@@ -12,6 +12,28 @@ from pathlib import Path
 
 _USER_DATA_PATH = Path(__file__).resolve().parent.parent / "cloud-init" / "user-data.yaml"
 
+# Render slots injected into the cloud-init template. These are the only names
+# ``render()`` substitutes.
+_RENDER_KEYS = (
+    "TAILSCALE_AUTH_KEY_SSM_PARAMETER",
+    "TAILSCALE_HOSTNAME",
+    "AWS_REGION",
+    "DOTFILES_REPO",
+    "DOTFILES_BRANCH",
+)
+
+
+class _UserDataTemplate(string.Template):
+    """``string.Template`` with a distinct ``@@`` delimiter.
+
+    The cloud-init template is mostly shell, which uses ``$VAR`` and ``${VAR}``
+    heavily. Using ``@@{KEY}`` for edcloud render slots means a shell variable
+    can never collide with (and be silently clobbered by) a render key, even if
+    a future maintainer introduces a shell variable named e.g. ``AWS_REGION``.
+    """
+
+    delimiter = "@@"
+
 
 def validate_inputs(
     tailscale_hostname: str,
@@ -87,11 +109,18 @@ def render(
 ) -> str:
     """Read the cloud-init template and interpolate runtime variables.
 
-    Uses ``string.Template`` for single-pass safe substitution to avoid
-    cascading replacement issues with naive ``str.replace`` chains.
+    Uses a distinct ``@@`` delimiter (see :class:`_UserDataTemplate`) for
+    single-pass substitution that cannot collide with the template's shell
+    ``$VAR`` / ``${VAR}`` usage. ``substitute`` (not ``safe_substitute``) is
+    intentional: an unknown ``@@{...}`` slot is a template bug and should fail
+    loudly at render time rather than boot with an empty value.
 
     Returns:
         Rendered user-data string ready for RunInstances.
+
+    Raises:
+        RuntimeError: If a render slot was left in the shell ``${KEY}`` form
+            (which would silently boot empty) instead of ``@@{KEY}``.
     """
     validate_inputs(
         tailscale_hostname=tailscale_hostname,
@@ -101,11 +130,18 @@ def render(
         dotfiles_branch=dotfiles_branch,
     )
     raw = _USER_DATA_PATH.read_text()
-    template = string.Template(raw)
-    return template.safe_substitute(
+    rendered = _UserDataTemplate(raw).substitute(
         TAILSCALE_AUTH_KEY_SSM_PARAMETER=tailscale_auth_key_ssm_parameter,
         TAILSCALE_HOSTNAME=tailscale_hostname,
         AWS_REGION=aws_region,
         DOTFILES_REPO=dotfiles_repo,
         DOTFILES_BRANCH=dotfiles_branch,
     )
+    stray = [key for key in _RENDER_KEYS if f"${{{key}}}" in rendered]
+    if stray:
+        raise RuntimeError(
+            "cloud-init template still contains shell-style placeholders for "
+            f"edcloud render keys: {', '.join(stray)}. "
+            "Use the @@{KEY} render syntax, not ${KEY}."
+        )
+    return rendered

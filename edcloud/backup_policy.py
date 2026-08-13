@@ -12,6 +12,7 @@ from edcloud.config import (
     STATE_VOLUME_ROLE,
     VOLUME_ROLE_TAG_KEY,
 )
+from edcloud.types import BackupPolicyResult
 
 
 def _dlm_client() -> Any:
@@ -105,7 +106,7 @@ def ensure_policy(
     weekly_keep: int = 1,
     monthly_keep: int = 1,
     enabled: bool = True,
-) -> dict[str, Any]:
+) -> BackupPolicyResult:
     """Create or update the managed DLM policy with tiered retention.
 
     Default retention keeps exactly one snapshot per tier:
