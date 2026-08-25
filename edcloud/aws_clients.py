@@ -1,7 +1,6 @@
-"""Shared boto3 session/client factories.
+"""Central boto3 session and client factories.
 
-Centralizes AWS client/resource creation so modules use a single, testable
-surface instead of calling ``boto3.client(...)`` directly everywhere.
+Modules use this testable surface instead of constructing clients directly.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ def aws_session() -> boto3.session.Session:
 
 
 def aws_region() -> str | None:
-    """Return configured AWS region from the shared session."""
+    """Return the region from a default-configured boto3 session."""
     return aws_session().region_name
 
 
@@ -27,20 +26,25 @@ def aws_client(service_name: str) -> Any:
 
 
 def ec2_client() -> Any:
+    """Return an EC2 client."""
     return aws_client("ec2")
 
 
 def ssm_client() -> Any:
+    """Return an SSM client."""
     return aws_client("ssm")
 
 
 def sts_client() -> Any:
+    """Return an STS client."""
     return aws_client("sts")
 
 
 def iam_client() -> Any:
+    """Return an IAM client."""
     return aws_client("iam")
 
 
 def dlm_client() -> Any:
+    """Return a DLM client."""
     return aws_client("dlm")

@@ -20,7 +20,7 @@ class VolumeInfo(TypedDict):
 
 
 class CostEstimate(TypedDict):
-    """Monthly cost estimate returned by ``ec2.status()``."""
+    """Compute and attached-EBS cost estimate returned by ``ec2.status()``."""
 
     compute_monthly: float
     storage_monthly: float
@@ -38,8 +38,8 @@ class OrphanedResources(TypedDict):
 class InstanceStatus(TypedDict, total=False):
     """Return type of ``ec2.status()``.
 
-    ``exists`` is always present. Other fields are present only when
-    ``exists is True``.
+    ``exists`` is always present. Instance fields are present when it is true;
+    ``orphaned_resources`` is present when it is false.
     """
 
     exists: bool
@@ -63,7 +63,7 @@ class ProvisionResult(TypedDict):
 
 
 class SnapshotInfo(TypedDict):
-    """Single snapshot summary returned by ``snapshot.list_snapshots()``."""
+    """Snapshot summary whose ``size_gb`` is source-volume capacity."""
 
     snapshot_id: str
     volume_id: str | None
@@ -86,7 +86,7 @@ class PruneResult(TypedDict):
 
 
 class RestoreDrillResult(TypedDict):
-    """Return type of ``snapshot.run_restore_drill()``."""
+    """Result of restoring a snapshot to a temporary EBS volume."""
 
     success: bool
     state_volume_id: str
@@ -111,7 +111,7 @@ class ResizeResult(TypedDict, total=False):
     public_ip: str
 
 
-class BackupPolicyResult(TypedDict, total=False):
+class BackupPolicyResult(TypedDict):
     """Return type of ``backup_policy.ensure_policy()``."""
 
     action: str
@@ -120,12 +120,10 @@ class BackupPolicyResult(TypedDict, total=False):
     daily_keep: int
     weekly_keep: int
     monthly_keep: int
-    exists: bool
-    policy_name: str
 
 
 class SnapshotCostReport(TypedDict):
-    """Return type of ``ops_health.estimate_snapshot_monthly_cost()``."""
+    """Capacity-based upper-bound proxy for EBS snapshot storage cost."""
 
     completed_snapshot_count: int
     completed_snapshot_gb: float
@@ -135,8 +133,6 @@ class SnapshotCostReport(TypedDict):
     over_soft_cap: bool
 
 
-# Re-export for convenience — modules can ``from edcloud.types import Any``
-# when they also need the escape hatch.
 __all__: list[str] = [
     "BackupPolicyResult",
     "CostEstimate",

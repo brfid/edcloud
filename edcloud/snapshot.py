@@ -154,10 +154,11 @@ def run_restore_drill(
     device_name: str = "/dev/sdg",
     keep_temporary_volume: bool = False,
 ) -> RestoreDrillResult:
-    """Run a non-destructive EBS restore drill.
+    """Verify that a state snapshot can create a temporary EBS volume.
 
     Creates a temporary volume from a state-volume snapshot. Optionally attaches
     it to a running instance, then detaches/deletes it unless explicitly kept.
+    The drill does not mount the filesystem or inspect restored files.
     """
     ec2 = get_ec2_client()
     state_volume = _find_single_state_volume(ec2)
@@ -268,12 +269,10 @@ def snapshot_and_prune(
     keep: int = DEFAULT_SNAPSHOT_KEEP_LAST,
     wait: bool = True,
 ) -> list[str]:
-    """Prune → snapshot → prune, enforcing a hard cap of *keep* snapshots.
+    """Prune, snapshot, and prune again to enforce ``keep`` on success.
 
-    The pre-prune heals drift from a previously failed post-prune.
-    The post-prune enforces the cap after the new snapshot is created.
-    Worst-case drift is +1 (snapshot succeeded, both prunes failed) — self-heals
-    on the next trigger.
+    The first prune heals drift from a previously failed final prune. The second
+    enforces the limit after creating the new snapshot.
 
     Args:
         description: Snapshot description.
@@ -305,7 +304,10 @@ def snapshot_and_prune(
 
 
 def create_snapshot(description: str | None = None) -> list[str]:
-    """Snapshot every EBS volume attached to the edcloud instance.
+    """Snapshot state-tagged volumes attached to the managed instance.
+
+    If no attached volume has a state role tag, the function snapshots every
+    attached volume as a recovery fallback.
 
     Args:
         description: Optional description; auto-generated if omitted.
@@ -371,8 +373,8 @@ def list_snapshots() -> list[SnapshotInfo]:
     """List all edcloud-managed snapshots, most recent first.
 
     Returns:
-        ``SnapshotInfo`` dicts (``snapshot_id``, ``volume_id``, ``size_gb``,
-        ``state``, ``progress``, ``start_time``, ``description``, ``name``).
+        Snapshot summaries. ``size_gb`` is the source volume's capacity, not
+        the snapshot's billed incremental storage.
     """
     ec2 = get_ec2_client()
     resp = ec2.describe_snapshots(
@@ -403,10 +405,10 @@ def prune_snapshots(
     keep_last: int = DEFAULT_SNAPSHOT_KEEP_LAST,
     dry_run: bool = True,
 ) -> PruneResult:
-    """Delete all but the most recent *keep_last* snapshots.
+    """Select old managed snapshots and optionally delete them.
 
-    Snapshots are ordered newest-first; the oldest beyond *keep_last* are
-    removed.  All snapshots are eligible regardless of description prefix.
+    Snapshots are ordered newest-first. The oldest beyond ``keep_last`` are
+    eligible regardless of description, source, or DLM backup-tier tags.
 
     Args:
         keep_last: Number of most-recent snapshots to retain.

@@ -6,7 +6,6 @@ SSM parameters (used to retrieve the Tailscale auth key at boot).
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 from typing import Any
@@ -131,8 +130,8 @@ def find_instance_profile() -> str | None:
 def ensure_instance_profile(tags: dict[str, str]) -> str:
     """Idempotently create the IAM role and instance profile for edcloud.
 
-    Steps: create role → attach inline SSM policy → create instance profile
-    → bind role to profile.  Each step is a no-op if the resource exists.
+    Creates missing resources, updates the inline SSM policy, and ensures that
+    the role is attached to the instance profile.
 
     Args:
         tags: AWS tags to apply to newly created IAM resources.
@@ -160,13 +159,12 @@ def ensure_instance_profile(tags: dict[str, str]) -> str:
 
     # 2. Attach inline policy
     policy_name = "edcloud-ssm-read"
-    with contextlib.suppress(ClientError):
-        # Policy may already exist; put is idempotent
-        iam.put_role_policy(
-            RoleName=INSTANCE_ROLE_NAME,
-            PolicyName=policy_name,
-            PolicyDocument=json.dumps(_ssm_read_policy()),
-        )
+    # ``put_role_policy`` creates or replaces the policy.
+    iam.put_role_policy(
+        RoleName=INSTANCE_ROLE_NAME,
+        PolicyName=policy_name,
+        PolicyDocument=json.dumps(_ssm_read_policy()),
+    )
 
     # 3. Create instance profile if needed
     try:

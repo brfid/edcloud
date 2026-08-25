@@ -111,14 +111,16 @@ def render(
 
     Uses a distinct ``@@`` delimiter (see :class:`_UserDataTemplate`) for
     single-pass substitution that cannot collide with the template's shell
-    ``$VAR`` / ``${VAR}`` usage. ``substitute`` (not ``safe_substitute``) is
-    intentional: an unknown ``@@{...}`` slot is a template bug and should fail
-    loudly at render time rather than boot with an empty value.
+    ``$VAR`` / ``${VAR}`` usage. Strict ``substitute`` is intentional: an
+    unknown ``@@{...}`` slot is a template bug and must fail at render time
+    instead of remaining unresolved in the bootstrap script.
 
     Returns:
         Rendered user-data string ready for RunInstances.
 
     Raises:
+        ValueError: If a template input is invalid.
+        KeyError: If the template contains an unknown render slot.
         RuntimeError: If a render slot was left in the shell ``${KEY}`` form
             (which would silently boot empty) instead of ``@@{KEY}``.
     """

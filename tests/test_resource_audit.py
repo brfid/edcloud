@@ -140,3 +140,5 @@ def test_audit_resources_detects_unanticipated_costs() -> None:
     assert "snapshot-over-retention" in categories
     assert "unattached-elastic-ip" in categories
     assert report.cost.unanticipated_monthly > 0
+    assert report.cost.total_monthly == report.cost.baseline_monthly
+    assert report.cost.unanticipated_monthly < report.cost.total_monthly

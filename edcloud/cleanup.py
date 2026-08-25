@@ -47,7 +47,7 @@ def cleanup_tailscale_devices(
     echo: Callable[[str], None] = _ECHO,
     confirm: Callable[[str], bool] = _CONFIRM,
 ) -> bool:
-    """Clean up offline edcloud Tailscale devices.
+    """Guide the operator through removing offline Tailscale devices.
 
     Args:
         interactive: If True, prompts user for confirmation.
@@ -55,7 +55,7 @@ def cleanup_tailscale_devices(
         confirm: Callable for yes/no confirmation prompts.
 
     Returns:
-        True if cleanup completed (or skipped), False if user aborted.
+        ``False`` only when the interactive operator aborts; otherwise ``True``.
     """
     count, message = tailscale.cleanup_offline_edcloud_devices()
     if count == 0:
@@ -90,7 +90,8 @@ def cleanup_orphaned_volumes(
         prompt_int: Callable for integer prompts ``(message, default) -> int``.
 
     Returns:
-        ``True`` if cleanup completed, ``False`` if the user aborted.
+        ``True`` if the operator keeps the volumes or all requested deletions
+        succeed; ``False`` if the operator aborts or a deletion fails.
     """
     ec2_client = _ec2_client()
     orphaned_volumes = list_managed_volumes(ec2_client, status="available")
@@ -106,7 +107,7 @@ def cleanup_orphaned_volumes(
         size = vol["Size"]
         vol_type = vol.get("VolumeType", "unknown")
         role = tag_value(vol.get("Tags", []), VOLUME_ROLE_TAG_KEY) or "unknown"
-        echo(f"  - {vol_id} ({size}GB {vol_type}, role={role})")
+        echo(f"  - {vol_id} ({size} GiB {vol_type}, role={role})")
 
     state_volumes = [v for v in orphaned_volumes if _is_state_volume(v)]
     unknown_role_volumes = [
@@ -174,7 +175,8 @@ def _delete_volumes(
     *,
     echo: Callable[[str], None] = _ECHO,
 ) -> bool:
-    """Delete a list of EBS volumes, logging each result."""
+    """Delete EBS volumes and return whether every deletion succeeded."""
+    success = True
     for vol in volumes:
         vol_id = vol["VolumeId"]
         try:
@@ -182,7 +184,8 @@ def _delete_volumes(
             echo(f"Deleted {vol_id}")
         except (ClientError, BotoCoreError) as e:
             echo(f"Failed to delete {vol_id}: {e}")
-    return True
+            success = False
+    return success
 
 
 def run_cleanup_workflow(
@@ -194,9 +197,10 @@ def run_cleanup_workflow(
     confirm: Callable[[str], bool] = _CONFIRM,
     prompt_int: Callable[[str, int], int] = _PROMPT_INT,
 ) -> bool:
-    """Run the full pre-provision or post-destroy cleanup workflow.
+    """Run Tailscale guidance and EBS cleanup before or after a lifecycle action.
 
-    Steps: Tailscale device cleanup -> orphaned volume cleanup.
+    Tailscale records require manual removal. Eligible EBS volumes can be
+    deleted by this workflow.
 
     Args:
         phase: Human-readable label (e.g. ``"pre-provision"``).
@@ -207,7 +211,8 @@ def run_cleanup_workflow(
         prompt_int: Callable for integer prompts.
 
     Returns:
-        ``True`` if the workflow completed, ``False`` if the user aborted.
+        ``True`` if the operator did not abort and requested deletions
+        succeeded; otherwise ``False``.
     """
     echo("=" * 70)
     echo(f"{phase.replace('-', ' ').title()} Cleanup")
@@ -216,7 +221,7 @@ def run_cleanup_workflow(
 
     # Cleanup Tailscale devices
     if not cleanup_tailscale_devices(interactive=interactive, echo=echo, confirm=confirm):
-        echo("Aborted.")
+        echo("Cleanup did not complete.")
         return False
 
     # Cleanup orphaned volumes
@@ -224,7 +229,7 @@ def run_cleanup_workflow(
     if not cleanup_orphaned_volumes(
         mode=mode, allow_delete_state=allow_delete_state, echo=echo, prompt_int=prompt_int
     ):
-        echo("Aborted.")
+        echo("Cleanup did not complete.")
         return False
 
     echo("")

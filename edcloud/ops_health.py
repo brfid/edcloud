@@ -14,10 +14,11 @@ def estimate_snapshot_monthly_cost(
     gb_month_rate: float = SNAPSHOT_MONTHLY_RATE_PER_GB,
     soft_cap_usd: float = 2.0,
 ) -> SnapshotCostReport:
-    """Estimate monthly EBS snapshot spend from snapshot list output.
+    """Calculate a conservative snapshot-storage cost proxy.
 
-    The estimate is intentionally simple and conservative for operator guardrails:
-    ``sum(completed snapshot size_gb) * gb_month_rate``.
+    The calculation is ``sum(source volume capacity) * gb_month_rate`` for
+    completed snapshots. EBS bills stored blocks and incremental changes, so
+    this is an upper-bound guardrail rather than an estimate of the AWS bill.
     """
     completed = [s for s in snapshots if str(s.get("state", "")).lower() == "completed"]
     total_gb = float(sum(int(s.get("size_gb", 0) or 0) for s in completed))

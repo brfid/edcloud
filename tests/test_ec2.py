@@ -100,6 +100,17 @@ class TestFindSecurityGroup:
         kwargs = mock_client.describe_security_groups.call_args.kwargs
         assert kwargs["Filters"] == [{"Name": "group-name", "Values": ["edcloud-sg"]}]
 
+    def test_propagates_discovery_client_error(self):
+        from botocore.exceptions import ClientError
+
+        mock_client = MagicMock()
+        mock_client.describe_security_groups.side_effect = ClientError(
+            {"Error": {"Code": "UnauthorizedOperation"}}, "DescribeSecurityGroups"
+        )
+
+        with pytest.raises(ClientError, match="UnauthorizedOperation"):
+            find_security_group(mock_client)
+
     def test_raises_on_untagged_group(self):
         mock_client = MagicMock()
         mock_client.describe_security_groups.return_value = {
@@ -247,14 +258,10 @@ class TestInputValidation:
         from edcloud.user_data import validate_inputs
 
         with pytest.raises(ValueError, match="Invalid dotfiles_repo"):
-            validate_inputs(
-                "edcloud", dotfiles_repo="https://gitlab.com/example/dotfiles"
-            )
+            validate_inputs("edcloud", dotfiles_repo="https://gitlab.com/example/dotfiles")
 
         with pytest.raises(ValueError, match="Invalid dotfiles_repo"):
-            validate_inputs(
-                "edcloud", dotfiles_repo="https://github.com/example/dotfiles"
-            )
+            validate_inputs("edcloud", dotfiles_repo="https://github.com/example/dotfiles")
 
     def test_valid_dotfiles_branch_values_pass(self):
         from edcloud.user_data import validate_inputs

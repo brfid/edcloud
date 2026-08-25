@@ -170,7 +170,7 @@ def required_actions(selected: tuple[str, ...]) -> list[str]:
 
 
 def policy_document(selected: tuple[str, ...]) -> dict[str, Any]:
-    """Build a practical least-privilege IAM policy document for operator usage."""
+    """Build the operator IAM policy for the selected command profiles."""
     selected_actions = set(required_actions(selected))
 
     ec2_actions = sorted(a for a in selected_actions if a.startswith("ec2:"))

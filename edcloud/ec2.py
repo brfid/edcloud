@@ -61,14 +61,16 @@ log = logging.getLogger(__name__)
 
 
 def get_ec2_client() -> Any:
-    """Return a low-level EC2 client (public API)."""
+    """Return a low-level EC2 client."""
     return _ec2_client()
 
 
 def find_instance(client: Any) -> dict[str, Any] | None:
-    """Locate the managed instance (public API).
+    """Return the managed instance, or ``None`` when none exists.
 
-    Delegates to the internal ``_find_instance`` helper.
+    Raises:
+        TagDriftError: If discovery finds duplicate instances or invalid volume
+            tags.
     """
     return _find_instance(client)
 
@@ -228,7 +230,7 @@ def _default_subnet_for_az(client: Any, az: str) -> str:
     if not subnets:
         raise RuntimeError(
             f"No default subnet found in AZ {az}. "
-            "Create/enable a default subnet in this AZ or choose a state volume in a supported AZ."
+            "Create or enable one there; the reused state volume fixes the instance AZ."
         )
     return str(subnets[0]["SubnetId"])
 
@@ -322,7 +324,7 @@ def provision(
     cfg: InstanceConfig,
     require_existing_state_volume: bool = False,
 ) -> ProvisionResult:
-    """Create the edcloud instance from scratch.
+    """Provision an instance and reuse a managed state volume when available.
 
     The Tailscale auth key is fetched from SSM at boot time by the instance
     itself.
@@ -330,7 +332,8 @@ def provision(
     Args:
         cfg: Resolved instance configuration.
         require_existing_state_volume: If ``True``, abort when no reusable
-            managed state volume is available.
+            managed state volume is available. If ``False``, create a state
+            volume only when none is available.
 
     Returns:
         Dict with keys ``instance_id``, ``security_group_id``, ``public_ip``.
@@ -386,7 +389,7 @@ def provision(
         cfg.tailscale_auth_key_ssm_parameter,
     )
 
-    # 3.5 Prefer reusing existing managed state volume when available ----------
+    # 5. Prefer reusing an existing managed state volume ------------------------
     reused_state_volume_id = _find_orphaned_state_volume_id(ec2)
 
     if require_existing_state_volume and not reused_state_volume_id:
@@ -414,7 +417,7 @@ def provision(
         log.info("  No reusable managed state volume found; creating new state volume.")
         subnet_id = None
 
-    # 4. Launch instance -------------------------------------------------------
+    # 6. Launch instance -------------------------------------------------------
     # IAM instance profile creation can be eventually consistent. Retry launch
     # briefly when AWS returns transient invalid-profile errors.
     run_kwargs: dict[str, Any] = {
@@ -447,7 +450,7 @@ def provision(
                 "Tags": [{"Key": k, "Value": v} for k, v in cfg.tags.items()],
             },
         ],
-        # No key pair — SSH access is via Tailscale + instance connect or SSM
+        # No EC2 key pair; SSH access uses the Tailscale network.
         "MetadataOptions": {
             "HttpTokens": "required",  # IMDSv2 only
             "HttpEndpoint": "enabled",
@@ -526,7 +529,7 @@ def provision(
                 f"Failed to attach reused state volume {reused_state_volume_id} to {instance_id}."
             )
 
-    # 5. Wait for running ------------------------------------------------------
+    # 7. Wait for running ------------------------------------------------------
     log.info("  Waiting for instance to reach 'running' state...")
     waiter = ec2.get_waiter("instance_running")
     waiter.wait(InstanceIds=[instance_id], WaiterConfig={"Delay": 15, "MaxAttempts": 40})
@@ -559,7 +562,9 @@ def provision(
     log.info("  Instance running. Public IP: %s", public_ip)
     log.info("  Tailscale hostname will be: %s", cfg.tailscale_hostname)
     log.info("  Cloud-init is installing Docker, Tailscale, and Portainer.")
-    log.info("  This takes 2-3 minutes. Run 'edc status' to check progress.")
+    log.info("  This usually takes several minutes.")
+    log.info("  Repeat 'edc status' until it reports 'Reachable: yes'.")
+    log.info("  Then run: edc ssh 'cloud-init status --wait'")
 
     return ProvisionResult(
         instance_id=str(instance_id),
@@ -569,13 +574,13 @@ def provision(
 
 
 def start() -> str:
-    """Start a stopped edcloud instance.
+    """Ensure that the managed instance is running.
 
     Returns:
         The instance ID.
 
     Raises:
-        RuntimeError: If no instance exists or it isn't in ``stopped`` state.
+        RuntimeError: If no instance exists or it is in a transitional state.
         TagDriftError: If orphaned managed resources are found instead.
     """
     ec2 = _ec2_client()
@@ -612,13 +617,13 @@ def start() -> str:
 
 
 def stop() -> str:
-    """Stop a running edcloud instance.
+    """Ensure that the managed instance is stopped.
 
     Returns:
         The instance ID.
 
     Raises:
-        RuntimeError: If no instance exists or it isn't in ``running`` state.
+        RuntimeError: If no instance exists or it is in a transitional state.
         TagDriftError: If orphaned managed resources are found instead.
     """
     ec2 = _ec2_client()
@@ -647,7 +652,7 @@ def stop() -> str:
 
 
 def status() -> InstanceStatus:
-    """Return current instance status.
+    """Return instance status and a compute-plus-attached-EBS cost estimate.
 
     Returns:
         Dict with at least ``exists: bool``.  When the instance exists the
@@ -714,14 +719,14 @@ def status() -> InstanceStatus:
             compute_monthly=round(compute_monthly, 2),
             storage_monthly=round(storage_monthly, 2),
             total_monthly=round(total_monthly, 2),
-            note=f"Assumes {DEFAULT_HOURS_PER_DAY}hrs/day runtime",
+            note=f"Assumes {DEFAULT_HOURS_PER_DAY} hours/day runtime",
         ),
     )
     return result
 
 
 def destroy() -> None:
-    """Terminate the edcloud instance and clean up its security group and IAM.
+    """Terminate the instance and attempt security-group and IAM cleanup.
 
     The root EBS volume is deleted automatically on termination
     (``DeleteOnTermination=True``).  The state volume survives and is
@@ -760,10 +765,10 @@ def destroy() -> None:
     for v in surviving:
         role = tag_value(v.get("Tags", []), VOLUME_ROLE_TAG_KEY) or "unknown"
         if role == STATE_VOLUME_ROLE:
-            log.info("State volume preserved: %s  %sGB", v["VolumeId"], v["Size"])
+            log.info("State volume preserved: %s  %s GiB", v["VolumeId"], v["Size"])
         else:
             log.warning(
-                "Unexpected orphaned volume: %s  %sGB  role=%s (delete manually or run cleanup)",
+                "Unexpected orphaned volume: %s  %s GiB  role=%s (delete manually or run cleanup)",
                 v["VolumeId"],
                 v["Size"],
                 role,
@@ -775,18 +780,21 @@ def resize(
     volume_size_gb: int | None = None,
     state_volume_size_gb: int | None = None,
 ) -> ResizeResult:
-    """Resize the edcloud instance type and/or EBS volumes in place.
+    """Change the instance type or request EBS volume expansion.
 
     Instance type change requires a stop → modify → start cycle.
-    Volume size changes (expand only) are applied online without a restart.
+    Volume expansion is requested online without a restart, but the operator
+    must grow the partition or filesystem after AWS completes the modification.
 
     Args:
         instance_type: New EC2 instance type (e.g. ``"t3a.medium"``).
-        volume_size_gb: New root volume size in GiB (must be >= current size).
-        state_volume_size_gb: New state volume size in GiB (must be >= current size).
+        volume_size_gb: Requested root volume size in GiB. Values less than or
+            equal to the current size are ignored.
+        state_volume_size_gb: Requested state volume size in GiB. Values less
+            than or equal to the current size are ignored.
 
     Returns:
-        Dict summarising the changes applied.
+        Dict summarizing the changes requested or applied.
 
     Raises:
         RuntimeError: If no managed instance exists or an operation fails.
@@ -827,14 +835,14 @@ def resize(
             if dev == "/dev/sda1" and volume_size_gb is not None:
                 if volume_size_gb <= current_size:
                     log.info(
-                        "  Root volume %s: requested %dGB <= current %dGB — skipping.",
+                        "  Root volume %s: requested %d GiB <= current %d GiB — skipping.",
                         vol_id,
                         volume_size_gb,
                         current_size,
                     )
                 else:
                     log.info(
-                        "  Expanding root volume %s: %dGB → %dGB",
+                        "  Expanding root volume %s: %d GiB → %d GiB",
                         vol_id,
                         current_size,
                         volume_size_gb,
@@ -846,22 +854,22 @@ def resize(
                         "    Volume modification initiated (async). May take several minutes.\n"
                         "    Poll: aws ec2 describe-volumes-modifications --volume-ids %s\n"
                         "    After completion, find device with: lsblk\n"
-                        "      Root volume (partitioned): "
-                        "sudo growpart <dev> 1 && sudo resize2fs <dev>p1",
+                        "      Set DEVICE to the root block device, then run: "
+                        'sudo growpart "$DEVICE" 1 && sudo resize2fs "${DEVICE}p1"',
                         vol_id,
                     )
 
             elif role == STATE_VOLUME_ROLE and state_volume_size_gb is not None:
                 if state_volume_size_gb <= current_size:
                     log.info(
-                        "  State volume %s: requested %dGB <= current %dGB — skipping.",
+                        "  State volume %s: requested %d GiB <= current %d GiB — skipping.",
                         vol_id,
                         state_volume_size_gb,
                         current_size,
                     )
                 else:
                     log.info(
-                        "  Expanding state volume %s: %dGB → %dGB",
+                        "  Expanding state volume %s: %d GiB → %d GiB",
                         vol_id,
                         current_size,
                         state_volume_size_gb,
@@ -873,7 +881,8 @@ def resize(
                         "    Volume modification initiated (async). May take several minutes.\n"
                         "    Poll: aws ec2 describe-volumes-modifications --volume-ids %s\n"
                         "    After completion, find device with: lsblk\n"
-                        "      State volume (no partition): sudo resize2fs <dev>",
+                        "      Set DEVICE to the state block device, then run: "
+                        'sudo resize2fs "$DEVICE"',
                         vol_id,
                     )
 

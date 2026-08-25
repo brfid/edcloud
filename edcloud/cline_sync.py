@@ -1,8 +1,4 @@
-"""Cline OAuth secret synchronization to remote hosts.
-
-Handles backup-then-replace semantics for syncing Cline auth files
-from a local operator machine to a remote edcloud instance over SSH.
-"""
+"""Back up and replace Cline OAuth files on a remote host over SSH."""
 
 from __future__ import annotations
 
@@ -93,16 +89,24 @@ def sync_files(
     _run_checked(["ssh", *ssh_opts, remote, backup_script])
 
     # Upload
-    _run_checked([
-        "scp", *ssh_opts, str(source_secrets_path),
-        f"{remote}:~/{remote_config_dir}/secrets.json.new",
-    ])
+    _run_checked(
+        [
+            "scp",
+            *ssh_opts,
+            str(source_secrets_path),
+            f"{remote}:~/{remote_config_dir}/secrets.json.new",
+        ]
+    )
     if include_global_state:
         source_global_state = source_secrets_path.with_name("globalState.json")
-        _run_checked([
-            "scp", *ssh_opts, str(source_global_state),
-            f"{remote}:~/{remote_config_dir}/globalState.json.new",
-        ])
+        _run_checked(
+            [
+                "scp",
+                *ssh_opts,
+                str(source_global_state),
+                f"{remote}:~/{remote_config_dir}/globalState.json.new",
+            ]
+        )
 
     # Install
     install_script = (

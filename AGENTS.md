@@ -1,134 +1,72 @@
-# Agent notes (repo workflow)
+# Agent notes
 
 ## Mission
 
-Build and operate a single-instance AWS EC2 personal cloud lab (`edcloud`) accessed via Tailscale, with Portainer for container management.
+Preserve edcloud as an accurate historical artifact. Prefer small correctness, security, and documentation fixes. Do not restart feature development unless the user explicitly requests it.
 
-Priorities:
-
-- Keep infrastructure simple and cost-aware.
-- Keep access model Tailscale-only.
-- Keep operations feasible from low-power ARM operator nodes.
-
-## Start-here order
+## Read first
 
 1. `README.md`
-2. `CHANGELOG.md` (`[Unreleased]` first)
+2. `docs/ARCHITECTURE.md`
 3. `SECURITY.md`
 4. `RUNBOOK.md`
-5. `docs/ARCHITECTURE.md`
-6. `edcloud/` package code
+5. `CHANGELOG.md`
+6. `edcloud/` and `tests/`
 
-## Source of truth
+## Sources of truth
 
-- Current mutable status / active queue: `CHANGELOG.md` under `[Unreleased]`
-- AWS resources: tag-based discovery via `edcloud:managed=true`
-- Runtime secrets: AWS SSM Parameter Store
-- Config defaults: `edcloud/config.py`
-- Bootstrap baseline: `cloud-init/user-data.yaml`
-- Tests: `tests/`
-- Operator runbook and backup policy: `RUNBOOK.md`
+- AWS resource ownership: the `edcloud:managed=true` tag and tag-based discovery.
+- Runtime defaults and tags: `edcloud/config.py`.
+- Bootstrap behavior: `cloud-init/user-data.yaml`.
+- CLI behavior and help: `edcloud/cli.py`.
+- Operator procedures: `RUNBOOK.md`.
+- Historical changes: `CHANGELOG.md` and Git history.
 
-## Dotfiles relink
+When documentation and code disagree, verify the behavior in code and tests before changing the documentation.
 
-On a running edcloud host, do not use a helper script.
+## Safety guardrails
 
-- Read `~/src/dotfiles/README.md`.
-- Link the edcloud profile directly.
-- Do not assume `~/src/dotfiles/install.sh` exists.
-- Do not create links to paths that do not exist.
+- Preserve the Tailscale-only access model. Newly created security groups must have no inbound rules.
+- Do not remove or weaken the `edcloud:managed=true` or `edcloud:volume-role` tags.
+- Do not hardcode credentials, tokens, personal data, or live AWS resource identifiers.
+- Keep bootstrap secrets in SSM Parameter Store and local credentials in restricted, untracked files.
+- Treat state volumes and snapshots as data-bearing resources. Do not delete them without explicit authorization and exact target verification.
+- Keep the host baseline reproducible in `cloud-init/user-data.yaml`.
 
-## Changelog memory model
+On a running host, dotfiles are cloned but not applied. Read `~/src/dotfiles/README.md`, create only links whose targets exist, and do not assume an `install.sh` helper exists.
 
-Use `CHANGELOG.md` as agent working memory.
+## Git workflow
 
-- `## [Unreleased]` must keep these subcategories in order:
-  1. `Current State`
-  2. `Active Priorities`
-  3. `In Progress`
-  4. `Blocked`
-  5. `Decisions Needed`
-  6. `Recently Completed`
-- Keep every subcategory present; if empty, use `- None.`.
-- Dated entries (`## [YYYY-MM-DD]`) should use standard Keep a Changelog categories.
-
-## Task source
-
-Primary TODO list: `CHANGELOG.md` under `[Unreleased]` → `Active Priorities`.
-
-Secondary procedural backlog: `RUNBOOK.md` checklists.
-
-Optional TODO scan:
-
-```bash
-grep -RInE "TODO|FIXME|TBD|\[ \]" README.md CHANGELOG.md RUNBOOK.md AGENTS.md docs/ARCHITECTURE.md edcloud tests cloud-init compose
-```
-
-## Constraints
-
-### Git discipline (LLM + operator)
-
-- Default: do not commit directly to `main`.
-- Exception (personal repos only): direct commits/pushes to `main` are allowed for
-  small, low-risk changes when the user explicitly requests it in the current task.
-  If there is any uncertainty or elevated risk, use task branch + PR.
 - Create one task branch per change: `agent/<topic>-YYYYMMDD`.
-- Local WIP commits are allowed, but do not push noisy history (`wip`, `fix typo`,
-  machine-specific checkpoints).
-- Before pushing, clean branch history:
-  - Prefer `git commit --fixup <sha>` during iteration.
-  - Then run `git rebase -i --autosquash origin/main`.
-- Keep `main` linear and reviewable:
-  - Prefer PR + squash merge.
-  - Do not merge with merge commits into `main`.
-- Assume GitHub enforces `main` protections:
-  - pull-request-only updates to `main` (no direct pushes),
-  - linear history required,
-  - squash merge enabled,
-  - merge commits and rebase merges disabled,
-  - force-push/delete disabled for `main`.
-- If branch protection rejects a direct push, switch to task-branch + PR workflow
-  rather than retrying direct writes to `main`.
-- History rewrite safety rules:
-  - Do not rebase/rewrite shared published branches.
-  - For intentional rewrite windows, create a backup tag/branch + bundle first,
-    then push with `--force-with-lease`.
+- Do not commit directly to `main` unless the user explicitly requests a small, low-risk direct commit.
+- Prefer a squash-merged pull request and keep `main` linear.
+- Do not rewrite published branches. For an intentional rewrite, create a backup branch or tag and a bundle before using `--force-with-lease`.
+- Preserve unrelated working-tree changes.
 
-### Python environment
+## Python environment
 
-- Use repo-local `.venv/` for Python commands.
-- Do not install global/system packages.
-- Manage dependencies via `pyproject.toml`.
+- Use the repository-local `.venv/` for Python commands.
+- Manage dependencies through `pyproject.toml`; do not install project tools globally.
+- Preserve documented interfaces unless a behavior is unsafe or nonfunctional.
 
-### Documentation policy
+## Documentation
 
-- Do not create new markdown files unless explicitly requested.
-- Update existing docs instead (`README.md`, `CHANGELOG.md`, `SECURITY.md`, `RUNBOOK.md`, `docs/ARCHITECTURE.md`, `AGENTS.md`).
-- Use CommonMark-compatible formatting.
+- Update existing Markdown files instead of creating new ones unless the user requests a new document.
+- Use CommonMark-compatible Markdown and soft-wrap prose with one source line per paragraph or list item.
+- Follow the Google developer documentation style guide: use direct language, active voice, sentence-case headings, descriptive links, and code formatting for commands, filenames, and identifiers.
+- Prefer current commands and generated help over duplicated static reference lists.
+- Preserve historical claims only when Git history supports them.
 
-### Operational guardrails
+## Validation
 
-- Do not remove `edcloud:managed=true` tags.
-- Do not hardcode credentials, tokens, or resource IDs.
-- Preserve Tailscale-only access model (no inbound security group rules).
-- Keep baseline host config reproducible in `cloud-init/user-data.yaml`.
-- Keep snapshot and restore-drill guidance current.
-- Backward compatibility is not a default goal; prefer clean, architecturally sound
-  breaking changes unless backward compatibility is explicitly requested.
-
-### Validation commands
-
-Run when requested:
+Run the checks appropriate to the change from the repository virtual environment:
 
 ```bash
 pytest -q
 ruff check .
+ruff format --check edcloud tests
 mypy edcloud/
 pre-commit run --all-files
 ```
 
-## Output expectations for implementation tasks
-
-- Summarize changes by file path.
-- State validation performed (or explicitly state none).
-- Do not add summary docs unless requested.
+Summarize changed files and validation results. Do not create a separate summary document.

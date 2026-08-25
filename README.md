@@ -1,191 +1,123 @@
 # edcloud
 
-Single-instance AWS EC2 personal cloud lab for x86_64 Linux workloads.
+edcloud is a single-instance AWS EC2 personal cloud lab for x86_64 Linux workloads.
 
-## Overview
+This repository is preserved for historical reference and is not actively maintained.
 
-A practical reliability/cost/security lab — not a production platform.
+## What it does
 
-- **Scope:** repeatable single-host lifecycle (`provision`, `reprovision`, `verify`), Tailscale-only access, snapshot/restore drill workflows.
-- **Constraints:** single operator, single instance, low monthly spend, no public inbound network exposure.
-- **Tradeoffs:** operational simplicity and clear guardrails over multi-node scale and deep automation complexity.
-- **Current focus:** continued thin-CLI extraction, restore-drill discipline, documentation clarity.
+- Provisions, verifies, resizes, snapshots, reprovisions, and destroys one Ubuntu EC2 instance through the `edc` CLI.
+- Creates the EC2 security group without inbound rules; operator access uses Tailscale.
+- Discovers managed AWS resources by the `edcloud:managed=true` tag instead of a local state file.
+- Keeps `/home/ubuntu`, Tailscale identity, Docker data, compose files, and Portainer data on a persistent state volume.
+- Stores bootstrap secrets in AWS Systems Manager Parameter Store.
 
-```bash
-edc verify
-edc restore-drill --attach-managed-instance
-edc snapshot-cost --soft-cap-usd 2.0
-```
-
-Safe rebuild sequence:
-
-```bash
-edc tailscale reconcile --dry-run
-edc snapshot -d pre-change
-edc reprovision --confirm-instance-id <instance-id>
-edc verify
-```
-
-## Operator model
-
-edcloud is designed to be operated from a lightweight terminal device (including
-small ARM/Linux nodes) using AWS + CLI tooling, not primarily from the AWS
-Console.
-
-- Primary path: `edc` + AWS CLI + Python + Tailscale from an operator device.
-- AWS Console path: inspection and break-glass/manual fallback.
-- Recurring lifecycle workflows (provision, verify, snapshot, reprovision,
-  cleanup) should stay CLI-driven for repeatability and safety guardrails.
-
-## Repository workflow
-
-- `main` is the working branch; changes land directly on `main`.
-- Secrets and PII are guarded before they can reach the remote: `gitleaks`
-  runs as a pre-commit hook and in CI (`.github/workflows/secret-scan.yml`,
-  full history), `detect-secrets` checks against `.secrets.baseline`, and
-  `.gitignore` excludes operator-local auth material (Tailscale keys, rclone
-  and Cline config, `.env`).
-- Install the hooks once: `pip install pre-commit && pre-commit install`.
-
-## Public collaboration expectations
-
-**Core design:**
-
-- Tailscale-only access (zero inbound rules)
-- Tag-based resource discovery (no state files)
-- Persistent home on state volume
-- Persistent Tailscale node identity on state volume
-- Portainer for container management
+It is not a production or multi-tenant platform.
 
 ## Quick start
 
-```bash
-# Prerequisites: AWS CLI, Python 3.10+, Tailscale account
+Running `edc provision` creates billable AWS resources. You need AWS CLI credentials and a region configured for an account with a default VPC and subnet, a local Tailscale client signed into the target tailnet, Git, and Python 3.10 or later.
 
-git clone <repo> && cd edcloud
-python3 -m venv .venv && source .venv/bin/activate
+```bash
+git clone https://github.com/brfid/edcloud.git
+cd edcloud
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e '.[dev]'
-
-# Store Tailscale key in SSM
-aws ssm put-parameter --name /edcloud/tailscale_auth_key \
-  --type SecureString --value '<TAILSCALE_AUTH_KEY>'
-
-# Provision
-edc provision
 ```
 
-ARM/Linux operator note:
-
-- Prefer running from the repo-local virtualenv (`.venv`) to keep tooling reproducible.
-- Use either `source .venv/bin/activate` or invoke commands directly as `.venv/bin/edc ...`.
-
-## Commands
+Store a Tailscale auth key in Parameter Store:
 
 ```bash
-edc tailscale reconcile --dry-run   # Detect edcloud naming conflicts before lifecycle actions
-edc provision [--cleanup]  # Create instance (requires existing state volume by default)
-edc up/down                          # Start/stop instance (up also fail-fast on naming conflicts)
-edc ssh [command]                    # SSH via Tailscale
-edc status                   # Instance state, IPs, cost estimate
-edc setup-ssm-tokens         # Store GitHub/Tailscale tokens in SSM
-edc permissions show         # Show required IAM actions by command profile
-edc permissions policy       # Emit operator least-privilege IAM policy JSON
-edc permissions verify       # Preflight-check your current AWS principal permissions
-edc sync-cline-auth          # Sync Cline OAuth secrets to headless remote host
-edc sync-cline-auth --remote-diagnostics  # Print remote Cline path/version + config target
-edc verify                   # Bootstrap validation
-edc backup-policy status     # Show AWS DLM backup policy status
-edc backup-policy apply      # Ensure DLM policy (daily 7 + weekly 4 + monthly 2)
-edc backup-policy disable    # Disable managed DLM policy
-edc snapshot [-d desc]       # Create snapshot (state volume only)
-edc snapshot --list          # List snapshots
-edc snapshot --prune [--keep N] [--apply]  # Optional manual cleanup for ad-hoc snapshots
-edc snapshot-cost [--soft-cap-usd 2.0] [--fail-on-cap]  # Snapshot spend guardrail signal
-edc restore-drill [--attach-managed-instance]  # Run non-destructive restore drill with temp volume
-edc destroy --confirm-instance-id ID  # Terminate instance (snapshot + cleanup run by default)
+aws ssm put-parameter \
+  --name /edcloud/tailscale_auth_key \
+  --type SecureString \
+  --value '<TAILSCALE_AUTH_KEY>'
 ```
 
-Use `--allow-tailscale-name-conflicts` only for break-glass cases.
-
-Auth-sync diagnostics note:
-
-- `--remote-diagnostics` is provided by `edc sync-cline-auth`.
-- It is **not** a flag on `cline auth`.
-
-Safe rebuild golden path:
+For the first deployment, allow edcloud to create a state volume:
 
 ```bash
-edc tailscale reconcile --dry-run
-edc snapshot -d pre-change-rebuild
-edc reprovision --confirm-instance-id <instance-id>
+edc provision --allow-new-state-volume
+edc status  # Repeat until Reachable: yes.
+edc ssh 'cloud-init status --wait'
 edc verify
 ```
 
-See `RUNBOOK.md` section **"Canonical safe rebuild workflow (golden path)"** for details and expected outcomes.
+Later provisions require an existing managed state volume by default. Use `--allow-new-state-volume` again only when you intend to create a replacement state volume.
 
-**Destroy defaults:** Auto-snapshot and cleanup (Tailscale devices + orphaned volumes) both run by default. Opt-out: `--skip-snapshot`, `--skip-cleanup`.
+## Common workflows
 
-**Backup defaults:** AWS DLM is the native retention engine. Recommended baseline:
-`edc backup-policy apply` (daily keep 7 + weekly keep 4 + monthly keep 2 ≈ dense recent points plus ~1 and ~2 month recovery points).
+Start, connect to, and stop the instance:
 
-Volume safety guardrails:
+```bash
+edc up
+edc status
+edc ssh
+edc down
+```
 
-- Managed volumes are role-tagged with `edcloud:volume-role` (`root` or `state`).
-- Cleanup protects `state` and unknown-role volumes by default.
-- To allow full deletion during cleanup, use `--allow-delete-state-volume`.
-- Provision now **requires** reusing an existing managed state volume by default.
-- To allow creating a fresh state volume (break-glass/new setup), use `--allow-new-state-volume`.
+Use the safe rebuild sequence for disruptive host changes:
 
-LazyVim compatibility:
+```bash
+INSTANCE_ID=i-0123456789abcdef0
+edc tailscale reconcile
+edc reprovision --confirm-instance-id "$INSTANCE_ID"
+edc status  # Repeat until Reachable: yes.
+edc ssh 'cloud-init status --wait'
+edc verify
+```
 
-- Cloud-init installs Neovim `v0.11.3` from upstream release tarball so LazyVim's `>= 0.11.2` requirement is met on new builds.
+Manage and test backups:
+
+```bash
+edc snapshot --list
+edc snapshot-cost --soft-cap-usd 2.0
+edc restore-drill --attach-managed-instance
+```
+
+The CLI-managed queue is the primary snapshot retention mechanism. AWS Data Lifecycle Manager (DLM) support is available for experimentation, but its snapshots share the CLI's managed tag and are eligible for CLI pruning. Do not rely on both retention models at the same time without changing the tagging or pruning behavior.
+
+Run `edc --help` or `edc <COMMAND> --help` for the complete command reference. Use `--allow-tailscale-name-conflicts` only for recovery when you have reviewed the reported naming conflict.
 
 ## Architecture
 
-**Compute:** t3a.small, Ubuntu 24.04, Tailscale SSH only
-**Storage:** 16GB root (disposable), 20GB state at `/opt/edcloud/state` (persistent)
-**Discovery:** Tag `edcloud:managed=true` on all resources
-**Secrets:** AWS SSM Parameter Store (`/edcloud/*` namespace, read by instance IAM role at boot)
-**Bootstrap secrets consumed automatically at cloud-init:**
+- **Compute:** `t3a.small` instance running Ubuntu 24.04 by default.
+- **Network:** Tailscale access only; no inbound security group rules.
+- **Storage:** 30 GiB disposable root volume and 30 GiB persistent state volume at `/opt/edcloud/state` by default.
+- **Discovery:** `edcloud:managed=true` tag on managed resources.
+- **Secrets:** Parameter Store under `/edcloud/*`, read by the instance role at boot.
+- **Bootstrap:** `cloud-init/user-data.yaml` defines Docker, Portainer, development tools, persistent mounts, and the idle-shutdown timer.
 
-- `/edcloud/tailscale_auth_key` — Tailscale join key (required)
-- `/edcloud/github_token` — GitHub CLI auth (optional)
-- `/edcloud/rclone_config` — rclone config with Dropbox OAuth token; mounts `~/Dropbox` via FUSE on every build (optional)
+Cloud-init reads these parameters when present:
 
-**Baseline:** Docker, Portainer, Node.js, Python, and dev tooling are defined in `cloud-init/user-data.yaml`.
+- `/edcloud/tailscale_auth_key`: joins the tailnet; required.
+- `/edcloud/github_token`: authenticates the GitHub CLI; optional.
+- `/edcloud/rclone_config`: mounts `~/Dropbox` through rclone; optional.
 
-Bootstrap repo sync:
+Cloud-init can clone dotfiles and selected non-secret repositories. It does not apply the dotfiles. After a rebuild, follow the dotfiles repository's instructions to link them.
 
-- Cloud-init clones non-secret repos but does not apply them. Dotfiles are
-  declarative (per-folder `README.md` with `Live paths:` maps); apply
-  post-rebuild manually or via an LLM CLI on the host.
-- Dotfiles clone target is configurable: `--dotfiles-repo` /
-  `EDCLOUD_DOTFILES_REPO` (`auto` default = `https://github.com/<gh-user>/dotfiles.git`
-  via `gh auth`, falling back to the existing origin on persisted home),
-  `--dotfiles-branch` / `EDCLOUD_DOTFILES_BRANCH` (`main` default).
-- Additional repos sync from the `gh`-authenticated user namespace:
-  `bin`, `llm-config`, `oldspeak` under `~/src/`.
+Automatic CLI lifecycle triggers snapshot the state volume and prune the managed pool to retain three snapshots. Manual snapshots remain until an explicit or later automatic prune places them beyond the limit.
 
-For local MCP usage on edcloud, cloud-init also installs best-effort wrappers:
+## Cost controls
 
-- `~/.local/bin/oldspeak-mcp-stdio` (recommended for Cline/Claude Code on-host)
-- `~/.local/bin/oldspeak-mcp-http [port]` (localhost HTTP transport, optional)
+The instance shuts down after 30 minutes without Tailscale connections or meaningful CPU load. `edc status` estimates compute and storage cost from the rates and assumption of eight runtime hours per day in `edcloud/config.py`; use AWS Cost Explorer for actual charges. `edc snapshot-cost` provides a capacity-based snapshot cost proxy.
 
-For full technical detail, see:
+## Validate the project
 
-- `RUNBOOK.md` for durable host baseline, rebuild workflow, backup/restore operations, and operator procedures.
-- `docs/ARCHITECTURE.md` for code/module boundaries and architecture decisions.
+```bash
+pytest -q
+ruff check .
+mypy edcloud/
+```
 
-## Cost
+## Documentation
 
-4hr/day usage: ~$2.26 compute + ~$2.88 storage + ~$1.00 snapshots ≈ **~$6–7/month**
-Auto-shutdown after 30min idle.
+- [Operator runbook](RUNBOOK.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Security model](SECURITY.md)
+- [Project history](CHANGELOG.md)
+- [Agent workflow](AGENTS.md)
+- [Script replacements](scripts/README.md)
 
-## Docs
-
-- **Cold-start sequence (recommended):** `README.md` → `CHANGELOG.md` (`[Unreleased]`) → `SECURITY.md` → `RUNBOOK.md` → `docs/ARCHITECTURE.md`.
-- `RUNBOOK.md` - Complete operator runbook
-- `CHANGELOG.md` - Project history + current mutable status (`[Unreleased]`)
-- `SECURITY.md` - Threat model
-- `AGENTS.md` - AI agent constraints
-- `docs/ARCHITECTURE.md` - Code structure and architecture decisions
+The project is licensed under the [MIT License](LICENSE).

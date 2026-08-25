@@ -49,7 +49,12 @@ class CostLineItem:
 
 @dataclass(frozen=True)
 class CostReport:
-    """Monthly cost summary."""
+    """Monthly cost summary for detected managed resources.
+
+    ``baseline_monthly`` and ``total_monthly`` both cover all detected managed
+    resources. ``unanticipated_monthly`` is the flagged subset of that total,
+    not an additional charge.
+    """
 
     baseline_monthly: float
     unanticipated_monthly: float
@@ -89,7 +94,7 @@ def audit_resources(
     ec2_client: Any | None = None,
     snapshot_keep_last: int = DEFAULT_SNAPSHOT_KEEP_LAST,
 ) -> AuditReport:
-    """Audit managed/lookalike resources and estimate monthly cost impact."""
+    """Audit managed and lookalike resources and estimate managed-resource cost."""
     ec2 = ec2_client or _ec2_client()
 
     findings: list[AuditFinding] = []
@@ -269,11 +274,9 @@ def audit_resources(
             )
 
     # Cost ---------------------------------------------------------------------
-    primary_instance_compute = 0.0
-    if managed_instances:
-        primary_instance_compute = _monthly_compute(
-            str(managed_instances[0].get("InstanceType", ""))
-        )
+    managed_instance_compute = sum(
+        _monthly_compute(str(instance.get("InstanceType", ""))) for instance in managed_instances
+    )
 
     managed_storage_cost = (
         sum(int(v.get("Size", 0)) for v in managed_volumes) * EBS_MONTHLY_RATE_PER_GB
@@ -288,19 +291,24 @@ def audit_resources(
         2,
     )
     baseline_monthly = round(
-        primary_instance_compute
+        managed_instance_compute
         + managed_storage_cost
         + managed_snapshot_cost
         + managed_unattached_eip_cost,
         2,
     )
-    total_monthly = round(baseline_monthly + unanticipated_monthly, 2)
+    # Findings identify a subset of resources already included in the managed
+    # resource total. Adding that subset again would double-count their cost.
+    total_monthly = baseline_monthly
 
     line_items = [
         CostLineItem(
-            name="primary-instance-compute",
-            monthly_cost=round(primary_instance_compute, 2),
-            note=f"Assumes {DEFAULT_HOURS_PER_DAY}hrs/day runtime",
+            name="managed-instance-compute",
+            monthly_cost=round(managed_instance_compute, 2),
+            note=(
+                f"{len(managed_instances)} managed instance(s); "
+                f"assumes {DEFAULT_HOURS_PER_DAY} hours/day runtime"
+            ),
         ),
         CostLineItem(
             name="managed-ebs-volumes",
@@ -310,7 +318,10 @@ def audit_resources(
         CostLineItem(
             name="managed-snapshots",
             monthly_cost=round(managed_snapshot_cost, 2),
-            note=f"{len(managed_snapshots)} managed snapshot(s)",
+            note=(
+                f"{len(managed_snapshots)} managed snapshot(s); "
+                "source-volume capacity proxy, not billed incremental storage"
+            ),
         ),
         CostLineItem(
             name="managed-unattached-eips",

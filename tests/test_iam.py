@@ -2,6 +2,9 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+from botocore.exceptions import ClientError
+
 from edcloud.config import INSTANCE_PROFILE_NAME, INSTANCE_ROLE_NAME, MANAGER_TAG_KEY
 from edcloud.iam import (
     delete_instance_profile,
@@ -128,6 +131,19 @@ class TestEnsureInstanceProfile:
             InstanceProfileName=INSTANCE_PROFILE_NAME,
             RoleName=INSTANCE_ROLE_NAME,
         )
+
+    @patch("edcloud.iam._iam_client")
+    @patch("edcloud.iam._ssm_resource_arn", return_value="arn:aws:ssm:*:123:parameter/edcloud/*")
+    def test_propagates_inline_policy_failure(self, _mock_ssm_arn, mock_iam_client):
+        mock_client = MagicMock()
+        mock_client.get_role.return_value = {"Role": {"RoleName": INSTANCE_ROLE_NAME}}
+        mock_client.put_role_policy.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied"}}, "PutRolePolicy"
+        )
+        mock_iam_client.return_value = mock_client
+
+        with pytest.raises(ClientError, match="AccessDenied"):
+            ensure_instance_profile({MANAGER_TAG_KEY: "true"})
 
 
 class TestDeleteInstanceProfile:

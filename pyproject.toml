@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "edcloud"
 version = "1.0.0"
 description = "Personal cloud lab CLI — provision, manage, and access an EC2 instance over Tailscale."
+readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{name = "Brad Fidler"}]
@@ -26,6 +27,10 @@ dev = [
 [project.scripts]
 edc = "edcloud.cli:main"
 edcloud = "edcloud.cli:main"
+
+[project.urls]
+Repository = "https://github.com/brfid/edcloud"
+Changelog = "https://github.com/brfid/edcloud/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["edcloud*"]

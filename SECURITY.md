@@ -4,6 +4,8 @@
 
 edcloud is a single-operator personal lab, not a multi-tenant platform.
 
+This repository is preserved for historical reference and is not actively maintained. It has no supported release or security-fix commitment.
+
 Core assumptions:
 
 - Access is Tailscale-only.
@@ -16,7 +18,6 @@ Core assumptions:
 - Public SSH exposure
 - Public exposure of Portainer or workload ports (Portainer binds to Tailscale interface only)
 - IMDSv1 usage (IMDSv2 is required, hop limit set to 1)
-- Avoidable idle spend (automatic idle shutdown)
 - Credentials in user-data (auth keys fetched from SSM at boot)
 
 ## What this project does not try to prevent
@@ -29,12 +30,13 @@ Core assumptions:
 
 ## Required operator practices
 
-- Keep runtime secrets in AWS SSM Parameter Store.
+- Keep bootstrap secrets in AWS Systems Manager Parameter Store.
+- Keep materialized credentials and OAuth files in access-restricted, untracked files on the operator device or host.
 - Do not commit credentials, keys, or tokens to git.
 - Use MFA on AWS and your identity provider.
 - Rotate Tailscale auth keys and remove unused devices.
-- Keep AWS DLM backup policy enabled and review `edc backup-policy status` periodically.
-- Run restore drills and validate backup recovery.
+- Monitor the CLI-managed snapshot queue and snapshot cost.
+- Run restore-to-volume drills and validate files separately before relying on a backup.
 
 ## Secret and PII guards
 
@@ -44,29 +46,8 @@ Automated checks reduce the chance of committing secrets or personal data:
 - `detect-secrets` runs as a pre-commit hook against `.secrets.baseline`.
 - `.gitignore` excludes operator-local auth material: Tailscale keys, rclone and Cline OAuth files (`secrets.json`, `globalState.json`), `.env` / `.envrc`, and AWS CLI credential and output files.
 
-Install the hooks with `pip install pre-commit && pre-commit install`. These guards are defense-in-depth, not a substitute for keeping runtime secrets in SSM.
+Install the hooks with `pip install pre-commit && pre-commit install`. These guards are defense-in-depth, not a substitute for handling bootstrap and materialized secrets as described above.
 
-## Vulnerability reporting
+## Reporting and support
 
-Do not open public issues for security vulnerabilities.
-
-Report privately to [@brfid](https://github.com/brfid) on GitHub and include:
-
-- A clear description
-- Reproduction steps
-- Expected impact
-- Suggested remediation (optional)
-
-Response targets:
-
-- Initial acknowledgment: within 7 days
-- Fix priority: based on impact and exploitability
-- Public disclosure: after a fix is available
-
-## Supported code line
-
-Security fixes are applied on `main`.
-
-## Dependency scope
-
-Security issues in upstream dependencies (AWS, Ubuntu, Docker, Tailscale, Portainer) should also be reported to the relevant maintainers.
+Do not include credentials, tokens, personal data, or active resource identifiers in a public issue. Because this repository is unmaintained, reports might not receive a response or fix. Report vulnerabilities in AWS, Ubuntu, Docker, Tailscale, Portainer, or another dependency to that project's current maintainer.

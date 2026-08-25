@@ -158,8 +158,8 @@ def _print_audit_summary(phase: str) -> None:
 
     click.echo(
         "  Cost summary: "
-        f"baseline=${report.cost.baseline_monthly:.2f}/mo, "
-        f"unanticipated=${report.cost.unanticipated_monthly:.2f}/mo, "
+        f"managed=${report.cost.baseline_monthly:.2f}/mo, "
+        f"flagged subset=${report.cost.unanticipated_monthly:.2f}/mo, "
         f"total=${report.cost.total_monthly:.2f}/mo"
     )
     click.echo(f"  Note: {report.cost.note}")
@@ -191,14 +191,14 @@ def main() -> None:
     default=InstanceConfig.volume_size_gb,
     type=int,
     show_default=True,
-    help="Root EBS volume size in GB.",
+    help="Root EBS volume size in GiB.",
 )
 @click.option(
     "--state-volume-size",
     default=InstanceConfig.state_volume_size_gb,
     type=int,
     show_default=True,
-    help="Persistent state EBS volume size in GB (mounted at /opt/edcloud/state).",
+    help="Persistent state EBS volume size in GiB (mounted at /opt/edcloud/state).",
 )
 @click.option(
     "--tailscale-hostname",
@@ -221,7 +221,7 @@ def main() -> None:
 @click.option(
     "--cleanup",
     is_flag=True,
-    help="Clean up old Tailscale devices and orphaned volumes before provisioning.",
+    help="Review Tailscale records and orphaned volumes before provisioning.",
 )
 @click.option(
     "--allow-delete-state-volume",
@@ -238,11 +238,6 @@ def main() -> None:
     ),
 )
 @click.option(
-    "--skip-snapshot",
-    is_flag=True,
-    help="Skip automatic snapshot before provision (if replacing existing instance).",
-)
-@click.option(
     "--allow-tailscale-name-conflicts",
     is_flag=True,
     help="Skip fail-fast guard for duplicate/suffixed edcloud Tailscale records.",
@@ -253,7 +248,7 @@ def main() -> None:
     envvar="EDCLOUD_DOTFILES_REPO",
     show_default=True,
     help=(
-        "Dotfiles repo URL for bootstrap ('auto' = infer https://github.com/<gh-user>/dotfiles.git)."
+        "Dotfiles repo URL for bootstrap ('auto' = infer https://github.com/USER/dotfiles.git)."
     ),
 )
 @click.option(
@@ -274,12 +269,11 @@ def provision(
     cleanup: bool,
     allow_delete_state_volume: bool,
     require_existing_state_volume: bool,
-    skip_snapshot: bool,
     allow_tailscale_name_conflicts: bool,
     dotfiles_repo: str,
     dotfiles_branch: str,
 ) -> None:
-    """Create the edcloud EC2 instance from scratch.
+    """Provision an EC2 instance, reusing a managed state volume by default.
 
     The Tailscale auth key is fetched from SSM by the instance at boot.
     """
@@ -291,19 +285,6 @@ def provision(
     # Pre-provision cleanup if requested
     if cleanup:
         from edcloud import cleanup as cleanup_module
-
-        # Auto-snapshot if existing instance (unless --skip-snapshot)
-        if not skip_snapshot:
-            click.echo("Checking for existing instance to snapshot...")
-            snap_ids = snapshot.snapshot_and_prune("pre-provision", wait=True)
-            if snap_ids:
-                click.echo(f"✅ Created pre-provision snapshot(s): {', '.join(snap_ids)}")
-                click.echo()
-            else:
-                click.echo(
-                    "Info: no existing instance to snapshot (this is fine for first provision)"
-                )
-                click.echo()
 
         # Run cleanup workflow
         if not cleanup_module.run_cleanup_workflow(
@@ -371,8 +352,8 @@ def provision(
     _print_audit_summary("post-provision")
 
     click.echo()
-    click.echo("Snapshots are managed by the CLI (max 3, pruned on each trigger).")
-    click.echo("  Use 'edc snapshot --list' to view, 'edc backup-policy apply' for DLM.")
+    click.echo("Automatic CLI snapshot triggers prune the managed pool to retain 3 snapshots.")
+    click.echo("  Use 'edc snapshot --list' to view the managed queue.")
     click.echo()
     click.echo(json.dumps(result, indent=2))
 
@@ -388,18 +369,11 @@ def provision(
     show_default=True,
     help="SSM parameter to read (SecureString supported).",
 )
-@click.option(
-    "--shell-export/--no-shell-export",
-    default=True,
-    show_default=True,
-    help='Print export command for eval: eval "$(edc load-tailscale-env-key)"',
-)
 @require_aws_creds
 def load_tailscale_env_key(
     tailscale_auth_key_ssm_parameter: str,
-    shell_export: bool,
 ) -> None:
-    """Load TAILSCALE_AUTH_KEY from SSM for local operator usage."""
+    """Print a command that exports TAILSCALE_AUTH_KEY from SSM."""
     try:
         key = ec2.fetch_tailscale_auth_key_from_ssm(tailscale_auth_key_ssm_parameter)
     except ClientError as exc:
@@ -410,12 +384,7 @@ def load_tailscale_env_key(
         )
         raise SystemExit(1) from exc
 
-    if shell_export:
-        click.echo(f"export TAILSCALE_AUTH_KEY={shlex.quote(key)}")
-        return
-
-    click.echo("No output selected. Use --shell-export.", err=True)
-    raise SystemExit(1)
+    click.echo(f"export TAILSCALE_AUTH_KEY={shlex.quote(key)}")
 
 
 @main.command("setup-ssm-tokens")
@@ -550,7 +519,7 @@ def sync_cline_auth(
     remote_diagnostics: bool,
     dry_run: bool,
 ) -> None:
-    """Sync Cline OAuth files from local machine to a remote host with backup semantics."""
+    """Back up and replace Cline OAuth files on a remote host."""
     from edcloud import cline_sync
 
     source_secrets_path = Path(source_secrets).expanduser().resolve()
@@ -611,7 +580,7 @@ def up(allow_tailscale_name_conflicts: bool) -> None:
     if not allow_tailscale_name_conflicts:
         _ensure_no_tailscale_name_conflicts()
 
-    # On-start snapshot (fire-and-forget; prune enforces 3-snapshot cap)
+    # Run the on-start trigger without waiting for snapshot completion.
     try:
         snap_ids = snapshot.snapshot_and_prune("on-start", wait=False)
         if snap_ids:
@@ -643,7 +612,7 @@ def down() -> None:
 @main.command()
 @require_aws_creds
 def status() -> None:
-    """Show instance state, IPs, and cost estimate."""
+    """Show instance state, addresses, and estimated compute and EBS cost."""
     info = ec2.status()
 
     if not info.get("exists"):
@@ -685,7 +654,7 @@ def status() -> None:
     # Volumes
     for vol in info.get("volumes", []):
         click.echo(
-            f"Volume:    {vol['volume_id']}  {vol['size_gb']}GB {vol['type']}  ({vol['state']})"
+            f"Volume:    {vol['volume_id']}  {vol['size_gb']} GiB {vol['type']}  ({vol['state']})"
         )
 
     # Orphaned volume warning
@@ -695,13 +664,13 @@ def status() -> None:
         click.echo(f"Warning: {len(orphaned_vols)} orphaned managed volume(s) accruing cost:")
         for vol_id in orphaned_vols:
             click.echo(f"  {vol_id}")
-        click.echo("  Delete manually: aws ec2 delete-volume --volume-id <id>")
+            click.echo(f"    Delete: aws ec2 delete-volume --volume-id {shlex.quote(vol_id)}")
 
     # Cost
     cost = info.get("cost_estimate", {})
     if cost:
         click.echo()
-        click.echo(f"Estimated monthly cost ({cost.get('note', '')}):")
+        click.echo(f"Estimated monthly compute and attached-EBS cost ({cost.get('note', '')}):")
         click.echo(f"  Compute: ${cost.get('compute_monthly', 0):.2f}")
         click.echo(f"  Storage: ${cost.get('storage_monthly', 0):.2f}")
         click.echo(f"  Total:   ${cost.get('total_monthly', 0):.2f}")
@@ -739,7 +708,7 @@ def status() -> None:
 @click.option(
     "--skip-cleanup",
     is_flag=True,
-    help="Skip Tailscale device and orphaned volume cleanup after destroy.",
+    help="Skip Tailscale cleanup guidance and orphaned-volume cleanup after destroy.",
 )
 @click.option(
     "--allow-delete-state-volume",
@@ -760,7 +729,7 @@ def destroy(
     allow_delete_state_volume: bool,
     skip_snapshot: bool,
 ) -> None:
-    """Terminate the instance and clean up. State volume is preserved."""
+    """Terminate the instance and clean up, preserving state by default."""
     if fresh_snapshot_max_age_minutes <= 0:
         click.echo("Error: --fresh-snapshot-max-age-minutes must be > 0.", err=True)
         raise SystemExit(1)
@@ -784,7 +753,7 @@ def destroy(
                 err=True,
             )
             click.echo(
-                "  Create one: edc snapshot -d pre-change-<reason>",
+                "  Create one: edc snapshot -d pre-change-description",
                 err=True,
             )
             click.echo(
@@ -827,7 +796,11 @@ def destroy(
 @main.command("snapshot")
 @click.option("--list", "list_", is_flag=True, help="List existing snapshots.")
 @click.option("--description", "-d", default=None, help="Snapshot description.")
-@click.option("--prune", is_flag=True, help="Delete all but the most recent snapshots.")
+@click.option(
+    "--prune",
+    is_flag=True,
+    help="Preview snapshots beyond the retention limit; use --apply to delete them.",
+)
 @click.option(
     "--keep",
     default=DEFAULT_SNAPSHOT_KEEP_LAST,
@@ -849,7 +822,7 @@ def snapshot_cmd(
     keep: int,
     dry_run: bool,
 ) -> None:
-    """Create or list EBS snapshots."""
+    """Create, list, or prune EBS snapshots."""
     modes_selected = int(list_) + int(prune)
     if modes_selected > 1:
         click.echo("Error: use either --list or --prune (not both).", err=True)
@@ -863,11 +836,11 @@ def snapshot_cmd(
         if not snaps:
             click.echo("No edcloud snapshots found.")
             return
-        click.echo(f"{'ID':<25} {'Size':>5} {'State':<12} {'Started':<20} {'Description'}")
+        click.echo(f"{'ID':<25} {'Source GiB':>10} {'State':<12} {'Started':<20} {'Description'}")
         click.echo("-" * 90)
         for s in snaps:
             click.echo(
-                f"{s['snapshot_id']:<25} {s['size_gb']:>4}GB {s['state']:<12} "
+                f"{s['snapshot_id']:<25} {s['size_gb']:>10} {s['state']:<12} "
                 f"{s['start_time'][:19]:<20} {s['description']}"
             )
     elif prune:
@@ -893,23 +866,23 @@ def snapshot_cmd(
     default=2.0,
     type=float,
     show_default=True,
-    help="Soft monthly spend cap for completed snapshots.",
+    help="Soft cap for the capacity-based monthly cost proxy.",
 )
 @click.option(
     "--gb-month-rate",
     default=SNAPSHOT_MONTHLY_RATE_PER_GB,
     type=float,
     show_default=True,
-    help="Estimated USD per GB-month for snapshot storage.",
+    help="Planning rate per source-volume GiB-month.",
 )
 @click.option(
     "--fail-on-cap",
     is_flag=True,
-    help="Exit non-zero when estimated spend exceeds soft cap.",
+    help="Exit non-zero when the cost proxy exceeds the soft cap.",
 )
 @require_aws_creds
 def snapshot_cost_cmd(soft_cap_usd: float, gb_month_rate: float, fail_on_cap: bool) -> None:
-    """Estimate monthly snapshot spend and compare against a soft cap."""
+    """Compare a conservative snapshot-cost proxy with a soft cap."""
     if soft_cap_usd <= 0:
         click.echo("Error: --soft-cap-usd must be > 0.", err=True)
         raise SystemExit(1)
@@ -926,8 +899,8 @@ def snapshot_cost_cmd(soft_cap_usd: float, gb_month_rate: float, fail_on_cap: bo
 
     if report["over_soft_cap"]:
         click.echo(
-            "Warning: estimated snapshot spend exceeds soft cap. "
-            "Consider pruning ad-hoc snapshots or adjusting DLM retention.",
+            "Warning: snapshot cost proxy exceeds soft cap. "
+            "Review managed snapshots and the active retention mechanism.",
             err=True,
         )
         if fail_on_cap:
@@ -969,7 +942,7 @@ def restore_drill_cmd(
     device_name: str,
     keep_temporary_volume: bool,
 ) -> None:
-    """Run a non-destructive snapshot restore drill using a temporary EBS volume."""
+    """Test snapshot-to-volume restoration without mounting or checking files."""
     if instance_id and attach_managed_instance:
         click.echo(
             "Error: use either --instance-id or --attach-managed-instance (not both).",
@@ -1063,12 +1036,12 @@ def backup_policy_disable_cmd() -> None:
 @click.option(
     "--public-ip",
     is_flag=True,
-    help="Use public IP for checks instead of Tailscale.",
+    help="Use public IP instead of Tailscale (requires an inbound security group rule).",
 )
 @click.option("--json-output", is_flag=True, help="Emit verification results as JSON.")
 @require_aws_creds
 def verify_cmd(user: str, public_ip: bool, json_output: bool) -> None:
-    """Run fresh-reprovision verification checks."""
+    """Verify the running host's bootstrap baseline."""
     info = ec2.status()
     if not info.get("exists"):
         raise RuntimeError("No edcloud instance found. Run 'edc provision' first.")
@@ -1138,16 +1111,10 @@ def verify_cmd(user: str, public_ip: bool, json_output: bool) -> None:
 @click.argument("ssh_args", nargs=-1, type=click.UNPROCESSED)
 @require_aws_creds
 def ssh_cmd(user: str, public_ip: bool, ssh_args: tuple[str, ...]) -> None:
-    """SSH into the instance.
+    """Connect through Tailscale interactively or run a remote command.
 
-    Pass additional arguments to execute remote commands:
-      edc ssh 'docker ps'
-      edc ssh ls -la /opt
-
-    Default: Uses Tailscale network. No exposed ports required.
-
-    Note: If Tailscale SSH is enabled on your tailnet, it may require browser authentication.
-    Use --public-ip for direct SSH (requires security group rule: port 22 from your IP).
+    --public-ip requires a temporary inbound security group rule for port 22.
+    Remove that rule after use.
     """
     # Get instance info
     info = ec2.status()
@@ -1181,14 +1148,6 @@ def ssh_cmd(user: str, public_ip: bool, ssh_args: tuple[str, ...]) -> None:
     if ssh_args:
         cmd.extend(ssh_args)
 
-    # Remove any stale known_hosts entry so accept-new can pick up the new key
-    # after a rebuild. ssh-keygen -R is a no-op when no entry exists.
-    subprocess.run(  # nosec B603, B607
-        ["ssh-keygen", "-R", target],
-        capture_output=True,
-        check=False,
-    )
-
     os.execvp(cmd[0], cmd)  # nosec B606
 
 
@@ -1198,14 +1157,9 @@ def tailscale_group() -> None:
 
 
 @tailscale_group.command("reconcile")
-@click.option(
-    "--dry-run/--apply",
-    default=True,
-    show_default=True,
-    help="Preview conflicts or apply manual reconciliation workflow guidance.",
-)
+@click.option("--dry-run/--apply", default=True, hidden=True)
 def tailscale_reconcile(dry_run: bool) -> None:
-    """Show or reconcile Tailscale naming conflicts for edcloud."""
+    """Report Tailscale naming conflicts and manual remediation steps."""
     if not tailscale.tailscale_available():
         click.echo("tailscale CLI not found on this operator node.", err=True)
         raise SystemExit(1)
@@ -1216,11 +1170,8 @@ def tailscale_reconcile(dry_run: bool) -> None:
         return
 
     click.echo(tailscale.format_conflict_message(conflicts), err=not dry_run)
-    if dry_run:
-        raise SystemExit(1)
-
-    click.echo()
-    click.echo("Applied mode: manual reconciliation required in Tailscale admin.")
+    if not dry_run:
+        click.echo("No changes applied; resolve the conflicts in Tailscale admin.", err=True)
     raise SystemExit(1)
 
 
@@ -1326,14 +1277,14 @@ def permissions_verify_cmd(profiles: tuple[str, ...], json_output: bool) -> None
     default=InstanceConfig.volume_size_gb,
     type=int,
     show_default=True,
-    help="Root EBS volume size in GB.",
+    help="Root EBS volume size in GiB.",
 )
 @click.option(
     "--state-volume-size",
     default=InstanceConfig.state_volume_size_gb,
     type=int,
     show_default=True,
-    help="Persistent state EBS volume size in GB.",
+    help="Persistent state EBS volume size in GiB.",
 )
 @click.option(
     "--tailscale-hostname",
@@ -1369,7 +1320,7 @@ def permissions_verify_cmd(profiles: tuple[str, ...], json_output: bool) -> None
     envvar="EDCLOUD_DOTFILES_REPO",
     show_default=True,
     help=(
-        "Dotfiles repo URL for bootstrap ('auto' = infer https://github.com/<gh-user>/dotfiles.git)."
+        "Dotfiles repo URL for bootstrap ('auto' = infer https://github.com/USER/dotfiles.git)."
     ),
 )
 @click.option(
@@ -1392,12 +1343,11 @@ def reprovision(
     dotfiles_repo: str,
     dotfiles_branch: str,
 ) -> None:
-    """Atomically snapshot → destroy → provision.
+    """Snapshot, terminate, and rebuild the instance with its state volume.
 
-    Takes a pre-reprovision snapshot (unless --skip-snapshot), destroys the
-    current instance, then provisions a fresh one. If provisioning fails after
-    destroy, the snapshot IDs are printed prominently so you can restore
-    manually.
+    If a managed instance exists, the command takes a pre-reprovision snapshot
+    unless --skip-snapshot is set, destroys the instance, and provisions a
+    replacement. It prints available snapshot IDs if a later step fails.
 
     Note: provisioning always requires an existing state volume. If the state
     volume was deleted, use 'edc provision --allow-new-state-volume' directly.
@@ -1405,7 +1355,7 @@ def reprovision(
     if not allow_tailscale_name_conflicts:
         _ensure_no_tailscale_name_conflicts(base_hostname=tailscale_hostname)
 
-    # Pre-flight: get current instance state once; use it for confirmation and destroy.
+    # Read status once to select the flow and confirm the destructive action.
     info = ec2.status()
     try:
         require_confirmed_instance_id(
@@ -1429,11 +1379,17 @@ def reprovision(
     from edcloud import cleanup as cleanup_module
 
     snap_ids: list[str] = []
+
+    def _snapshot_for_reprovision() -> list[str]:
+        created = snapshot.snapshot_and_prune("pre-reprovision", wait=True)
+        snap_ids.extend(created)
+        return created
+
     try:
-        snap_ids, result = run_reprovision_flow(
+        completed_snap_ids, result = run_reprovision_flow(
             info=info,
             skip_snapshot=skip_snapshot,
-            auto_snapshot=lambda: snapshot.snapshot_and_prune("pre-reprovision", wait=True),
+            auto_snapshot=_snapshot_for_reprovision,
             destroy_instance=lambda: ec2.destroy(),
             cleanup_orphaned_volumes=lambda: cleanup_module.cleanup_orphaned_volumes(
                 mode="delete", allow_delete_state=False, echo=click.echo
@@ -1443,12 +1399,13 @@ def reprovision(
             echo_err=lambda msg: click.echo(msg, err=True),
             confirm_continue=lambda msg: click.confirm(msg),
         )
+        snap_ids = completed_snap_ids
     except (RuntimeError, TagDriftError, ClientError, BotoCoreError) as exc:
-        click.echo(f"❌ Provisioning failed: {exc}", err=True)
+        click.echo(f"❌ Reprovisioning failed: {exc}", err=True)
         if snap_ids:
             click.echo("", err=True)
             click.echo(
-                "⚠️  The instance was destroyed but reprovisioning failed.",
+                "⚠️  A pre-reprovision snapshot is available.",
                 err=True,
             )
             click.echo(
@@ -1456,13 +1413,16 @@ def reprovision(
                 err=True,
             )
             click.echo(
-                "   Use 'edc provision' after restoring the state volume from a snapshot.",
+                "   Run 'edc status' to determine the instance state before recovery.",
                 err=True,
             )
         raise SystemExit(1) from exc
 
     click.echo()
-    click.echo("Next step: run 'edc verify' to confirm rebuild health.")
+    click.echo("Next steps:")
+    click.echo("  1. Repeat 'edc status' until it reports 'Reachable: yes'.")
+    click.echo("  2. Run: edc ssh 'cloud-init status --wait'")
+    click.echo("  3. Run: edc verify")
     click.echo()
     click.echo(json.dumps(result, indent=2))
 
@@ -1480,13 +1440,13 @@ def reprovision(
     "--volume-size",
     default=None,
     type=int,
-    help="New root EBS volume size in GB (expand only, applied online).",
+    help="New root EBS capacity in GiB (expand only; grow the filesystem separately).",
 )
 @click.option(
     "--state-volume-size",
     default=None,
     type=int,
-    help="New state EBS volume size in GB (expand only, applied online).",
+    help="New state EBS capacity in GiB (expand only; grow the filesystem separately).",
 )
 @require_aws_creds
 def resize_cmd(
@@ -1494,11 +1454,11 @@ def resize_cmd(
     volume_size: int | None,
     state_volume_size: int | None,
 ) -> None:
-    """Resize the instance type and/or EBS volumes in place.
+    """Change the instance type or request EBS volume expansion.
 
     Instance type changes require a stop/start cycle (data is preserved).
-    Volume size changes are applied online without a restart.
-    Volume shrinking is not supported by AWS.
+    Volume changes request online EBS expansion; grow the partition or filesystem
+    separately after AWS completes the modification. AWS does not support shrinking.
     """
     if instance_type is None and volume_size is None and state_volume_size is None:
         click.echo(

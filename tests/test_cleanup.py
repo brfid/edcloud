@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+from botocore.exceptions import ClientError
+
 from edcloud.cleanup import (
     cleanup_orphaned_volumes,
     cleanup_tailscale_devices,
@@ -54,6 +56,20 @@ def test_cleanup_delete_mode_deletes_all_when_override_enabled(mock_boto_client)
     assert ok is True
     deleted = [kwargs["VolumeId"] for _, kwargs in ec2_client.delete_volume.call_args_list]
     assert deleted == ["vol-root", "vol-state", "vol-unknown"]
+
+
+@patch("edcloud.cleanup._ec2_client")
+def test_cleanup_delete_mode_reports_deletion_failure(mock_boto_client):
+    ec2_client = MagicMock()
+    ec2_client.describe_volumes.return_value = {"Volumes": [_vol("vol-root", "root")]}
+    ec2_client.delete_volume.side_effect = ClientError(
+        {"Error": {"Code": "UnauthorizedOperation"}}, "DeleteVolume"
+    )
+    mock_boto_client.return_value = ec2_client
+
+    ok = cleanup_orphaned_volumes(mode="delete", allow_delete_state=False)
+
+    assert ok is False
 
 
 @patch("edcloud.cleanup._ec2_client")

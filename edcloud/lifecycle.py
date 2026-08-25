@@ -85,7 +85,7 @@ def run_reprovision_flow(
     echo_err: Callable[[str], None],
     confirm_continue: Callable[[str], bool],
 ) -> tuple[list[str], Mapping[str, Any]]:
-    """Execute snapshot -> destroy -> cleanup -> provision reprovision flow."""
+    """Snapshot and replace an instance, skipping destroy and cleanup if absent."""
     snap_ids = run_optional_auto_snapshot(
         skip_snapshot=skip_snapshot,
         auto_snapshot=auto_snapshot,

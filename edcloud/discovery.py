@@ -30,5 +30,5 @@ def default_vpc_id(ec2_client: Any) -> str:
     resp = ec2_client.describe_vpcs(Filters=[{"Name": "is-default", "Values": ["true"]}])
     vpcs = resp.get("Vpcs", [])
     if not vpcs:
-        raise RuntimeError("No default VPC found. Create one or specify a VPC ID.")
+        raise RuntimeError("No default VPC found. Create one in the configured AWS region.")
     return str(vpcs[0]["VpcId"])

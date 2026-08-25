@@ -1,113 +1,78 @@
 # Architecture
 
-## Module structure (current)
+## System model
 
-```text
-edcloud/
-├── cli.py              # Click command adapters (entrypoint)
-├── lifecycle.py        # Shared lifecycle orchestration helpers for CLI
-├── verify_catalog.py   # Declarative `edc verify` check catalog
-├── resource_queries.py # Shared managed-resource query/filter helpers
-├── ec2.py              # EC2 lifecycle core (provision/start/stop/status/destroy/resize)
-├── snapshot.py         # Snapshot create/list/prune
-├── backup_policy.py    # AWS DLM backup policy management
-├── cleanup.py          # Tailscale + orphaned volume cleanup (UI-agnostic)
-├── tailscale.py        # Tailscale discovery/conflict helpers
-├── iam.py              # IAM role/profile setup + teardown
-├── resource_audit.py   # Drift + cost audit
-├── aws_clients.py      # Shared boto3 session/client factories
-├── aws_check.py        # Credential/region checks
-├── discovery.py        # Shared EC2 instance discovery helpers
-├── config.py           # Constants, tags, defaults, InstanceConfig
-├── types.py            # TypedDict definitions for API contracts
-├── user_data.py        # Cloud-init template rendering + input validation
-├── security_group.py   # Security group discovery/lifecycle + TagDriftError
-├── cline_sync.py       # Cline OAuth secret sync to remote hosts
-└── py.typed            # PEP 561 type-checking marker
-```
+- **Topology:** One `t3a.small` EC2 instance running Ubuntu 24.04 by default.
+- **Access:** Tailscale carries operator traffic. Newly created security groups have no inbound rules.
+- **Ownership:** The `edcloud:managed=true` tag identifies resources; edcloud does not use a local state file.
+- **Storage:** The 30 GiB root volume is disposable. The 30 GiB state volume persists data under `/opt/edcloud/state` and is reused during reprovisioning.
+- **Secrets:** The instance role reads bootstrap secrets from `/edcloud/*` in AWS Systems Manager Parameter Store.
+- **Bootstrap:** `cloud-init/user-data.yaml` defines the host baseline, persistent mounts, services, and repository sync.
 
-## Design principles
+The single-instance design favors low operating cost and simple recovery over high availability, horizontal scaling, or multi-user isolation.
 
-- **Thin command adapters:** `cli.py` focuses on options, user I/O, and delegation.
-- **Centralized orchestration:** repeated lifecycle flows live in `lifecycle.py`.
-- **Declarative checks:** verification checks live in `verify_catalog.py`, not inline command code.
-- **Shared query primitives:** managed-resource filter/query composition lives in `resource_queries.py`.
-- **Tag-based source of truth:** no local state file; AWS tags define ownership and discovery.
-- **UI-agnostic library modules:** only `cli.py` depends on `click`. Library modules accept I/O callbacks when they need user interaction.
-- **Typed API contracts:** major return values use `TypedDict` definitions in `types.py` so callers and type checkers can verify field access.
-- **Single-pass template rendering:** `user_data.py` uses a `string.Template` subclass with a distinct `@@{KEY}` delimiter so cloud-init shell variables (`$VAR` / `${VAR}`) can never collide with edcloud render slots. Rendering is strict (`substitute`, not `safe_substitute`) and guards against a slot left in shell `${KEY}` form.
+## Package boundaries
 
-## Architecture decisions (ADR summary)
+- `cli.py` defines Click commands and user interaction. `lifecycle.py` contains shared command workflows.
+- `ec2.py`, `iam.py`, and `security_group.py` manage the instance and its supporting AWS resources.
+- `snapshot.py` manages the CLI snapshot queue and restore-to-volume drills. `backup_policy.py` manages the optional AWS Data Lifecycle Manager (DLM) policy.
+- `aws_clients.py`, `aws_check.py`, `discovery.py`, and `resource_queries.py` contain shared AWS access and discovery helpers.
+- `cleanup.py`, `resource_audit.py`, `ops_health.py`, and `permissions.py` provide operational safeguards and reporting.
+- `tailscale.py` handles tailnet discovery and conflict guidance. `cline_sync.py` transfers Cline authentication files to the host.
+- `config.py`, `types.py`, and `verify_catalog.py` define configuration, typed return contracts, and verification checks.
+- `user_data.py` validates bootstrap inputs and renders the cloud-init template. `proc.py` provides the shared subprocess wrapper.
 
-- **Single-instance topology:** one EC2 host (`t3a.small` default) optimizes for low-cost, low-ops personal use.
-- **Python + boto3 over Terraform:** small resource graph and tag-based ownership make stateful IaC overhead unnecessary here.
-- **Tailscale-only access:** zero inbound SG rules; access is identity-based over tailnet.
-- **Durable state volume + disposable root:** host runtime is replaceable; durable data lives under `/opt/edcloud/state`.
-- **CLI-managed snapshot queue:** a single flat pool capped at 3 snapshots, enforced by the CLI. Every snapshot trigger runs `prune(3) → snapshot → prune(3)` so drift self-heals within one cycle. Triggers: `edc up` (on-start, fire-and-forget), `edc provision`/`edc reprovision`/`edc destroy` (blocking, pre-destructive-op). DLM (`backup-policy`) remains available but is not wired automatically.
-- **SSM-backed runtime secrets:** secrets stay out of git and host bootstrap payloads. The instance IAM role grants `ssm:GetParameter` on `/edcloud/*`. Three parameters are consumed automatically by cloud-init: `tailscale_auth_key` (required), `github_token` (optional, authenticates `gh`), and `rclone_config` (optional, writes rclone config and enables the Dropbox FUSE mount).
-- **Separate app/infrastructure repos:** application MCP code (for example `oldspeak`) remains in its own repository (`~/src/oldspeak` on-host). edcloud bootstraps checkout/update and local wrappers (`oldspeak-mcp-stdio`, `oldspeak-mcp-http`) without vendoring app code into this infra repo. Dotfiles bootstrap is configurable via `InstanceConfig.dotfiles_repo` / `dotfiles_branch` and rendered into cloud-init at provision time.
-- **Cloud-init as baseline contract:** reproducible host/tooling baseline is codified in `cloud-init/user-data.yaml`.
-- **CLI-first operations model:** commands must remain safe/repeatable from lightweight ARM/Linux operator nodes.
-- **TagDriftError as unified exception:** all tag-based discovery invariant violations (duplicate instances, duplicate security groups, duplicate state volumes) raise `TagDriftError` from `security_group.py`, providing consistent error handling across modules.
+Only `cli.py` depends on Click. Library modules return values or accept callbacks instead of writing directly to the terminal.
 
-## Key runtime flows
+## Resource discovery
 
-### Dotfiles bootstrap
+edcloud queries AWS by tags and expects at most one active managed instance, one managed security group, and one available managed state volume. Duplicate resources violate the discovery invariant and raise `TagDriftError`.
 
-Dotfiles are synced during cloud-init via configurable inputs:
+Volumes also use `edcloud:volume-role=root` or `edcloud:volume-role=state`. Cleanup preserves state and unknown-role volumes by default and deletes them only after an explicit override.
 
-1. `InstanceConfig.dotfiles_repo` / `dotfiles_branch` are rendered into cloud-init by `user_data.render()`.
-2. Cloud-init resolves the repo URL: `auto` → `https://github.com/<gh-user>/dotfiles.git` (via `gh api user`), or falls back to existing `~/src/dotfiles` origin URL.
-3. `sync_git_repo()` (shell function in cloud-init) clones or updates `~/src/dotfiles`.
-4. If `~/src/dotfiles/install.sh` exists, it is executed to link configs.
-5. Otherwise, relink on a running host via the instructions in `AGENTS.md`.
+New security groups are created without inbound rules. Discovery does not audit or remove rules from an existing tagged security group, so operators must preserve that invariant.
 
-### Destroy (default)
+## Provisioning and reprovisioning
 
-1. Confirm instance ID guardrail
-2. Optional pre-destroy snapshot (enabled by default)
-3. Destroy instance and clean IAM/security group state
-4. Optional post-destroy cleanup workflow (enabled by default)
+Provisioning performs these operations:
 
-### Reprovision
+1. Check for an existing managed instance and resource drift.
+2. Find or create the security group and instance profile.
+3. Resolve the Ubuntu AMI and render cloud-init.
+4. Reuse an available managed state volume, or create one only when `--allow-new-state-volume` is set.
+5. Launch the instance, attach the state volume, and apply role tags.
 
-1. Confirm instance ID guardrail
-2. Optional pre-reprovision snapshot
-3. Destroy current instance
-4. Cleanup orphaned non-state volumes
-5. Provision replacement instance with state-volume reuse requirement
+Reprovisioning snapshots the current state volume by default, terminates the instance, cleans orphaned root volumes, and launches a replacement that must reuse the state volume. The workflow is not atomic: a launch failure can occur after termination, so the snapshot and state volume remain the recovery boundary.
 
-### Verify
+## Persistent state
 
-- `edc verify` iterates `VERIFY_CHECKS` from `verify_catalog.py` and executes each check over SSH.
+Cloud-init bind-mounts these paths from the state volume:
 
-## DRY consolidation implemented
+- `/home/ubuntu`
+- `/var/lib/tailscale`
+- `/opt/edcloud/compose`
+- `/opt/edcloud/portainer-data`
 
-- **Lifecycle guardrails/snapshot flow:** shared in `lifecycle.py` (`require_confirmed_instance_id`, `run_optional_auto_snapshot`, `maybe_run_cleanup`).
-- **Managed volume query filters:** shared in `resource_queries.py` (`managed_volume_filters`, `list_managed_volumes`) and reused by `cleanup.py`/`ec2.py`.
-- **Verification check catalog:** extracted into `verify_catalog.py` and consumed by `cli.verify_cmd`.
-- **User-data rendering:** extracted into `user_data.py` with a distinct-delimiter (`@@{KEY}`) `string.Template` so shell `$VAR` usage never collides with render slots.
-- **Security group management:** extracted into `security_group.py` with `TagDriftError` as the unified tag-drift exception.
-- **Cline sync workflow:** extracted into `cline_sync.py` with validation, diagnostics, and file sync as separate functions.
-- **API type contracts:** `types.py` provides `TypedDict` definitions for `InstanceStatus`, `ProvisionResult`, `ResizeResult`, `SnapshotInfo`, etc.
+Docker stores its data under `/opt/edcloud/state/docker`, and SSH host keys persist under `/opt/edcloud/state/ssh-host-keys`.
 
-## Notes
+## Repository bootstrap
 
-- AWS DLM policy management is implemented in `backup_policy.py`.
-- Root volume remains disposable; state volume is durable and role-tagged.
-- Cloud-init runs `loginctl enable-linger ubuntu` so user systemd services start at boot without a login session. `rclone-dropbox.service` is written by cloud-init and enabled automatically when `/edcloud/rclone_config` is present in SSM, mounting `~/Dropbox` via rclone FUSE on every build. Additional user service templates live in `templates/operator/systemd-user/`.
-- Snapshot cap is 3 (`DEFAULT_SNAPSHOT_KEEP_LAST`). Each CLI trigger runs pre-prune + create + post-prune. Worst-case drift is +1, self-healing on next trigger.
-- `edc status` shows snapshot count. `edc snapshot --list` shows full inventory. `edc backup-policy apply` can optionally wire DLM on top.
+`InstanceConfig.dotfiles_repo` and `dotfiles_branch` control dotfiles sync. With the default `auto` setting, cloud-init resolves the authenticated GitHub user's dotfiles URL or falls back to the persisted checkout's origin. Cloud-init clones or updates the repository but does not run an installer or create links. Apply the dotfiles after provisioning by following that repository's instructions.
+
+Cloud-init also performs best-effort sync for selected non-secret repositories and installs local wrappers for the `oldspeak` MCP service. Application code remains outside this infrastructure repository.
+
+## Snapshots and recovery
+
+CLI lifecycle triggers use `prune → snapshot → prune` to retain three snapshots in the managed pool. Manual snapshots remain until an explicit or later automatic prune places them beyond the limit. Snapshots normally cover the state-tagged volume; if volume-role tags are missing, the implementation falls back to all attached volumes.
+
+DLM is optional. DLM and CLI snapshots use the same managed tag, so CLI pruning can remove DLM-created snapshots and does not preserve separate DLM tiers. Treat the mechanisms as alternatives unless their tagging or pruning behavior is changed.
+
+`edc restore-drill` verifies that a snapshot can create a temporary EBS volume and can optionally attach it to the managed instance. It does not mount the filesystem or validate files.
 
 ## Non-goals
 
-- Multi-region orchestration
-- Multi-tenant isolation model
-- Public internet service exposure
-- Fleet-scale infrastructure automation
-
-## Revisit triggers
-
-Revisit this architecture when you need multiple long-lived instances, shared state
-across hosts, team-managed infrastructure workflows, or stronger drift/audit
-requirements than tag-based discovery.
+- Multi-region or fleet orchestration
+- Multi-tenant isolation
+- Public service exposure
+- High availability
+- Full infrastructure-as-code state management

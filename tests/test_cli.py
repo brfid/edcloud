@@ -287,7 +287,6 @@ def test_provision_cleanup_passes_allow_delete_state_volume(
             "--tailscale-auth-key",
             "tskey-test",
             "--cleanup",
-            "--skip-snapshot",
             "--allow-delete-state-volume",
         ],
     )
@@ -546,21 +545,6 @@ def test_load_tailscale_env_key_shell_export(
 
     assert result.exit_code == 0
     assert "export TAILSCALE_AUTH_KEY=tailscale-test-key" in result.output
-
-
-@patch("edcloud.cli.ec2.fetch_tailscale_auth_key_from_ssm", return_value="tailscale-test-key")
-@patch("edcloud.cli.get_region", return_value="us-east-1")
-@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
-def test_load_tailscale_env_key_requires_output_mode(
-    _mock_creds,
-    _mock_region,
-    _mock_fetch,
-):
-    runner = CliRunner()
-    result = runner.invoke(main, ["load-tailscale-env-key", "--no-shell-export"])
-
-    assert result.exit_code == 1
-    assert "No output selected" in result.output
 
 
 @patch("edcloud.cli.ssm_client")
@@ -904,10 +888,10 @@ def test_status_displays_instance_info(
         "launch_time": "2026-02-15T10:00:00Z",
         "volumes": [{"volume_id": "vol-123", "size_gb": 40, "type": "gp3", "state": "in-use"}],
         "cost_estimate": {
-            "compute_monthly": 13.54,
+            "compute_monthly": 9.02,
             "storage_monthly": 3.20,
-            "total_monthly": 16.74,
-            "note": "Assumes 4hrs/day runtime",
+            "total_monthly": 12.22,
+            "note": "Assumes 8 hours/day runtime",
         },
     }
 
@@ -920,7 +904,7 @@ def test_status_displays_instance_info(
     assert "t3a.medium" in result.output
     assert "100.64.1.1" in result.output
     assert "yes" in result.output  # reachable
-    assert "$16.74" in result.output
+    assert "$12.22" in result.output
 
 
 @patch("edcloud.cli.ec2.status")
@@ -969,7 +953,7 @@ def test_destroy_cleanup_passes_allow_delete_state_volume(
 
 @patch("edcloud.cli.tailscale.edcloud_name_conflicts")
 @patch("edcloud.cli.tailscale.tailscale_available", return_value=True)
-def test_tailscale_reconcile_dry_run_reports_conflicts(
+def test_tailscale_reconcile_reports_conflicts(
     _mock_available,
     mock_conflicts,
 ):
@@ -985,6 +969,25 @@ def test_tailscale_reconcile_dry_run_reports_conflicts(
     result = runner.invoke(main, ["tailscale", "reconcile", "--dry-run"])
     assert result.exit_code == 1
     assert "Tailscale naming conflict detected" in result.output
+
+
+@patch("edcloud.cli.tailscale.edcloud_name_conflicts")
+@patch("edcloud.cli.tailscale.tailscale_available", return_value=True)
+def test_tailscale_reconcile_apply_remains_manual(
+    _mock_available,
+    mock_conflicts,
+):
+    mock_conflicts.return_value = [
+        {
+            "hostname": "edcloud-2",
+            "dns_name": "edcloud-2.tailnet.ts.net.",
+            "ip": "100.64.0.2",
+        }
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["tailscale", "reconcile", "--apply"])
+    assert result.exit_code == 1
+    assert "No changes applied" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -1061,7 +1064,9 @@ def test_reprovision_snapshots_destroys_and_provisions(
     mock_snapshot.assert_called_once()
     mock_destroy.assert_called_once_with()
     mock_provision.assert_called_once()
-    assert "Next step: run 'edc verify' to confirm rebuild health." in result.output
+    assert "Repeat 'edc status' until it reports 'Reachable: yes'." in result.output
+    assert "edc ssh 'cloud-init status --wait'" in result.output
+    assert "Run: edc verify" in result.output
 
 
 @patch("edcloud.cleanup.cleanup_orphaned_volumes", return_value=True)
@@ -1148,7 +1153,50 @@ def test_reprovision_surfaces_snapshot_ids_on_provision_failure(
     )
 
     assert result.exit_code == 1
-    assert "snap-abc123" in result.output
+    assert "Snapshot IDs for manual restore: snap-abc123" in result.output
+    assert "Run 'edc status' to determine the instance state before recovery." in result.output
+
+
+@patch("edcloud.cleanup.cleanup_orphaned_volumes", return_value=True)
+@patch("edcloud.cli.ec2.provision")
+@patch("edcloud.cli.ec2.destroy")
+@patch("edcloud.cli.ec2.status")
+@patch("edcloud.cli.snapshot.snapshot_and_prune")
+@patch("edcloud.cli.tailscale.edcloud_name_conflicts", return_value=[])
+@patch("edcloud.cli.tailscale.tailscale_available", return_value=True)
+@patch("edcloud.cli.get_region", return_value="us-east-1")
+@patch("edcloud.cli.check_aws_credentials", return_value=(True, "ok"))
+def test_reprovision_does_not_claim_destroy_succeeded_on_destroy_failure(
+    _mock_creds,
+    _mock_region,
+    _mock_available,
+    _mock_conflicts,
+    mock_snapshot,
+    mock_status,
+    mock_destroy,
+    mock_provision,
+    _mock_vol_cleanup,
+):
+    mock_snapshot.return_value = ["snap-abc123"]
+    mock_status.return_value = {"exists": True, "instance_id": "i-abc123"}
+    mock_destroy.side_effect = RuntimeError("termination failed")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "reprovision",
+            "--confirm-instance-id",
+            "i-abc123",
+            "--tailscale-auth-key-ssm-parameter",
+            "/edcloud/tailscale_auth_key",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Snapshot IDs for manual restore: snap-abc123" in result.output
+    assert "The instance was destroyed" not in result.output
+    mock_provision.assert_not_called()
 
 
 @patch("edcloud.cli.run_reprovision_flow")

@@ -1,4 +1,4 @@
-"""AWS-native backup lifecycle policy management (DLM-backed)."""
+"""Optional AWS Data Lifecycle Manager policy management."""
 
 from __future__ import annotations
 
@@ -109,13 +109,12 @@ def ensure_policy(
 ) -> BackupPolicyResult:
     """Create or update the managed DLM policy with tiered retention.
 
-    Default retention keeps exactly one snapshot per tier:
-    - daily:   1 snapshot (~1 day old)
-    - weekly:  1 snapshot (~1 week old, every Sunday)
-    - monthly: 1 snapshot (~1 month old, 1st of month)
+    Default retention keeps the newest snapshot in each daily, weekly, and
+    monthly schedule.
 
-    DLM targets EBS volumes by tag and runs independently of instance state,
-    so snapshots accumulate on schedule whether the instance is running or not.
+    DLM targets EBS volumes by tag and runs independently of instance state.
+    Its snapshots carry the managed tag and are therefore eligible for the
+    CLI's global managed-snapshot pruning.
     """
     if daily_keep <= 0 or weekly_keep <= 0 or monthly_keep <= 0:
         raise ValueError("daily_keep, weekly_keep, and monthly_keep must be > 0")

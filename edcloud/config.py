@@ -66,9 +66,9 @@ SECURITY_GROUP_DESC = "edcloud - no public inbound; all access via Tailscale"
 # Note: rates are approximate us-east-1 on-demand prices (USD/hr).
 # Verify against https://aws.amazon.com/ec2/pricing/on-demand/ for your region.
 HOURLY_RATES: dict[str, float] = {
-    "t3a.micro": 0.0094,  # 2 vCPU, 1 GB RAM - minimal workloads only
-    "t3a.small": 0.0188,  # 2 vCPU, 2 GB RAM - default for light dev work
-    "t3a.medium": 0.0376,  # 2 vCPU, 4 GB RAM - heavier Docker workloads
+    "t3a.micro": 0.0094,  # 2 vCPU, 1 GiB RAM - minimal workloads only
+    "t3a.small": 0.0188,  # 2 vCPU, 2 GiB RAM - default for light dev work
+    "t3a.medium": 0.0376,  # 2 vCPU, 4 GiB RAM - heavier Docker workloads
 }
 EBS_MONTHLY_RATE_PER_GB = 0.08
 SNAPSHOT_MONTHLY_RATE_PER_GB = 0.05
@@ -134,9 +134,8 @@ def get_volume_ids(instance: dict[str, Any]) -> list[str]:
 class InstanceConfig:
     """Runtime-resolved configuration for provisioning an edcloud instance.
 
-    All fields carry sensible defaults so callers can override only what
-    they need.  The ``tags`` dict is always pre-populated with the
-    managed-resource marker and a human-friendly Name tag.
+    Every field has a default. The ``tags`` dict includes the managed-resource
+    marker and the default ``Name`` tag.
     """
 
     instance_type: str = DEFAULT_INSTANCE_TYPE

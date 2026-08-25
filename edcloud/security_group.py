@@ -1,7 +1,7 @@
 """Security group discovery and lifecycle for edcloud.
 
-Manages the single ``edcloud-sg`` security group with zero inbound rules
-(all access via Tailscale).
+Creates ``edcloud-sg`` without inbound rules and discovers existing groups by
+name and managed tag. Existing rules are not audited or removed.
 """
 
 from __future__ import annotations
@@ -36,14 +36,12 @@ def find_security_group(client: Any) -> str | None:
     """Return the edcloud security-group ID, or ``None`` if it doesn't exist.
 
     Raises:
+        ClientError: If AWS rejects the discovery request.
         TagDriftError: On duplicate or untagged security groups.
     """
-    try:
-        resp = client.describe_security_groups(
-            Filters=[{"Name": "group-name", "Values": [SECURITY_GROUP_NAME]}]
-        )
-    except ClientError:
-        return None
+    resp = client.describe_security_groups(
+        Filters=[{"Name": "group-name", "Values": [SECURITY_GROUP_NAME]}]
+    )
 
     groups = resp.get("SecurityGroups", [])
     managed_groups = [g for g in groups if has_managed_tag(g.get("Tags", []))]
